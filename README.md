@@ -27,6 +27,9 @@ Xminds Release Platform 是面向企业软件交付场景的多产品可信发�
 - 显式审批者角色、提交者与审批者职责分离、数据库乐观锁及不可变 Release 内容；
 - 并发安全的发布幂等键、事务化 attempt/审计/Outbox，以及审批者授权重试和正交撤销证据；
 - Release 创建、提交、批准、拒绝、发布、重试、撤销和查询的 OpenAPI 3.1 与 RFC 9457 HTTP 契约。
+- 严格 Canonical JSON、Ed25519 五角色签名链、跨角色摘要/版本绑定和 NGEP 消费端黄金向量；
+- AES-256-GCM 本地加密 Signing Provider、在线 root 拒绝门禁、单调 Catalog 版本仓储和原子 current pointer；
+- 离线 root 密钥工具及双人控制的[密钥仪式规范](docs/security/key-ceremony.md)。
 
 当前运行时只开放存活、就绪和版本端点。产品、制品和 Release HTTP 适配器已经完成并强制从请求上下文获取已验证身份；在运行时组合根完成 OIDC/工作负载身份配置前不会挂载业务路由，避免暴露未受保护的管理接口。
 

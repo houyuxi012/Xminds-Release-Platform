@@ -1,0 +1,1 @@
+{"signatures":[{"keyid":"revocation-key-2026","sig":"RUMqRknx3zTl87Wna2XRtclC3Ekhnta-iOcl6F6qHVICDnFM9LlXzKkwB6HTR3zrW9jbh4EUkAnboA5HHPwfBw"}],"signed":{"_type":"revocation","expires":"2026-08-15T12:00:00Z","revocations":[{"key_id":"","manifest_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","release_id":"rel-20260802-stable"}],"version":1}}

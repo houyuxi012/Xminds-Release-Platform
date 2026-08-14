@@ -1,0 +1,1 @@
+{"signatures":[{"keyid":"snapshot-key-2026","sig":"n98UOZcekvnIKfwAEySDQajKqbMntoUekPYg2aP4UCQjC7XM3L7gJkBNlVveiNHiU4mnc8PUa9PFFGnDdAhGDg"}],"signed":{"_type":"snapshot","expires":"2026-08-15T12:00:00Z","meta":{"targets.json":{"hashes":{"sha256":"1c8822f5dd9311ae61b43073739bb4a2b52a8d969f4addcf1ab4ca728ec1b54a"},"version":1}},"version":1}}

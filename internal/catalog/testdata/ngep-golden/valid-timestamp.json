@@ -1,0 +1,1 @@
+{"signatures":[{"keyid":"timestamp-key-2026","sig":"AQl4f11pX-7LJRA6ju6zGudLTwNYSA5yHZZ1Wl2ZcYDHFS9LP82Vhx4uOPCkm41432pVUKv0ft4VEFNPY1PDAA"}],"signed":{"_type":"timestamp","expires":"2026-08-15T12:00:00Z","meta":{"snapshot.json":{"hashes":{"sha256":"b98a070b80ff835f6dc013b27b7ba1f0af7df490c7ef6cf23e176ba5df09e2ce"},"version":1}},"version":1}}

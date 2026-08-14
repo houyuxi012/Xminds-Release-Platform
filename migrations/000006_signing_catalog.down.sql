@@ -1,0 +1,15 @@
+DROP TRIGGER IF EXISTS catalog_version_counters_reject_delete ON catalog_version_counters;
+DROP TRIGGER IF EXISTS catalog_current_pointers_reject_delete ON catalog_current_pointers;
+DROP TRIGGER IF EXISTS catalog_role_documents_reject_update_delete ON catalog_role_documents;
+DROP TRIGGER IF EXISTS catalog_versions_reject_delete ON catalog_versions;
+DROP TRIGGER IF EXISTS catalog_versions_protect_update ON catalog_versions;
+DROP FUNCTION IF EXISTS protect_catalog_version();
+DROP FUNCTION IF EXISTS reject_catalog_evidence_mutation();
+DROP TRIGGER IF EXISTS catalog_current_pointers_validate_switch ON catalog_current_pointers;
+DROP FUNCTION IF EXISTS validate_catalog_current_switch();
+DROP TRIGGER IF EXISTS catalog_role_documents_validate_version ON catalog_role_documents;
+DROP FUNCTION IF EXISTS validate_catalog_role_version();
+DROP TABLE IF EXISTS catalog_current_pointers;
+DROP TABLE IF EXISTS catalog_role_documents;
+DROP TABLE IF EXISTS catalog_versions;
+DROP TABLE IF EXISTS catalog_version_counters;
