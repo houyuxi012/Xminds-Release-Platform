@@ -18,8 +18,6 @@ type HealthChecker interface {
 	Ping(ctx context.Context) error
 }
 
-type requestIDContextKey struct{}
-
 func NewHandler(healthChecker HealthChecker, info buildinfo.Info) http.Handler {
 	router := chi.NewRouter()
 	router.Use(securityHeaders)
@@ -49,7 +47,7 @@ func NewHandler(healthChecker HealthChecker, info buildinfo.Info) http.Handler {
 			"ROUTE_NOT_FOUND",
 			"Route not found",
 			nil,
-		).WithRequestID(requestIDFromContext(request.Context())).WithInstance(request.URL.Path))
+		).WithRequestID(httpx.RequestIDFromContext(request.Context())).WithInstance(request.URL.Path))
 	})
 	router.MethodNotAllowed(func(writer http.ResponseWriter, request *http.Request) {
 		httpx.WriteProblem(writer, httpx.NewProblem(
@@ -57,7 +55,7 @@ func NewHandler(healthChecker HealthChecker, info buildinfo.Info) http.Handler {
 			"METHOD_NOT_ALLOWED",
 			"Method not allowed",
 			nil,
-		).WithRequestID(requestIDFromContext(request.Context())).WithInstance(request.URL.Path))
+		).WithRequestID(httpx.RequestIDFromContext(request.Context())).WithInstance(request.URL.Path))
 	})
 
 	return otelhttp.NewHandler(router, "xminds-release-platform.http")
@@ -83,7 +81,7 @@ func requestID(next http.Handler) http.Handler {
 			identifier = generated.String()
 		}
 		writer.Header().Set("X-Request-ID", identifier)
-		ctx := context.WithValue(request.Context(), requestIDContextKey{}, identifier)
+		ctx := httpx.WithRequestID(request.Context(), identifier)
 		next.ServeHTTP(writer, request.WithContext(ctx))
 	})
 }
@@ -97,7 +95,7 @@ func recoverPanics(next http.Handler) http.Handler {
 					"INTERNAL_ERROR",
 					"Internal server error",
 					objectAsError(recovered),
-				).WithRequestID(requestIDFromContext(request.Context())))
+				).WithRequestID(httpx.RequestIDFromContext(request.Context())))
 			}
 		}()
 		next.ServeHTTP(writer, request)
@@ -110,7 +108,7 @@ func writeUnavailable(writer http.ResponseWriter, request *http.Request, cause e
 		"DATABASE_UNAVAILABLE",
 		"Service is not ready",
 		cause,
-	).WithRequestID(requestIDFromContext(request.Context())))
+	).WithRequestID(httpx.RequestIDFromContext(request.Context())))
 }
 
 func writeJSON(writer http.ResponseWriter, status int, value any) {
@@ -128,11 +126,6 @@ func writeJSON(writer http.ResponseWriter, status int, value any) {
 	writer.Header().Set("Cache-Control", "no-store")
 	writer.WriteHeader(status)
 	_, _ = writer.Write(append(payload, '\n'))
-}
-
-func requestIDFromContext(ctx context.Context) string {
-	identifier, _ := ctx.Value(requestIDContextKey{}).(string)
-	return identifier
 }
 
 func objectAsError(value any) error {

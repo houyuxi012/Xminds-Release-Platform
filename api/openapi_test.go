@@ -23,3 +23,25 @@ func TestOpenAPIContractIsValid(t *testing.T) {
 	}
 }
 
+func TestOpenAPIDefinesAuditorOnlyQueryAndExportOperations(t *testing.T) {
+	t.Parallel()
+
+	loader := openapi3.NewLoader()
+	document, err := loader.LoadFromFile("openapi.yaml")
+	if err != nil {
+		t.Fatalf("load OpenAPI contract: %v", err)
+	}
+	for _, testCase := range []struct {
+		path   string
+		method string
+	}{
+		{path: "/api/v1/audit-events", method: "GET"},
+		{path: "/api/v1/audit-exports", method: "POST"},
+		{path: "/api/v1/audit-exports/{export_id}", method: "GET"},
+	} {
+		pathItem := document.Paths.Find(testCase.path)
+		if pathItem == nil || pathItem.GetOperation(testCase.method) == nil {
+			t.Fatalf("missing %s %s operation", testCase.method, testCase.path)
+		}
+	}
+}

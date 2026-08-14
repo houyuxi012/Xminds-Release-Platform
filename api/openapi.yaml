@@ -16,6 +16,8 @@ security:
 tags:
   - name: System
     description: 存活、就绪和版本信息
+  - name: Audit
+    description: 产品范围内的不可变审计事件查询与导出
 paths:
   /health/live:
     get:
@@ -76,7 +78,133 @@ paths:
                 $ref: '#/components/schemas/BuildInfo'
         '500':
           $ref: '#/components/responses/InternalError'
+  /api/v1/audit-events:
+    get:
+      operationId: queryAuditEvents
+      summary: 查询不可变审计事件
+      description: 仅允许具有目标产品 audit.read 权限的审计员或管理员访问。
+      tags: [Audit]
+      x-required-action: audit.read
+      parameters:
+        - $ref: '#/components/parameters/ProductID'
+        - name: actor_subject
+          in: query
+          schema:
+            type: string
+            maxLength: 512
+        - name: action
+          in: query
+          schema:
+            type: string
+            maxLength: 128
+        - name: outcome
+          in: query
+          schema:
+            $ref: '#/components/schemas/AuditOutcome'
+        - name: since
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: until
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: before_time
+          in: query
+          description: 与 before_id 同时提供的稳定时间游标。
+          schema:
+            type: string
+            format: date-time
+        - name: before_id
+          in: query
+          description: 与 before_time 同时提供的 UUID 游标。
+          schema:
+            type: string
+            format: uuid
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 500
+            default: 100
+      responses:
+        '200':
+          description: 审计事件页
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditEventPage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /api/v1/audit-exports:
+    post:
+      operationId: startAuditExport
+      summary: 发起审计导出
+      description: 持久化不可变导出请求，并在同一事务中创建 audit.export.v1 作业。
+      tags: [Audit]
+      x-required-action: audit.read
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AuditExportRequest'
+      responses:
+        '202':
+          description: 导出请求已受理
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditExport'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /api/v1/audit-exports/{export_id}:
+    get:
+      operationId: getAuditExport
+      summary: 获取审计导出状态
+      tags: [Audit]
+      x-required-action: audit.read
+      parameters:
+        - name: export_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: 审计导出状态
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditExport'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: 导出请求不存在
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
 components:
+  parameters:
+    ProductID:
+      name: product_id
+      in: query
+      required: true
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
   securitySchemes:
     oidcBearer:
       type: http
@@ -91,6 +219,22 @@ components:
   responses:
     InternalError:
       description: 服务内部错误
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    Unauthorized:
+      description: Bearer Token 缺失、无效或已过期
+      headers:
+        WWW-Authenticate:
+          schema:
+            type: string
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    Forbidden:
+      description: 身份已验证但缺少产品范围或 audit.read 权限
       content:
         application/problem+json:
           schema:
@@ -118,6 +262,143 @@ components:
           type: string
         build_time:
           type: string
+    AuditOutcome:
+      type: string
+      enum: [success, denied, failed]
+    AuditEvent:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - occurred_at
+        - product_id
+        - actor_subject
+        - actor_kind
+        - actor_provider
+        - actor_roles
+        - actor_product_ids
+        - token_id
+        - action
+        - resource_type
+        - resource_id
+        - outcome
+        - request_id
+        - metadata
+        - previous_hash
+        - event_hash
+      properties:
+        id:
+          type: string
+          format: uuid
+        occurred_at:
+          type: string
+          format: date-time
+        product_id:
+          type: string
+        actor_subject:
+          type: string
+        actor_kind:
+          type: string
+          enum: [human, workload, local]
+        actor_provider:
+          type: string
+          enum: ['', github-actions, github-enterprise-actions, gitlab-ci, api-token]
+        actor_roles:
+          type: array
+          items:
+            type: string
+            enum: [admin, publisher, approver, auditor]
+        actor_product_ids:
+          type: array
+          items:
+            type: string
+        token_id:
+          type: string
+        action:
+          type: string
+        resource_type:
+          type: string
+        resource_id:
+          type: string
+        outcome:
+          $ref: '#/components/schemas/AuditOutcome'
+        request_id:
+          type: string
+          format: uuid
+        source_ip:
+          type: string
+        metadata:
+          type: object
+          additionalProperties: true
+        previous_hash:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        event_hash:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+    AuditEventPage:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/AuditEvent'
+        next_before_time:
+          type: string
+          format: date-time
+        next_before_id:
+          type: string
+          format: uuid
+    AuditExportRequest:
+      type: object
+      additionalProperties: false
+      required: [product_id]
+      properties:
+        product_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+        action:
+          type: string
+          maxLength: 128
+        outcome:
+          $ref: '#/components/schemas/AuditOutcome'
+        since:
+          type: string
+          format: date-time
+        until:
+          type: string
+          format: date-time
+    AuditExport:
+      type: object
+      additionalProperties: false
+      required: [id, product_id, requested_by, request_id, status, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        product_id:
+          type: string
+        requested_by:
+          type: string
+        request_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [pending, completed, failed]
+        object_key:
+          type: string
+        error_code:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
     ProblemDetails:
       type: object
       additionalProperties: false

@@ -12,8 +12,12 @@ Xminds Release Platform 是面向企业软件交付场景的多产品可信发�
 - 基于 UUIDv7、事务入队和 `FOR UPDATE SKIP LOCKED` 的可靠 Outbox；
 - RFC 9457 Problem Details、请求 ID、安全响应头和 OpenTelemetry HTTP 插桩；
 - OpenAPI 3.1 基础契约及机器校验测试。
+- OIDC Discovery/JWKS 验签、issuer/audience/时间声明校验和强制 token ID；
+- GitHub Actions、GitHub Enterprise Actions、GitLab CI 工作负载区分，以及仅保存 Argon2id 哈希的 API Token fallback；
+- 显式角色-动作矩阵、产品范围 RBAC、审计查询与导出的对象级授权；
+- 按产品分区的不可变审计哈希链、敏感字段递归脱敏，以及事务化审计导出 Outbox。
 
-当前只开放存活、就绪和版本端点。业务管理端点将在身份认证、产品级 RBAC 和不可变审计能力完成后加入，不会先暴露未受保护的占位接口。
+当前运行时只开放存活、就绪和版本端点。身份、授权与审计领域服务及 OpenAPI 契约已完成，后续业务 HTTP 适配器接入这些安全边界后才会开放管理端点，不会先暴露未受保护的占位接口。
 
 ## P0 能力范围
 

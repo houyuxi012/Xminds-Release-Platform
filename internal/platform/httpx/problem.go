@@ -1,11 +1,24 @@
 package httpx
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 )
 
 const ProblemMediaType = "application/problem+json"
+
+type requestIDContextKey struct{}
+
+func WithRequestID(ctx context.Context, requestID string) context.Context {
+	return context.WithValue(ctx, requestIDContextKey{}, strings.TrimSpace(requestID))
+}
+
+func RequestIDFromContext(ctx context.Context) string {
+	requestID, _ := ctx.Value(requestIDContextKey{}).(string)
+	return requestID
+}
 
 type Problem struct {
 	Type      string `json:"type"`
