@@ -9,6 +9,8 @@ type Action string
 
 const (
 	ActionProductRead       Action = "product.read"
+	ActionProductRegister   Action = "product.register"
+	ActionProductManage     Action = "product.manage"
 	ActionArtifactPublish   Action = "artifact.publish"
 	ActionReleaseCreate     Action = "release.create"
 	ActionReleaseSubmit     Action = "release.submit"
@@ -33,6 +35,8 @@ func NewAuthorizer() *Authorizer {
 	return &Authorizer{permissions: map[Role]map[Action]struct{}{
 		RoleAdmin: actionSet(
 			ActionProductRead,
+			ActionProductRegister,
+			ActionProductManage,
 			ActionArtifactPublish,
 			ActionReleaseCreate,
 			ActionReleaseSubmit,
@@ -94,7 +98,7 @@ func actionSet(actions ...Action) map[Action]struct{} {
 }
 
 func isProductScoped(action Action) bool {
-	return action != ActionIdentityManage
+	return action != ActionIdentityManage && action != ActionProductRegister
 }
 
 func contains(values []string, wanted string) bool {

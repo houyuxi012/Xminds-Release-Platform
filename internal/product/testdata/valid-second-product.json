@@ -1,0 +1,13 @@
+{
+  "schema_version": "xminds-product-manifest/v1",
+  "product_id": "xminds-desktop",
+  "display_name": "Xminds Desktop",
+  "artifact_types": ["desktop"],
+  "version_scheme": "semver",
+  "compatibility_keys": ["os", "arch", "edition"],
+  "catalog_format": "xminds-tuf-v1",
+  "default_channels": [
+    {"name": "stable", "display_name": "Stable"},
+    {"name": "preview", "display_name": "Preview"}
+  ]
+}

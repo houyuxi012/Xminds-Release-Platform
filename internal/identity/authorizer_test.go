@@ -37,6 +37,19 @@ func TestPublisherCannotApproveRelease(t *testing.T) {
 	}
 }
 
+func TestOnlyAdminCanRegisterProductWithoutExistingProductScope(t *testing.T) {
+	t.Parallel()
+
+	admin := Principal{Subject: "admin", Kind: PrincipalKindHuman, Roles: []Role{RoleAdmin}}
+	if err := NewAuthorizer().Require(admin, ActionProductRegister, ""); err != nil {
+		t.Fatalf("admin product registration error = %v", err)
+	}
+	publisher := Principal{Subject: "publisher", Kind: PrincipalKindHuman, Roles: []Role{RolePublisher}}
+	if err := NewAuthorizer().Require(publisher, ActionProductRegister, ""); !errors.Is(err, ErrActionDenied) {
+		t.Fatalf("publisher product registration error = %v, want %v", err, ErrActionDenied)
+	}
+}
+
 func TestAuditorCanReadAuditWithinProductScope(t *testing.T) {
 	t.Parallel()
 

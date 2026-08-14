@@ -15,9 +15,12 @@ Xminds Release Platform 是面向企业软件交付场景的多产品可信发�
 - OIDC Discovery/JWKS 验签、issuer/audience/时间声明校验和强制 token ID；
 - GitHub Actions、GitHub Enterprise Actions、GitLab CI 工作负载区分，以及仅保存 Argon2id 哈希的 API Token fallback；
 - 显式角色-动作矩阵、产品范围 RBAC、审计查询与导出的对象级授权；
-- 按产品分区的不可变审计哈希链、敏感字段递归脱敏，以及事务化审计导出 Outbox。
+- 按产品分区的不可变审计哈希链、敏感字段递归脱敏，以及事务化审计导出 Outbox；
+- 版本化 `xminds-product-manifest/v1`、双产品无特例注册、默认通道和稳定 SHA-256 Manifest 摘要；
+- 产品、默认通道和审计证据的事务一致性，以及数据库层 Manifest 不可变保护；
+- 产品注册、范围内列表/详情和停用的 OpenAPI 3.1 与 RFC 9457 HTTP 适配器契约。
 
-当前运行时只开放存活、就绪和版本端点。身份、授权与审计领域服务及 OpenAPI 契约已完成，后续业务 HTTP 适配器接入这些安全边界后才会开放管理端点，不会先暴露未受保护的占位接口。
+当前运行时只开放存活、就绪和版本端点。产品 HTTP 适配器已经完成并强制从请求上下文获取已验证身份；在运行时组合根完成 OIDC/工作负载身份配置前不会挂载业务路由，避免暴露未受保护的管理接口。
 
 ## P0 能力范围
 
