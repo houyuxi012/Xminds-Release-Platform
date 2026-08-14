@@ -105,6 +105,53 @@ func TestArtifactDatabaseDeduplicatesPhysicalObjectAcrossProducts(t *testing.T) 
 	}
 }
 
+func TestArtifactDatabasePreservesMonotonicTimestampAcrossClockDomains(t *testing.T) {
+	databaseURL := integrationDatabaseURL(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	pool, err := database.Open(ctx, databaseURL)
+	if err != nil {
+		t.Fatalf("database.Open() error = %v", err)
+	}
+	defer pool.Close()
+	if err := database.ApplyMigrations(ctx, pool, migrations.FS); err != nil {
+		t.Fatalf("database.ApplyMigrations() error = %v", err)
+	}
+
+	productID := "artifact-clock-" + uuid.NewString()
+	insertIntegrationProduct(t, ctx, pool, productID)
+	digestBytes := sha256.Sum256([]byte(productID))
+	digest := hex.EncodeToString(digestBytes[:])
+	applicationTime := time.Now().UTC().Add(5 * time.Minute).Truncate(time.Microsecond)
+	upload := integrationArtifactUpload(productID, digest, applicationTime)
+	repository := artifact.NewPostgresRepository(pool)
+	if err := database.WithTx(ctx, pool, func(tx pgx.Tx) error {
+		return repository.CreateUpload(ctx, tx, upload)
+	}); err != nil {
+		t.Fatalf("CreateUpload() error = %v", err)
+	}
+	candidate := artifact.Artifact{
+		ID: uuid.Must(uuid.NewV7()), ProductID: productID, ArtifactType: "desktop",
+		Filename: productID + ".tar", ContentType: "application/x-tar", Size: 3,
+		SHA256: digest, ObjectKey: artifact.ArtifactObjectKey(digest),
+		CreatedBy: "publisher-integration", CreatedAt: applicationTime,
+	}
+	if err := database.WithTx(ctx, pool, func(tx pgx.Tx) error {
+		_, completeErr := repository.Complete(ctx, tx, upload.ID, candidate)
+		return completeErr
+	}); err != nil {
+		t.Fatalf("Complete() across clock domains error = %v", err)
+	}
+	stored, err := repository.GetUpload(ctx, upload.ID)
+	if err != nil {
+		t.Fatalf("GetUpload() error = %v", err)
+	}
+	if stored.UpdatedAt.Before(stored.CreatedAt) {
+		t.Fatalf("artifact upload timestamps regressed: created=%s updated=%s", stored.CreatedAt, stored.UpdatedAt)
+	}
+}
+
 func insertIntegrationProduct(t *testing.T, ctx context.Context, pool interface {
 	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
 }, productID string) {

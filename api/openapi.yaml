@@ -20,6 +20,8 @@ tags:
     description: 多产品注册、产品范围查询与生命周期管理
   - name: Artifacts
     description: 可恢复分块上传、服务端摘要校验与不可变制品元数据
+  - name: Releases
+    description: Release 创建、职责分离审批、幂等发布、重试与撤销
   - name: Audit
     description: 产品范围内的不可变审计事件查询与导出
 paths:
@@ -458,6 +460,297 @@ paths:
             application/problem+json:
               schema:
                 $ref: '#/components/schemas/ProblemDetails'
+  /api/v1/products/{product_id}/releases:
+    post:
+      operationId: createRelease
+      summary: 创建不可变 Release 草稿
+      tags: [Releases]
+      security:
+        - oidcBearer: []
+        - workloadBearer: []
+      x-required-action: release.create
+      parameters:
+        - $ref: '#/components/parameters/ProductIDPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateReleaseRequest'
+      responses:
+        '201':
+          description: Release 草稿已创建
+          headers:
+            Location:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Release'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          description: Release 请求超过大小限制
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+        '415':
+          description: 请求媒体类型不受支持
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+  /api/v1/products/{product_id}/releases/{release_id}:
+    get:
+      operationId: getRelease
+      summary: 获取产品范围内的 Release
+      tags: [Releases]
+      security:
+        - oidcBearer: []
+        - workloadBearer: []
+      x-required-action: product.read
+      parameters:
+        - $ref: '#/components/parameters/ProductIDPath'
+        - $ref: '#/components/parameters/ReleaseIDPath'
+      responses:
+        '200':
+          description: Release 详情
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Release'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/v1/products/{product_id}/releases/{release_id}/submit:
+    post:
+      operationId: submitRelease
+      summary: 提交 Release 审批
+      tags: [Releases]
+      security:
+        - oidcBearer: []
+        - workloadBearer: []
+      x-required-action: release.submit
+      parameters:
+        - $ref: '#/components/parameters/ProductIDPath'
+        - $ref: '#/components/parameters/ReleaseIDPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReleaseTransitionRequest'
+      responses:
+        '200':
+          description: Release 已提交
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Release'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+  /api/v1/products/{product_id}/releases/{release_id}/approve:
+    post:
+      operationId: approveRelease
+      summary: 独立审批人批准 Release
+      description: 提交者不得批准本人提交的 Release。
+      tags: [Releases]
+      security:
+        - oidcBearer: []
+        - workloadBearer: []
+      x-required-action: release.approve
+      parameters:
+        - $ref: '#/components/parameters/ProductIDPath'
+        - $ref: '#/components/parameters/ReleaseIDPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReleaseTransitionRequest'
+      responses:
+        '200':
+          description: Release 已批准
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Release'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+  /api/v1/products/{product_id}/releases/{release_id}/reject:
+    post:
+      operationId: rejectRelease
+      summary: 独立审批人拒绝 Release
+      tags: [Releases]
+      security:
+        - oidcBearer: []
+        - workloadBearer: []
+      x-required-action: release.approve
+      parameters:
+        - $ref: '#/components/parameters/ProductIDPath'
+        - $ref: '#/components/parameters/ReleaseIDPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReleaseReasonRequest'
+      responses:
+        '200':
+          description: Release 已拒绝
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Release'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+  /api/v1/products/{product_id}/releases/{release_id}/publish:
+    post:
+      operationId: publishRelease
+      summary: 原子启动 Release 发布
+      description: 状态迁移、attempt、审计与 catalog.publish.v1 作业在同一事务提交。
+      tags: [Releases]
+      security:
+        - oidcBearer: []
+        - workloadBearer: []
+      x-required-action: release.publish
+      parameters:
+        - $ref: '#/components/parameters/ProductIDPath'
+        - $ref: '#/components/parameters/ReleaseIDPath'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReleaseTransitionRequest'
+      responses:
+        '200':
+          description: 发布 attempt 已创建，或返回原幂等结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReleaseOperationResult'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+  /api/v1/products/{product_id}/releases/{release_id}/retry:
+    post:
+      operationId: retryReleasePublication
+      summary: 审批人授权重试失败发布
+      tags: [Releases]
+      security:
+        - oidcBearer: []
+        - workloadBearer: []
+      x-required-action: release.approve
+      parameters:
+        - $ref: '#/components/parameters/ProductIDPath'
+        - $ref: '#/components/parameters/ReleaseIDPath'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReleaseTransitionRequest'
+      responses:
+        '200':
+          description: 重试 attempt 已创建，或返回原幂等结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReleaseOperationResult'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+  /api/v1/products/{product_id}/releases/{release_id}/revoke:
+    post:
+      operationId: revokeRelease
+      summary: 撤销已发布 Release
+      description: Release 保持 PUBLISHED，并记录不可变撤销证据与 catalog.revoke.v1 作业。
+      tags: [Releases]
+      security:
+        - oidcBearer: []
+        - workloadBearer: []
+      x-required-action: release.approve
+      parameters:
+        - $ref: '#/components/parameters/ProductIDPath'
+        - $ref: '#/components/parameters/ReleaseIDPath'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReleaseReasonRequest'
+      responses:
+        '200':
+          description: 撤销 attempt 已创建
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReleaseOperationResult'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
   /api/v1/audit-events:
     get:
       operationId: queryAuditEvents
@@ -599,6 +892,22 @@ components:
       schema:
         type: string
         format: uuid
+    ReleaseIDPath:
+      name: release_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema:
+        type: string
+        minLength: 8
+        maxLength: 128
+        pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$'
   securitySchemes:
     oidcBearer:
       type: http
@@ -629,6 +938,24 @@ components:
             $ref: '#/components/schemas/ProblemDetails'
     Forbidden:
       description: 身份已验证但缺少产品范围或 audit.read 权限
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    NotFound:
+      description: 产品范围内的资源不存在
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    Conflict:
+      description: 状态、乐观锁、唯一性或幂等约束冲突
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    UnprocessableEntity:
+      description: 请求字段或业务规则校验失败
       content:
         application/problem+json:
           schema:
@@ -954,6 +1281,230 @@ components:
         created_at:
           type: string
           format: date-time
+    ReleaseSource:
+      type: object
+      additionalProperties: false
+      required: [repository, commit_sha, tag, pipeline_ref]
+      properties:
+        repository:
+          type: string
+          minLength: 1
+          maxLength: 2048
+        commit_sha:
+          type: string
+          pattern: '^([0-9a-f]{40}|[0-9a-f]{64})$'
+        tag:
+          type: string
+          minLength: 1
+          maxLength: 255
+        pipeline_ref:
+          type: string
+          minLength: 1
+          maxLength: 512
+    CreateReleaseRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - channel
+        - version
+        - release_notes
+        - release_notes_sha256
+        - compatibility
+        - compatibility_sha256
+        - artifact_ids
+        - source
+      properties:
+        channel:
+          type: string
+          pattern: '^[a-z][a-z0-9._-]{0,63}$'
+        version:
+          type: string
+          pattern: '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$'
+        release_notes:
+          type: string
+          minLength: 1
+          maxLength: 1048576
+        release_notes_sha256:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        compatibility:
+          type: object
+        compatibility_sha256:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        artifact_ids:
+          type: array
+          minItems: 1
+          maxItems: 64
+          uniqueItems: true
+          items:
+            type: string
+            format: uuid
+        source:
+          $ref: '#/components/schemas/ReleaseSource'
+    ReleaseTransitionRequest:
+      type: object
+      additionalProperties: false
+      required: [lock_version]
+      properties:
+        lock_version:
+          type: integer
+          format: int64
+          minimum: 1
+    ReleaseReasonRequest:
+      type: object
+      additionalProperties: false
+      required: [lock_version, reason]
+      properties:
+        lock_version:
+          type: integer
+          format: int64
+          minimum: 1
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 2048
+    ReleaseArtifactBinding:
+      type: object
+      additionalProperties: false
+      required: [artifact_id, artifact_type, filename, size, sha256]
+      properties:
+        artifact_id:
+          type: string
+          format: uuid
+        artifact_type:
+          type: string
+        filename:
+          type: string
+        size:
+          type: integer
+          format: int64
+          minimum: 1
+        sha256:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+    Release:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - product_id
+        - channel
+        - version
+        - status
+        - lock_version
+        - release_notes
+        - release_notes_sha256
+        - compatibility
+        - compatibility_sha256
+        - artifacts
+        - source
+        - created_by
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        product_id:
+          type: string
+        channel:
+          type: string
+        version:
+          type: string
+        status:
+          type: string
+          enum: [DRAFT, SUBMITTED, APPROVED, REJECTED, PUBLISHING, PUBLISHED, FAILED]
+        lock_version:
+          type: integer
+          format: int64
+          minimum: 1
+        release_notes:
+          type: string
+        release_notes_sha256:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        compatibility:
+          type: object
+        compatibility_sha256:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        artifacts:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReleaseArtifactBinding'
+        source:
+          $ref: '#/components/schemas/ReleaseSource'
+        created_by:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        submitted_by:
+          type: string
+        submitted_at:
+          type: string
+          format: date-time
+        approved_by:
+          type: string
+        approved_at:
+          type: string
+          format: date-time
+        rejected_by:
+          type: string
+        rejected_at:
+          type: string
+          format: date-time
+        rejection_reason:
+          type: string
+        revoked_at:
+          type: string
+          format: date-time
+        revoked_by:
+          type: string
+        revocation_reason:
+          type: string
+        publication_failure_code:
+          type: string
+    ReleaseAttempt:
+      type: object
+      additionalProperties: false
+      required: [id, release_id, kind, number, idempotency_key, status, created_by, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        release_id:
+          type: string
+          format: uuid
+        kind:
+          type: string
+          enum: [publish, retry, revoke]
+        number:
+          type: integer
+          minimum: 1
+        idempotency_key:
+          type: string
+        status:
+          type: string
+          enum: [pending]
+        created_by:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+    ReleaseOperationResult:
+      type: object
+      additionalProperties: false
+      required: [release, attempt]
+      properties:
+        release:
+          $ref: '#/components/schemas/Release'
+        attempt:
+          $ref: '#/components/schemas/ReleaseAttempt'
     AuditOutcome:
       type: string
       enum: [success, denied, failed]
