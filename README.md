@@ -4,13 +4,16 @@ Xminds Release Platform 是面向企业软件交付场景的多产品可信发�
 
 ## 当前状态
 
-项目处于 P0 实施阶段。当前代码只包含独立工程骨架和安全启动保护；API 与 Worker 在配置模块完成前会明确报错并以非零状态退出，不会启动未受保护的占位服务。
+项目处于 P0 实施阶段，已交付第一批平台基础能力：
 
-P0 设计与实施基线：
+- 严格的 `XMINDS_RELEASE_*` 配置边界和非开发环境必填校验；
+- 显式 `release-api migrate` 与 `release-api serve` 模式，服务启动不会隐式修改数据库；
+- PostgreSQL 内嵌迁移、advisory lock 串行化和已执行迁移 SHA-256 漂移防护；
+- 基于 UUIDv7、事务入队和 `FOR UPDATE SKIP LOCKED` 的可靠 Outbox；
+- RFC 9457 Problem Details、请求 ID、安全响应头和 OpenTelemetry HTTP 插桩；
+- OpenAPI 3.1 基础契约及机器校验测试。
 
-- [P0 总体设计规格](docs/superpowers/specs/2026-08-13-xminds-release-platform-p0-design.md)
-- [身份治理与统一日志补充规格](docs/superpowers/specs/2026-08-14-xminds-release-platform-p0-identity-log-baseline-design.md)
-- [P0 实施计划](docs/superpowers/plans/2026-08-13-xminds-release-platform-p0-implementation.md)
+当前只开放存活、就绪和版本端点。业务管理端点将在身份认证、产品级 RBAC 和不可变审计能力完成后加入，不会先暴露未受保护的占位接口。
 
 ## P0 能力范围
 
@@ -29,10 +32,11 @@ P0 只保存可信上游产生的请求时授权快照，不负责 License 创�
 
 ```text
 apps/       API、Worker 和 Console 入口
+api/        OpenAPI 3.1 接口契约与校验测试
 internal/   模块化单体领域与平台能力
+migrations/ 编译内嵌的 PostgreSQL 迁移
 scripts/    构建、边界和交付检查
 tests/      集成、契约、端到端和性能测试
-docs/       架构、运维、安全、规格和实施计划
 ```
 
 ## 开发环境
@@ -49,11 +53,38 @@ docs/       架构、运维、安全、规格和实施计划
 make fmt
 make lint
 make test
+make test-integration
 make build
 make verify
 ```
 
 `make verify` 会执行格式、Go Vet、竞态测试、双二进制构建、仓库边界检查和 macOS 元数据污染检查。
+
+## 本地启动
+
+复制 [`.env.example`](.env.example) 中的变量到本地环境，并确保 PostgreSQL 已创建对应数据库。迁移与服务启动必须分开执行：
+
+```bash
+go run ./apps/release-api migrate
+go run ./apps/release-api serve
+```
+
+默认管理 API 监听 `127.0.0.1:8080`，可访问：
+
+- `GET /health/live`：进程存活检查；
+- `GET /health/ready`：PostgreSQL 就绪检查；
+- `GET /version`：构建版本信息。
+
+Worker 目前保持安全关闭，直到具体领域作业处理器完成后才会进入消费循环。
+
+## PostgreSQL 集成测试
+
+集成测试只接受数据库名包含 `test` 的连接串，避免误清理非测试数据库：
+
+```bash
+export XMINDS_RELEASE_TEST_DATABASE_URL='postgres://xminds_release_test:xminds_release_test@127.0.0.1:55432/xminds_release_test?sslmode=disable'
+make test-integration
+```
 
 ## 安全原则
 

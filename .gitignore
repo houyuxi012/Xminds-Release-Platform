@@ -10,6 +10,7 @@
 /.cache/
 /.tmp/
 /.worktrees/
+/docs/superpowers/
 
 # Local configuration and secrets
 .env

@@ -1,0 +1,145 @@
+openapi: 3.1.0
+info:
+  title: Xminds Release Platform API
+  version: 0.1.0-p0
+  description: |
+    Xminds Release Platform 管理面与工作负载 API 基础契约。
+    管理操作使用 OIDC Bearer Token，自动化工作负载使用独立工作负载令牌。
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+servers:
+  - url: /
+    description: 当前部署来源
+security:
+  - oidcBearer: []
+tags:
+  - name: System
+    description: 存活、就绪和版本信息
+paths:
+  /health/live:
+    get:
+      operationId: getLiveness
+      summary: 存活检查
+      description: 仅表示进程可响应，不检查外部依赖。
+      tags: [System]
+      security: []
+      responses:
+        '200':
+          description: 进程存活
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+              examples:
+                live:
+                  value:
+                    status: ok
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /health/ready:
+    get:
+      operationId: getReadiness
+      summary: 就绪检查
+      description: 检查 PostgreSQL 等关键依赖是否可用。
+      tags: [System]
+      security: []
+      responses:
+        '200':
+          description: 服务就绪
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+              examples:
+                ready:
+                  value:
+                    status: ready
+        '503':
+          description: 关键依赖不可用
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+  /version:
+    get:
+      operationId: getVersion
+      summary: 获取构建版本
+      tags: [System]
+      security: []
+      responses:
+        '200':
+          description: 当前构建信息
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BuildInfo'
+        '500':
+          $ref: '#/components/responses/InternalError'
+components:
+  securitySchemes:
+    oidcBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: OIDC-JWT
+      description: 面向控制台用户的企业 OIDC 身份令牌；Issuer 通过部署配置提供。
+    workloadBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: 面向 CI/CD、客户端与同步执行器的短期工作负载令牌。
+  responses:
+    InternalError:
+      description: 服务内部错误
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+  schemas:
+    HealthStatus:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status:
+          type: string
+          minLength: 1
+          maxLength: 32
+    BuildInfo:
+      type: object
+      additionalProperties: false
+      required: [product, version, commit, build_time]
+      properties:
+        product:
+          type: string
+        version:
+          type: string
+        commit:
+          type: string
+        build_time:
+          type: string
+    ProblemDetails:
+      type: object
+      additionalProperties: false
+      required: [type, title, status, code, request_id]
+      properties:
+        type:
+          type: string
+          format: uri-reference
+        title:
+          type: string
+        status:
+          type: integer
+          minimum: 400
+          maximum: 599
+        detail:
+          type: string
+        instance:
+          type: string
+          format: uri-reference
+        code:
+          type: string
+          pattern: '^[A-Z][A-Z0-9_]{2,127}$'
+        request_id:
+          type: string
+          format: uuid

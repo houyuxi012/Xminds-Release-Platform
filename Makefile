@@ -13,7 +13,7 @@ LDFLAGS := -s -w \
 	-X '$(BUILDINFO_PACKAGE).buildTime=$(BUILD_TIME)'
 GO_FILES := $(shell find apps internal tests -type f -name '*.go' 2>/dev/null)
 
-.PHONY: fmt fmt-check lint golangci test build boundary-check metadata-check verify clean
+.PHONY: fmt fmt-check lint golangci test test-integration build boundary-check metadata-check verify clean
 
 fmt:
 	gofmt -w $(GO_FILES)
@@ -38,6 +38,13 @@ golangci:
 
 test:
 	GOCACHE="$(GOCACHE)" $(GO) test ./... -race -count=1
+
+test-integration:
+	@test -n "$$XMINDS_RELEASE_TEST_DATABASE_URL" || { \
+		echo 'XMINDS_RELEASE_TEST_DATABASE_URL is required' >&2; \
+		exit 1; \
+	}
+	GOCACHE="$(GOCACHE)" $(GO) test ./tests/integration -race -count=1 -v
 
 build:
 	mkdir -p bin
