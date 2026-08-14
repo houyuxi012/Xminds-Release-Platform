@@ -1,0 +1,11 @@
+DROP TRIGGER IF EXISTS artifact_upload_parts_require_active_upload ON artifact_upload_parts;
+DROP FUNCTION IF EXISTS require_uploading_session_for_part();
+DROP TRIGGER IF EXISTS artifact_uploads_protect_transition ON artifact_uploads;
+DROP FUNCTION IF EXISTS protect_artifact_upload_transition();
+DROP TRIGGER IF EXISTS artifact_product_bindings_immutable ON artifact_product_bindings;
+DROP TRIGGER IF EXISTS artifacts_immutable ON artifacts;
+DROP FUNCTION IF EXISTS reject_immutable_artifact_mutation();
+DROP TABLE IF EXISTS artifact_upload_parts;
+DROP TABLE IF EXISTS artifact_uploads;
+DROP TABLE IF EXISTS artifact_product_bindings;
+DROP TABLE IF EXISTS artifacts;

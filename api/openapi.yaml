@@ -18,6 +18,8 @@ tags:
     description: 存活、就绪和版本信息
   - name: Products
     description: 多产品注册、产品范围查询与生命周期管理
+  - name: Artifacts
+    description: 可恢复分块上传、服务端摘要校验与不可变制品元数据
   - name: Audit
     description: 产品范围内的不可变审计事件查询与导出
 paths:
@@ -219,6 +221,243 @@ paths:
             application/problem+json:
               schema:
                 $ref: '#/components/schemas/ProblemDetails'
+  /api/v1/products/{product_id}/artifact-uploads:
+    post:
+      operationId: beginArtifactUpload
+      summary: 创建可恢复制品上传会话
+      description: 创建有效期 24 小时的临时上传会话；最终对象仅在服务端 SHA-256 校验通过后可见。
+      tags: [Artifacts]
+      security:
+        - oidcBearer: []
+        - workloadBearer: []
+      x-required-action: artifact.publish
+      parameters:
+        - $ref: '#/components/parameters/ProductIDPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BeginArtifactUploadRequest'
+      responses:
+        '201':
+          description: 上传会话已创建
+          headers:
+            Location:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ArtifactUpload'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: 产品不存在
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+        '413':
+          description: 请求或制品声明超过大小限制
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+        '415':
+          description: 请求媒体类型不受支持
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+        '422':
+          description: 制品元数据无效
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+  /api/v1/products/{product_id}/artifact-uploads/{upload_id}/parts/{part_number}:
+    put:
+      operationId: putArtifactUploadPart
+      summary: 上传或重传制品分块
+      description: 相同 part_number 可安全重传并替换旧分块；除最终分块外每块至少 5 MiB，单块不超过 256 MiB。
+      tags: [Artifacts]
+      security:
+        - oidcBearer: []
+        - workloadBearer: []
+      x-required-action: artifact.publish
+      parameters:
+        - $ref: '#/components/parameters/ProductIDPath'
+        - $ref: '#/components/parameters/UploadIDPath'
+        - name: part_number
+          in: path
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 10000
+        - name: X-Part-SHA256
+          in: header
+          required: true
+          schema:
+            type: string
+            pattern: '^[0-9a-f]{64}$'
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '200':
+          description: 分块已保存
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ArtifactUploadPart'
+        '400':
+          description: 上传 ID 或分块编号无效
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: 上传会话不存在或不属于路径产品
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+        '410':
+          description: 上传会话已过期
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+        '411':
+          description: 缺少 Content-Length
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+        '413':
+          description: 分块超过 256 MiB
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+        '415':
+          description: 请求媒体类型不受支持
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+        '422':
+          description: 分块大小或摘要无效
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+  /api/v1/products/{product_id}/artifact-uploads/{upload_id}/complete:
+    post:
+      operationId: completeArtifactUpload
+      summary: 完成上传并校验制品
+      description: 服务端流式计算完整对象 SHA-256；不信任客户端 ETag，摘要不一致时隔离临时对象并创建清理任务。
+      tags: [Artifacts]
+      security:
+        - oidcBearer: []
+        - workloadBearer: []
+      x-required-action: artifact.publish
+      parameters:
+        - $ref: '#/components/parameters/ProductIDPath'
+        - $ref: '#/components/parameters/UploadIDPath'
+      responses:
+        '200':
+          description: 制品已校验并固化，或返回已有内容寻址制品
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Artifact'
+        '400':
+          description: 上传 ID 无效
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: 上传会话不存在或不属于路径产品
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+        '409':
+          description: 分块不完整或上传状态冲突
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+        '410':
+          description: 上传会话已过期
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+        '422':
+          description: 完整对象摘要或大小不匹配
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+  /api/v1/products/{product_id}/artifacts/{artifact_id}:
+    get:
+      operationId: getArtifact
+      summary: 获取产品范围内的不可变制品元数据
+      tags: [Artifacts]
+      security:
+        - oidcBearer: []
+        - workloadBearer: []
+      x-required-action: product.read
+      parameters:
+        - $ref: '#/components/parameters/ProductIDPath'
+        - name: artifact_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: 制品元数据；不暴露内部对象存储键或凭据
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Artifact'
+        '400':
+          description: 制品 ID 无效
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: 制品不存在或未绑定到路径产品
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
   /api/v1/audit-events:
     get:
       operationId: queryAuditEvents
@@ -353,6 +592,13 @@ components:
         type: string
         minLength: 1
         maxLength: 128
+    UploadIDPath:
+      name: upload_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
   securitySchemes:
     oidcBearer:
       type: http
@@ -565,6 +811,149 @@ components:
             $ref: '#/components/schemas/Product'
         next_cursor:
           type: string
+    BeginArtifactUploadRequest:
+      type: object
+      additionalProperties: false
+      required: [artifact_type, filename, content_type, size, sha256]
+      properties:
+        artifact_type:
+          type: string
+          pattern: '^[a-z][a-z0-9._-]{0,63}$'
+        filename:
+          type: string
+          minLength: 1
+          maxLength: 255
+        content_type:
+          type: string
+          minLength: 1
+          maxLength: 255
+        size:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 21474836480
+        sha256:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+    ArtifactUpload:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - product_id
+        - artifact_type
+        - filename
+        - content_type
+        - expected_size
+        - expected_sha256
+        - status
+        - expires_at
+        - created_by
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        product_id:
+          type: string
+          pattern: '^[a-z][a-z0-9-]{1,62}$'
+        artifact_type:
+          type: string
+        filename:
+          type: string
+        content_type:
+          type: string
+        expected_size:
+          type: integer
+          format: int64
+        expected_sha256:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        status:
+          type: string
+          enum: [uploading, completed, quarantined, expired]
+        artifact_id:
+          type: string
+          format: uuid
+        expires_at:
+          type: string
+          format: date-time
+        created_by:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    ArtifactUploadPart:
+      type: object
+      additionalProperties: false
+      required: [upload_id, part_number, size, sha256, etag, created_at, updated_at]
+      properties:
+        upload_id:
+          type: string
+          format: uuid
+        part_number:
+          type: integer
+          minimum: 1
+          maximum: 10000
+        size:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 268435456
+        sha256:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        etag:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    Artifact:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - product_id
+        - artifact_type
+        - filename
+        - content_type
+        - size
+        - sha256
+        - created_by
+        - created_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        product_id:
+          type: string
+          pattern: '^[a-z][a-z0-9-]{1,62}$'
+        artifact_type:
+          type: string
+        filename:
+          type: string
+        content_type:
+          type: string
+        size:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 21474836480
+        sha256:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        created_by:
+          type: string
+        created_at:
+          type: string
+          format: date-time
     AuditOutcome:
       type: string
       enum: [success, denied, failed]

@@ -19,6 +19,10 @@ Xminds Release Platform 是面向企业软件交付场景的多产品可信发�
 - 版本化 `xminds-product-manifest/v1`、双产品无特例注册、默认通道和稳定 SHA-256 Manifest 摘要；
 - 产品、默认通道和审计证据的事务一致性，以及数据库层 Manifest 不可变保护；
 - 产品注册、范围内列表/详情和停用的 OpenAPI 3.1 与 RFC 9457 HTTP 适配器契约。
+- 24 小时可恢复分块上传、20 GiB/10000 分块硬限制、同分块安全重传和产品范围隔离；
+- MinIO/S3 兼容存储适配器、服务端独立 SHA-256 流式校验、内容寻址去重与最终对象不可删除；
+- 摘要不匹配隔离及事务化清理 Outbox，以及制品上传/完成的不可变审计证据；
+- 制品上传、分块、完成与元数据查询的 OpenAPI 3.1 和 RFC 9457 HTTP 适配器契约。
 
 当前运行时只开放存活、就绪和版本端点。产品 HTTP 适配器已经完成并强制从请求上下文获取已验证身份；在运行时组合根完成 OIDC/工作负载身份配置前不会挂载业务路由，避免暴露未受保护的管理接口。
 
@@ -92,6 +96,18 @@ Worker 目前保持安全关闭，直到具体领域作业处理器完成后才�
 export XMINDS_RELEASE_TEST_DATABASE_URL='postgres://xminds_release_test:xminds_release_test@127.0.0.1:55432/xminds_release_test?sslmode=disable'
 make test-integration
 ```
+
+制品端到端集成测试还需要一个隔离的 MinIO 测试桶：
+
+```bash
+export XMINDS_RELEASE_TEST_MINIO_URL='http://127.0.0.1:59000'
+export XMINDS_RELEASE_TEST_MINIO_ACCESS_KEY='仅用于测试的访问密钥'
+export XMINDS_RELEASE_TEST_MINIO_SECRET_KEY='仅用于测试的秘密密钥'
+export XMINDS_RELEASE_TEST_MINIO_BUCKET='xminds-release-test'
+make test-integration
+```
+
+集成测试产生的已校验内容寻址对象保持不可变；测试应使用专用桶，并按环境生命周期整体回收测试桶。
 
 ## 安全原则
 
