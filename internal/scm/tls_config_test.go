@@ -49,6 +49,30 @@ func TestHTTPClientDialsPinnedAddressInsteadOfResolvingRegisteredHostname(t *tes
 	}
 }
 
+func TestHTTPClientDialsPinnedExplicitProxyAddress(t *testing.T) {
+	t.Parallel()
+
+	dialer := &recordingDialer{err: errors.New("stop after observing proxy dial")}
+	client, err := NewHTTPClient(Connection{
+		ID: uuid.New(), Provider: ProviderGitLab, Status: ConnectionStatusActive,
+		APIBaseURL: "https://gitlab.corp.example/api/v4", ResolvedAddresses: []string{"10.20.30.40"},
+		ProxyURL: "http://proxy.corp.example:3128", ProxyResolvedAddresses: []string{"10.20.30.50"},
+	}, HTTPClientOptions{Dialer: dialer})
+	if err != nil {
+		t.Fatalf("NewHTTPClient() error = %v", err)
+	}
+	request, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://gitlab.corp.example/api/v4/version", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Do(request); err == nil {
+		t.Fatal("client proxy request unexpectedly succeeded")
+	}
+	if dialer.address != "10.20.30.50:3128" {
+		t.Fatalf("proxy dial address = %q, want pinned proxy address", dialer.address)
+	}
+}
+
 func TestHTTPClientIgnoresAmbientProxy(t *testing.T) {
 	t.Setenv("HTTPS_PROXY", "http://ambient-proxy.invalid:3128")
 

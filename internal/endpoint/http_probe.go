@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"xminds-release-platform/internal/catalog"
+	"xminds-release-platform/internal/platform/egress"
 )
 
 const maximumProbeMetadataBytes = 8 * 1024 * 1024
@@ -128,22 +129,18 @@ func (probe *HTTPProbe) client(ctx context.Context, baseURL *url.URL, caReferenc
 		}
 	}
 	wantedHost := strings.ToLower(strings.TrimSuffix(baseURL.Hostname(), "."))
+	pinnedDialContext, err := egress.NewPinnedDialContext(wantedHost, addresses, probe.dialer)
+	if err != nil {
+		return nil, errors.Join(ErrHTTPProbeDestination, err)
+	}
 	transport := &http.Transport{
 		Proxy: nil,
 		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
-			host, port, splitErr := net.SplitHostPort(address)
-			if splitErr != nil || strings.ToLower(strings.TrimSuffix(host, ".")) != wantedHost {
-				return nil, ErrHTTPProbeDestination
+			connection, dialErr := pinnedDialContext(ctx, network, address)
+			if dialErr != nil {
+				return nil, errors.Join(ErrHTTPProbeDestination, dialErr)
 			}
-			var failures []error
-			for _, candidate := range addresses {
-				connection, dialErr := probe.dialer.DialContext(ctx, network, net.JoinHostPort(candidate.String(), port))
-				if dialErr == nil {
-					return connection, nil
-				}
-				failures = append(failures, dialErr)
-			}
-			return nil, errors.Join(failures...)
+			return connection, nil
 		},
 		TLSClientConfig: &tls.Config{
 			MinVersion: tls.VersionTLS12,
@@ -167,33 +164,11 @@ func (probe *HTTPProbe) client(ctx context.Context, baseURL *url.URL, caReferenc
 }
 
 func resolveProbeAddresses(ctx context.Context, resolver ProbeIPResolver, host string, allowLoopback bool) ([]netip.Addr, error) {
-	var addresses []netip.Addr
-	if literal, err := netip.ParseAddr(host); err == nil {
-		addresses = []netip.Addr{literal}
-	} else {
-		resolved, resolveErr := resolver.LookupNetIP(ctx, "ip", host)
-		if resolveErr != nil {
-			return nil, errors.Join(ErrHTTPProbeDestination, resolveErr)
-		}
-		addresses = resolved
+	addresses, err := egress.ResolvePinnedAddresses(ctx, resolver, host, egress.Policy{AllowLoopback: allowLoopback, AllowPrivate: true})
+	if err != nil {
+		return nil, errors.Join(ErrHTTPProbeDestination, err)
 	}
-	result := make([]netip.Addr, 0, len(addresses))
-	seen := make(map[netip.Addr]struct{}, len(addresses))
-	for _, address := range addresses {
-		address = address.Unmap()
-		if !address.IsValid() || address.IsUnspecified() || address.IsMulticast() || address.IsLinkLocalUnicast() || (!allowLoopback && address.IsLoopback()) {
-			return nil, ErrHTTPProbeDestination
-		}
-		if _, duplicate := seen[address]; duplicate {
-			continue
-		}
-		seen[address] = struct{}{}
-		result = append(result, address)
-	}
-	if len(result) == 0 {
-		return nil, ErrHTTPProbeDestination
-	}
-	return result, nil
+	return addresses, nil
 }
 
 func parseProbeBaseURL(raw string) (*url.URL, error) {

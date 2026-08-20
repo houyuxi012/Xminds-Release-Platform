@@ -39,6 +39,12 @@ func ResolvePinnedAddresses(ctx context.Context, resolver IPResolver, host strin
 		}
 		addresses = resolved
 	}
+	return NormalizeAddresses(addresses, policy)
+}
+
+// NormalizeAddresses applies the shared outbound address policy and returns a
+// stable, de-duplicated set suitable for transactionally pinned dialing.
+func NormalizeAddresses(addresses []netip.Addr, policy Policy) ([]netip.Addr, error) {
 	result := make([]netip.Addr, 0, len(addresses))
 	seen := make(map[netip.Addr]struct{}, len(addresses))
 	for _, address := range addresses {

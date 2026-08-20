@@ -12,6 +12,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	platformegress "xminds-release-platform/internal/platform/egress"
 )
 
 const maximumEnterpriseCABundleBytes = 1024 * 1024
@@ -65,17 +67,29 @@ func NewHTTPClient(connection Connection, options HTTPClientOptions) (*http.Clie
 	if options.Dialer == nil {
 		options.Dialer = &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
 	}
+	baseHost := strings.ToLower(strings.TrimSuffix(baseURL.Hostname(), "."))
+	baseDialContext, err := platformegress.NewPinnedDialContext(baseHost, pinned, options.Dialer)
+	if err != nil {
+		return nil, errors.Join(ErrEgressConfigurationInvalid, err)
+	}
 
 	var proxyURL *url.URL
 	proxyPinned := []netip.Addr(nil)
+	proxyHost := ""
+	var proxyDialContext func(context.Context, string, string) (net.Conn, error)
 	if strings.TrimSpace(connection.ProxyURL) != "" {
 		proxyURL, err = parseExplicitProxyURL(connection.ProxyURL)
 		if err != nil {
 			return nil, err
 		}
+		proxyHost = strings.ToLower(strings.TrimSuffix(proxyURL.Hostname(), "."))
 		proxyPinned, err = validatePinnedAddresses(connection.ProxyResolvedAddresses, options.AllowLoopback)
 		if err != nil {
 			return nil, err
+		}
+		proxyDialContext, err = platformegress.NewPinnedDialContext(proxyHost, proxyPinned, options.Dialer)
+		if err != nil {
+			return nil, errors.Join(ErrEgressConfigurationInvalid, err)
 		}
 	}
 	noProxy := make(map[string]struct{}, len(connection.NoProxy))
@@ -101,26 +115,22 @@ func NewHTTPClient(connection Connection, options HTTPClientOptions) (*http.Clie
 			return proxyURL, nil
 		},
 		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
-			host, port, splitErr := net.SplitHostPort(address)
+			host, _, splitErr := net.SplitHostPort(address)
 			if splitErr != nil {
 				return nil, ErrEgressDestinationDenied
 			}
 			host = strings.ToLower(strings.TrimSuffix(host, "."))
-			addresses := pinned
-			if proxyURL != nil && host == strings.ToLower(proxyURL.Hostname()) {
-				addresses = proxyPinned
-			} else if host != strings.ToLower(baseURL.Hostname()) {
+			dialContext := baseDialContext
+			if proxyURL != nil && host == proxyHost {
+				dialContext = proxyDialContext
+			} else if host != baseHost {
 				return nil, ErrEgressDestinationDenied
 			}
-			var dialErrors []error
-			for _, address := range addresses {
-				connection, dialErr := options.Dialer.DialContext(ctx, network, net.JoinHostPort(address.String(), port))
-				if dialErr == nil {
-					return connection, nil
-				}
-				dialErrors = append(dialErrors, dialErr)
+			connection, dialErr := dialContext(ctx, network, address)
+			if dialErr != nil {
+				return nil, errors.Join(ErrEgressDestinationDenied, dialErr)
 			}
-			return nil, errors.Join(dialErrors...)
+			return connection, nil
 		},
 		TLSClientConfig:       tlsConfiguration,
 		TLSHandshakeTimeout:   10 * time.Second,
@@ -160,19 +170,17 @@ func validatePinnedAddresses(raw []string, allowLoopback bool) ([]netip.Addr, er
 	if len(raw) == 0 {
 		return nil, ErrEgressConfigurationInvalid
 	}
-	result := make([]netip.Addr, 0, len(raw))
-	seen := make(map[netip.Addr]struct{}, len(raw))
+	parsed := make([]netip.Addr, 0, len(raw))
 	for _, item := range raw {
 		address, err := netip.ParseAddr(strings.TrimSpace(item))
-		if err != nil || address.IsUnspecified() || address.IsMulticast() || address.IsLinkLocalUnicast() || (!allowLoopback && address.IsLoopback()) {
+		if err != nil {
 			return nil, ErrEgressConfigurationInvalid
 		}
-		address = address.Unmap()
-		if _, duplicate := seen[address]; duplicate {
-			return nil, ErrEgressConfigurationInvalid
-		}
-		seen[address] = struct{}{}
-		result = append(result, address)
+		parsed = append(parsed, address)
+	}
+	result, err := platformegress.NormalizeAddresses(parsed, platformegress.Policy{AllowLoopback: allowLoopback, AllowPrivate: true})
+	if err != nil || len(result) != len(raw) {
+		return nil, ErrEgressConfigurationInvalid
 	}
 	return result, nil
 }

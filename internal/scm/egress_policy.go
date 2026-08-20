@@ -8,6 +8,8 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+
+	platformegress "xminds-release-platform/internal/platform/egress"
 )
 
 var (
@@ -32,25 +34,16 @@ func ResolveConnection(ctx context.Context, connection Connection, resolver IPRe
 	if err != nil {
 		return Connection{}, err
 	}
-	addresses, err := resolver.LookupNetIP(ctx, "ip", parsed.Hostname())
+	addresses, err := platformegress.ResolvePinnedAddresses(ctx, resolver, parsed.Hostname(), platformegress.Policy{AllowPrivate: true})
 	if err != nil {
-		return Connection{}, errors.Join(ErrEgressDestinationDenied, err)
-	}
-	seen := make(map[netip.Addr]struct{}, len(addresses))
-	resolved := make([]string, 0, len(addresses))
-	for _, address := range addresses {
-		address = address.Unmap()
-		if !address.IsValid() || address.IsUnspecified() || address.IsMulticast() || address.IsLinkLocalUnicast() || address.IsLoopback() {
+		if err == platformegress.ErrDestinationDenied {
 			return Connection{}, ErrEgressDestinationDenied
 		}
-		if _, duplicate := seen[address]; duplicate {
-			continue
-		}
-		seen[address] = struct{}{}
-		resolved = append(resolved, address.String())
+		return Connection{}, errors.Join(ErrEgressDestinationDenied, err)
 	}
-	if len(resolved) == 0 {
-		return Connection{}, ErrEgressDestinationDenied
+	resolved := make([]string, 0, len(addresses))
+	for _, address := range addresses {
+		resolved = append(resolved, address.String())
 	}
 	sort.Strings(resolved)
 	connection.ResolvedAddresses = resolved

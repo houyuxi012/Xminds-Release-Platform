@@ -31,6 +31,21 @@ func TestResolvePinnedAddressesRejectsUnsafeAndMixedDNSAnswers(t *testing.T) {
 	}
 }
 
+func TestNormalizeAddressesProvidesSharedPolicyBoundary(t *testing.T) {
+	addresses, err := NormalizeAddresses([]netip.Addr{
+		netip.MustParseAddr("::ffff:192.0.2.20"), netip.MustParseAddr("192.0.2.20"), netip.MustParseAddr("10.20.30.40"),
+	}, Policy{AllowPrivate: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(addresses) != 2 || addresses[0].String() != "192.0.2.20" || addresses[1].String() != "10.20.30.40" {
+		t.Fatalf("normalized addresses=%v", addresses)
+	}
+	if _, err := NormalizeAddresses([]netip.Addr{netip.MustParseAddr("192.0.2.20"), netip.MustParseAddr("169.254.169.254")}, Policy{AllowPrivate: true}); !errors.Is(err, ErrDestinationDenied) {
+		t.Fatalf("mixed unsafe addresses error=%v", err)
+	}
+}
+
 func TestPinnedDialContextUsesOnlyResolvedAddressesAndRejectsHostReplay(t *testing.T) {
 	dialer := &recordingPinnedDialer{}
 	dialContext, err := NewPinnedDialContext("directory.example.com", []netip.Addr{
