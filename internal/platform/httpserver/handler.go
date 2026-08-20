@@ -19,6 +19,21 @@ type HealthChecker interface {
 }
 
 func NewHandler(healthChecker HealthChecker, info buildinfo.Info) http.Handler {
+	return newHandler(healthChecker, info, nil, nil)
+}
+
+type Middleware func(http.Handler) http.Handler
+
+type RouteRegistrar func(chi.Router)
+
+// NewManagementHandler keeps operational endpoints available without a token
+// while placing every registered business route behind one fail-closed
+// authentication boundary.
+func NewManagementHandler(healthChecker HealthChecker, info buildinfo.Info, authentication Middleware, register RouteRegistrar) http.Handler {
+	return newHandler(healthChecker, info, authentication, register)
+}
+
+func newHandler(healthChecker HealthChecker, info buildinfo.Info, authentication Middleware, register RouteRegistrar) http.Handler {
 	router := chi.NewRouter()
 	router.Use(securityHeaders)
 	router.Use(requestID)
@@ -41,6 +56,16 @@ func NewHandler(healthChecker HealthChecker, info buildinfo.Info) http.Handler {
 	router.Get("/version", func(writer http.ResponseWriter, _ *http.Request) {
 		writeJSON(writer, http.StatusOK, info)
 	})
+	if register != nil {
+		router.Group(func(protected chi.Router) {
+			if authentication == nil {
+				protected.Use(authenticationUnavailable)
+			} else {
+				protected.Use(authentication)
+			}
+			register(protected)
+		})
+	}
 	router.NotFound(func(writer http.ResponseWriter, request *http.Request) {
 		httpx.WriteProblem(writer, httpx.NewProblem(
 			http.StatusNotFound,
@@ -59,6 +84,17 @@ func NewHandler(healthChecker HealthChecker, info buildinfo.Info) http.Handler {
 	})
 
 	return otelhttp.NewHandler(router, "xminds-release-platform.http")
+}
+
+func authenticationUnavailable(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		httpx.WriteProblem(writer, httpx.NewProblem(
+			http.StatusServiceUnavailable,
+			"AUTHENTICATION_NOT_CONFIGURED",
+			"Authentication service is unavailable",
+			nil,
+		).WithRequestID(httpx.RequestIDFromContext(request.Context())).WithInstance(request.URL.Path))
+	})
 }
 
 func securityHeaders(next http.Handler) http.Handler {

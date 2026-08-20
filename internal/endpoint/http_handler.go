@@ -34,10 +34,14 @@ func NewHTTPHandler(application EndpointApplication) http.Handler {
 		})
 	}
 	router := chi.NewRouter()
+	RegisterRoutes(router, application)
+	return router
+}
+
+func RegisterRoutes(router chi.Router, application EndpointApplication) {
 	router.Post("/api/v1/endpoints", registerEndpointHandler(application))
 	router.Get("/api/v1/endpoints/{endpoint_id}", getEndpointHandler(application))
 	router.Post("/api/v1/endpoints/{endpoint_id}/activate", activateEndpointHandler(application))
-	return router
 }
 
 func registerEndpointHandler(application EndpointApplication) http.HandlerFunc {

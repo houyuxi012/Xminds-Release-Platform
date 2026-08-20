@@ -98,3 +98,108 @@ func TestAuthenticationMiddlewareDoesNotLeakVerifierError(t *testing.T) {
 		t.Fatalf("request ID missing: %s", response.Body.String())
 	}
 }
+
+func TestManagementVerifierRoutesAPITokensWithoutOIDCFallback(t *testing.T) {
+	t.Parallel()
+
+	humanCalls := 0
+	workloadCalls := 0
+	verifier, err := NewManagementVerifier(
+		verifierFunc(func(context.Context, string) (Principal, error) {
+			humanCalls++
+			return Principal{}, errors.New("human verifier must not receive API tokens")
+		}),
+		verifierFunc(func(context.Context, string) (Principal, error) {
+			workloadCalls++
+			return Principal{}, errors.New("workload verifier must not receive API tokens")
+		}),
+		verifierFunc(func(_ context.Context, rawToken string) (Principal, error) {
+			if rawToken != "xrp.018f835d-7e4b-7abc-9f42-67a2f5f48e01.c2VjcmV0LXNlY3JldC1zZWNyZXQtc2VjcmV0LXNlY3JldA" {
+				return Principal{}, ErrAPITokenInvalid
+			}
+			return Principal{Subject: "automation", Kind: PrincipalKindWorkload}, nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewManagementVerifier() error = %v", err)
+	}
+
+	principal, err := verifier.Verify(context.Background(), "xrp.018f835d-7e4b-7abc-9f42-67a2f5f48e01.c2VjcmV0LXNlY3JldC1zZWNyZXQtc2VjcmV0LXNlY3JldA")
+	if err != nil {
+		t.Fatalf("Verify() error = %v", err)
+	}
+	if principal.Subject != "automation" || humanCalls != 0 || workloadCalls != 0 {
+		t.Fatalf("principal = %#v, human calls = %d, workload calls = %d", principal, humanCalls, workloadCalls)
+	}
+}
+
+func TestManagementVerifierFallsBackOnlyForWorkloadTokenUse(t *testing.T) {
+	t.Parallel()
+
+	workload := Principal{Subject: "github-runner", Kind: PrincipalKindWorkload}
+	verifier, err := NewManagementVerifier(
+		verifierFunc(func(context.Context, string) (Principal, error) {
+			return Principal{}, ErrTokenUseInvalid
+		}),
+		verifierFunc(func(context.Context, string) (Principal, error) {
+			return workload, nil
+		}),
+		verifierFunc(func(context.Context, string) (Principal, error) {
+			return Principal{}, ErrAPITokenInvalid
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewManagementVerifier() error = %v", err)
+	}
+
+	principal, err := verifier.Verify(context.Background(), "signed-workload-token")
+	if err != nil {
+		t.Fatalf("Verify() error = %v", err)
+	}
+	if principal.Subject != workload.Subject || principal.Kind != PrincipalKindWorkload {
+		t.Fatalf("principal = %#v", principal)
+	}
+
+	verificationFailure := errors.New("signature verification failed")
+	workloadCalled := false
+	strictVerifier, err := NewManagementVerifier(
+		verifierFunc(func(context.Context, string) (Principal, error) {
+			return Principal{}, verificationFailure
+		}),
+		verifierFunc(func(context.Context, string) (Principal, error) {
+			workloadCalled = true
+			return workload, nil
+		}),
+		verifierFunc(func(context.Context, string) (Principal, error) {
+			return Principal{}, ErrAPITokenInvalid
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewManagementVerifier() error = %v", err)
+	}
+	if _, err := strictVerifier.Verify(context.Background(), "invalid-token"); !errors.Is(err, verificationFailure) {
+		t.Fatalf("Verify() error = %v, want %v", err, verificationFailure)
+	}
+	if workloadCalled {
+		t.Fatal("workload verifier accepted fallback after a signature failure")
+	}
+}
+
+func TestManagementVerifierRejectsIncompleteConfiguration(t *testing.T) {
+	t.Parallel()
+
+	valid := verifierFunc(func(context.Context, string) (Principal, error) {
+		return Principal{}, ErrAuthenticationFailed
+	})
+	for name, verifiers := range map[string][]Verifier{
+		"human":     {nil, valid, valid},
+		"workload":  {valid, nil, valid},
+		"api token": {valid, valid, nil},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := NewManagementVerifier(verifiers[0], verifiers[1], verifiers[2]); !errors.Is(err, ErrManagementVerifierConfiguration) {
+				t.Fatalf("NewManagementVerifier() error = %v", err)
+			}
+		})
+	}
+}

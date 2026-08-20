@@ -8,6 +8,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/go-chi/chi/v5"
+
+	"xminds-release-platform/internal/identity"
 	"xminds-release-platform/internal/platform/buildinfo"
 )
 
@@ -80,4 +83,82 @@ func TestReadinessUsesSafeProblemDetails(t *testing.T) {
 	if response.Header().Get("Content-Type") != "application/problem+json" {
 		t.Fatalf("Content-Type = %q", response.Header().Get("Content-Type"))
 	}
+}
+
+func TestManagementHandlerProtectsBusinessRoutesButNotHealth(t *testing.T) {
+	t.Parallel()
+
+	principal := identity.Principal{
+		Subject:    "alice",
+		Kind:       identity.PrincipalKindHuman,
+		Roles:      []identity.Role{identity.RoleAdmin},
+		ProductIDs: []string{"ngep"},
+		TokenID:    "token-1",
+	}
+	verifier := identityVerifierFunc(func(_ context.Context, rawToken string) (identity.Principal, error) {
+		if rawToken != "signed-token" {
+			return identity.Principal{}, identity.ErrAuthenticationFailed
+		}
+		return principal, nil
+	})
+	handler := NewManagementHandler(
+		healthCheckerFunc(func(context.Context) error { return nil }),
+		buildinfo.Current(),
+		identity.AuthenticationMiddleware(verifier),
+		func(router chi.Router) {
+			router.Get("/api/v1/products", func(writer http.ResponseWriter, request *http.Request) {
+				verified, ok := identity.PrincipalFromContext(request.Context())
+				if !ok || verified.Subject != "alice" {
+					t.Fatalf("PrincipalFromContext() = %#v, %v", verified, ok)
+				}
+				writer.WriteHeader(http.StatusNoContent)
+			})
+		},
+	)
+
+	healthResponse := httptest.NewRecorder()
+	handler.ServeHTTP(healthResponse, httptest.NewRequest(http.MethodGet, "/health/live", nil))
+	if healthResponse.Code != http.StatusOK {
+		t.Fatalf("health status = %d, body = %s", healthResponse.Code, healthResponse.Body.String())
+	}
+
+	unauthorizedResponse := httptest.NewRecorder()
+	handler.ServeHTTP(unauthorizedResponse, httptest.NewRequest(http.MethodGet, "/api/v1/products", nil))
+	if unauthorizedResponse.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status = %d, body = %s", unauthorizedResponse.Code, unauthorizedResponse.Body.String())
+	}
+
+	authorizedRequest := httptest.NewRequest(http.MethodGet, "/api/v1/products", nil)
+	authorizedRequest.Header.Set("Authorization", "Bearer signed-token")
+	authorizedResponse := httptest.NewRecorder()
+	handler.ServeHTTP(authorizedResponse, authorizedRequest)
+	if authorizedResponse.Code != http.StatusNoContent {
+		t.Fatalf("authorized status = %d, body = %s", authorizedResponse.Code, authorizedResponse.Body.String())
+	}
+}
+
+func TestManagementHandlerFailsClosedWithoutAuthenticationMiddleware(t *testing.T) {
+	t.Parallel()
+
+	handler := NewManagementHandler(
+		healthCheckerFunc(func(context.Context) error { return nil }),
+		buildinfo.Current(),
+		nil,
+		func(router chi.Router) {
+			router.Get("/api/v1/products", func(writer http.ResponseWriter, _ *http.Request) {
+				writer.WriteHeader(http.StatusNoContent)
+			})
+		},
+	)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/v1/products", nil))
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+}
+
+type identityVerifierFunc func(context.Context, string) (identity.Principal, error)
+
+func (function identityVerifierFunc) Verify(ctx context.Context, token string) (identity.Principal, error) {
+	return function(ctx, token)
 }

@@ -38,11 +38,15 @@ func NewHTTPHandler(application ArtifactApplication) http.Handler {
 		})
 	}
 	router := chi.NewRouter()
+	RegisterRoutes(router, application)
+	return router
+}
+
+func RegisterRoutes(router chi.Router, application ArtifactApplication) {
 	router.Post("/api/v1/products/{product_id}/artifact-uploads", beginUploadHandler(application))
 	router.Put("/api/v1/products/{product_id}/artifact-uploads/{upload_id}/parts/{part_number}", putPartHandler(application))
 	router.Post("/api/v1/products/{product_id}/artifact-uploads/{upload_id}/complete", completeUploadHandler(application))
 	router.Get("/api/v1/products/{product_id}/artifacts/{artifact_id}", getArtifactHandler(application))
-	return router
 }
 
 type beginUploadRequest struct {

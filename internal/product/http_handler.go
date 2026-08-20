@@ -37,13 +37,17 @@ func NewHTTPHandler(application ProductApplication) http.Handler {
 		})
 	}
 	router := chi.NewRouter()
+	RegisterRoutes(router, application)
+	return router
+}
+
+func RegisterRoutes(router chi.Router, application ProductApplication) {
 	router.Route("/api/v1/products", func(router chi.Router) {
 		router.Post("/", registerProductHandler(application))
 		router.Get("/", listProductsHandler(application))
 		router.Get("/{product_id}", getProductHandler(application))
 		router.Post("/{product_id}/deactivate", deactivateProductHandler(application))
 	})
-	return router
 }
 
 func registerProductHandler(application ProductApplication) http.HandlerFunc {

@@ -42,6 +42,11 @@ func NewHTTPHandler(application ReleaseApplication) http.Handler {
 		})
 	}
 	router := chi.NewRouter()
+	RegisterRoutes(router, application)
+	return router
+}
+
+func RegisterRoutes(router chi.Router, application ReleaseApplication) {
 	router.Post("/api/v1/products/{product_id}/releases", createReleaseHandler(application))
 	router.Post("/api/v1/products/{product_id}/releases/{release_id}/submit", releaseTransitionHandler(application, "submit"))
 	router.Post("/api/v1/products/{product_id}/releases/{release_id}/approve", releaseTransitionHandler(application, "approve"))
@@ -50,7 +55,6 @@ func NewHTTPHandler(application ReleaseApplication) http.Handler {
 	router.Post("/api/v1/products/{product_id}/releases/{release_id}/retry", releaseOperationHandler(application, "retry"))
 	router.Post("/api/v1/products/{product_id}/releases/{release_id}/revoke", releaseOperationHandler(application, "revoke"))
 	router.Get("/api/v1/products/{product_id}/releases/{release_id}", getReleaseHandler(application))
-	return router
 }
 
 type createReleaseRequest struct {
