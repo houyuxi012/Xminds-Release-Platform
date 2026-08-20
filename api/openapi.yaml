@@ -177,6 +177,67 @@ paths:
                 $ref: '#/components/schemas/ProblemDetails'
         '500':
           $ref: '#/components/responses/InternalError'
+  /api/v1/auth/reauth-challenges:
+    post:
+      operationId: createReauthenticationChallenge
+      summary: 创建服务器端高风险重认证挑战
+      tags: [Identity Governance]
+      x-required-action: identity.manage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateReauthenticationChallengeRequest'
+      responses:
+        '201':
+          description: 挑战已创建；响应不包含高风险授权 evidence
+          headers:
+            Cache-Control:
+              schema: {type: string, const: no-store}
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReauthenticationChallenge'
+        '400': {$ref: '#/components/responses/UnprocessableEntity'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /api/v1/auth/reauth-challenges/{challenge_id}/complete:
+    post:
+      operationId: completeReauthenticationChallenge
+      summary: 使用可信本地凭据或新鲜 OIDC MFA 完成挑战
+      tags: [Identity Governance]
+      x-required-action: identity.manage
+      parameters:
+        - $ref: '#/components/parameters/ReauthenticationChallengeIDPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CompleteReauthenticationChallengeRequest'
+      responses:
+        '200':
+          description: 成功时一次性返回高风险授权 evidence
+          headers:
+            Cache-Control:
+              schema: {type: string, const: no-store}
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReauthenticationEvidence'
+        '400': {$ref: '#/components/responses/UnprocessableEntity'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429':
+          description: 账号或来源 IP 超过固定窗口重认证限制
+          headers:
+            Retry-After:
+              schema: {type: integer, minimum: 1}
+          content:
+            application/problem+json:
+              schema: {$ref: '#/components/schemas/ProblemDetails'}
+        '500': {$ref: '#/components/responses/InternalError'}
   /api/v1/products:
     post:
       operationId: registerProduct
@@ -1285,7 +1346,7 @@ paths:
     get:
       operationId: listRoleBindings
       summary: 查询角色绑定
-      description: 此 P0 增量仅公开只读查询；创建和删除仍限服务层受控调用。
+      description: 创建和删除必须同时通过服务端重认证、显式确认和乐观版本校验。
       tags: [Identity Governance]
       x-required-action: identity.manage
       parameters:
@@ -1298,6 +1359,104 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RoleBindingPage'
+    post:
+      operationId: createRoleBinding
+      summary: 创建具备主体版本绑定的角色授权
+      tags: [Identity Governance]
+      x-required-action: identity.manage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreateRoleBindingRequest'}
+      responses:
+        '201':
+          description: 角色绑定已创建、关联会话已按需撤销并审计
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/RoleBinding'}
+        '400': {$ref: '#/components/responses/UnprocessableEntity'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /api/v1/role-bindings/{binding_id}:
+    delete:
+      operationId: deleteRoleBinding
+      summary: 按乐观版本删除角色绑定
+      tags: [Identity Governance]
+      x-required-action: identity.manage
+      parameters:
+        - $ref: '#/components/parameters/RoleBindingIDPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/IAMVersionedHighRiskRequest'}
+      responses:
+        '204': {description: 角色绑定已删除、相关会话已撤销并审计}
+        '400': {$ref: '#/components/responses/UnprocessableEntity'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /api/v1/users/{user_id}/disable:
+    post:
+      operationId: disableUser
+      summary: 按乐观版本停用用户并撤销会话
+      tags: [Identity Governance]
+      x-required-action: identity.manage
+      parameters: [{$ref: '#/components/parameters/UserIDPath'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/IAMReasonedHighRiskRequest'}
+      responses:
+        '204': {description: 用户已停用、会话已撤销并审计}
+        '400': {$ref: '#/components/responses/UnprocessableEntity'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /api/v1/users/{user_id}/enable:
+    post:
+      operationId: enableUser
+      summary: 在身份来源仍可用时启用用户
+      tags: [Identity Governance]
+      x-required-action: identity.manage
+      parameters: [{$ref: '#/components/parameters/UserIDPath'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/IAMReasonedHighRiskRequest'}
+      responses:
+        '204': {description: 用户已启用并审计；历史会话不会恢复}
+        '400': {$ref: '#/components/responses/UnprocessableEntity'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /api/v1/users/{user_id}/revoke-sessions:
+    post:
+      operationId: revokeUserSessions
+      summary: 校验用户版本并仅撤销当前会话
+      tags: [Identity Governance]
+      x-required-action: identity.manage
+      parameters: [{$ref: '#/components/parameters/UserIDPath'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/IAMReasonedHighRiskRequest'}
+      responses:
+        '204': {description: 会话已撤销并审计；用户状态和版本不变}
+        '400': {$ref: '#/components/responses/UnprocessableEntity'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '500': {$ref: '#/components/responses/InternalError'}
   /api/v1/identity-sources:
     get:
       operationId: listIdentitySources
@@ -1337,7 +1496,7 @@ paths:
     patch:
       operationId: patchIdentitySourceDraft
       summary: 更新身份源草稿
-      description: 仅草稿可更新；`version` 是必填乐观锁。该增量不提供启用、停用、同步或任何客户端自报重新认证时间戳接口。
+      description: 仅草稿可更新；`version` 是必填乐观锁。身份源启停仅接受服务端一次性重认证 evidence，不接受客户端自报重新认证时间戳。
       tags: [Identity Governance]
       x-required-action: identity.manage
       parameters:
@@ -1357,6 +1516,44 @@ paths:
                 $ref: '#/components/schemas/IdentitySource'
         '409':
           $ref: '#/components/responses/Conflict'
+  /api/v1/identity-sources/{source_id}/enable:
+    post:
+      operationId: enableIdentitySourceSSO
+      summary: 满足安全前置条件后启用 SSO
+      tags: [Identity Governance]
+      x-required-action: identity.manage
+      parameters: [{$ref: '#/components/parameters/IdentitySourceIDPath'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/IAMVersionedHighRiskRequest'}
+      responses:
+        '204': {description: SSO 已启用、普通本地会话已撤销并审计}
+        '400': {$ref: '#/components/responses/UnprocessableEntity'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /api/v1/identity-sources/{source_id}/disable:
+    post:
+      operationId: disableIdentitySourceSSO
+      summary: 仅停用当前活动身份源并返回本地模式
+      tags: [Identity Governance]
+      x-required-action: identity.manage
+      parameters: [{$ref: '#/components/parameters/IdentitySourceIDPath'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/IAMVersionedHighRiskRequest'}
+      responses:
+        '204': {description: 当前活动身份源已停用并审计}
+        '400': {$ref: '#/components/responses/UnprocessableEntity'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '500': {$ref: '#/components/responses/InternalError'}
 components:
   parameters:
     ProductIDPath:
@@ -1439,6 +1636,21 @@ components:
       schema:
         type: string
         format: uuid
+    UserIDPath:
+      name: user_id
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
+    RoleBindingIDPath:
+      name: binding_id
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
+    ReauthenticationChallengeIDPath:
+      name: challenge_id
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
     Limit:
       name: limit
       in: query
@@ -2463,6 +2675,104 @@ components:
         version: {type: integer, minimum: 1}
         created_at: {type: string, format: date-time}
         updated_at: {type: string, format: date-time}
+    ReauthenticationOperation:
+      type: string
+      enum:
+        - identity.role_binding.create
+        - identity.role_binding.delete
+        - identity.user.disable
+        - identity.user.enable
+        - identity.user.revoke_sessions
+        - identity.sso.enable
+        - identity.sso.disable
+    HighRiskProof:
+      type: object
+      additionalProperties: false
+      required: [challenge_id, evidence, confirmed]
+      properties:
+        challenge_id:
+          type: string
+          format: uuid
+        evidence:
+          type: string
+          pattern: '^xmr_[A-Za-z0-9_-]{43}$'
+          writeOnly: true
+        confirmed:
+          type: boolean
+          const: true
+    CreateReauthenticationChallengeRequest:
+      type: object
+      additionalProperties: false
+      required: [operation]
+      properties:
+        operation:
+          $ref: '#/components/schemas/ReauthenticationOperation'
+    CompleteReauthenticationChallengeRequest:
+      type: object
+      additionalProperties: false
+      description: OIDC MFA 完成时请求体为空对象；本地账号必须提供密码及已配置的 MFA 证明。
+      properties:
+        password:
+          type: string
+          minLength: 1
+          maxLength: 1024
+          writeOnly: true
+        mfa_proof:
+          type: string
+          pattern: '^[0-9]{6,8}$'
+          writeOnly: true
+    ReauthenticationChallenge:
+      type: object
+      additionalProperties: false
+      required: [id, operation, status, expires_at]
+      properties:
+        id: {type: string, format: uuid}
+        operation:
+          $ref: '#/components/schemas/ReauthenticationOperation'
+        status: {type: string, const: pending}
+        expires_at: {type: string, format: date-time}
+    ReauthenticationEvidence:
+      type: object
+      additionalProperties: false
+      required: [challenge_id, evidence, expires_at]
+      properties:
+        challenge_id: {type: string, format: uuid}
+        evidence:
+          type: string
+          pattern: '^xmr_[A-Za-z0-9_-]{43}$'
+          readOnly: true
+        expires_at: {type: string, format: date-time}
+    CreateRoleBindingRequest:
+      type: object
+      additionalProperties: false
+      required: [subject_type, subject_id, subject_version, role, scope_type, effect, reauth]
+      properties:
+        subject_type: {type: string, enum: [user, organization]}
+        subject_id: {type: string, format: uuid}
+        subject_version: {type: integer, minimum: 1}
+        role: {type: string, enum: [admin, publisher, approver, auditor, viewer]}
+        scope_type: {type: string, enum: [platform, product, channel]}
+        product_id: {type: string, maxLength: 128}
+        channel_name: {type: string, maxLength: 64}
+        effect: {type: string, enum: [allow, deny]}
+        valid_from: {type: string, format: date-time}
+        valid_until: {type: string, format: date-time}
+        reauth: {$ref: '#/components/schemas/HighRiskProof'}
+    IAMVersionedHighRiskRequest:
+      type: object
+      additionalProperties: false
+      required: [version, reauth]
+      properties:
+        version: {type: integer, minimum: 1}
+        reauth: {$ref: '#/components/schemas/HighRiskProof'}
+    IAMReasonedHighRiskRequest:
+      type: object
+      additionalProperties: false
+      required: [version, reason, reauth]
+      properties:
+        version: {type: integer, minimum: 1}
+        reason: {type: string, minLength: 1, maxLength: 256}
+        reauth: {$ref: '#/components/schemas/HighRiskProof'}
     RoleBindingPage:
       type: object
       additionalProperties: false

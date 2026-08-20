@@ -93,9 +93,13 @@ var (
 	ErrIdentitySourceNotFound       = errors.New("identity source was not found")
 	ErrUserNotFound                 = errors.New("user was not found")
 	ErrUserAlreadyDisabled          = errors.New("user is already disabled")
+	ErrUserAlreadyEnabled           = errors.New("user is already enabled")
+	ErrUserCannotBeEnabled          = errors.New("user authentication source is not usable")
 	ErrLocalCredentialInvalid       = errors.New("local credential is invalid")
 	ErrLocalCredentialLocked        = errors.New("local credential is locked")
 	ErrDisableReasonRequired        = errors.New("user disable reason is required")
+	ErrEnableReasonRequired         = errors.New("user enable reason is required")
+	ErrRevokeReasonRequired         = errors.New("session revocation reason is required")
 	ErrIdentityFaultCodeInvalid     = errors.New("identity source fault code is invalid")
 	ErrUserInputInvalid             = errors.New("user input is invalid")
 	ErrPageInvalid                  = errors.New("IAM page parameters are invalid")
@@ -216,8 +220,9 @@ type LocalLoginCommand struct {
 type AuthenticationMethod string
 
 const (
-	AuthenticationMethodLocal     AuthenticationMethod = "local_password"
-	AuthenticationMethodEmergency AuthenticationMethod = "emergency_password"
+	AuthenticationMethodLocal            AuthenticationMethod = "local_password"
+	AuthenticationMethodEmergency        AuthenticationMethod = "emergency_password"
+	AuthenticationMethodReauthentication AuthenticationMethod = "reauthentication"
 )
 
 type Session struct {
@@ -313,15 +318,16 @@ type CreateOrganizationCommand struct {
 }
 
 type CreateRoleBindingCommand struct {
-	SubjectType SubjectType
-	SubjectID   uuid.UUID
-	Role        identity.Role
-	ScopeType   ScopeType
-	ProductID   string
-	ChannelName string
-	Effect      BindingEffect
-	ValidFrom   time.Time
-	ValidUntil  time.Time
+	SubjectType    SubjectType
+	SubjectID      uuid.UUID
+	SubjectVersion int64
+	Role           identity.Role
+	ScopeType      ScopeType
+	ProductID      string
+	ChannelName    string
+	Effect         BindingEffect
+	ValidFrom      time.Time
+	ValidUntil     time.Time
 }
 
 type CreateIdentitySourceCommand struct {

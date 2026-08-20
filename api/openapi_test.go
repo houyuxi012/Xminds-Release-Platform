@@ -189,7 +189,7 @@ func TestOpenAPIDefinesEndpointManagementAndUnauthenticatedDistributionOperation
 	}
 }
 
-func TestOpenAPIDefinesReadOnlyRoleBindingsAndDraftIdentityGovernanceOperations(t *testing.T) {
+func TestOpenAPIDefinesGovernedHighRiskIdentityWritesAndReauthentication(t *testing.T) {
 	t.Parallel()
 
 	loader := openapi3.NewLoader()
@@ -204,17 +204,38 @@ func TestOpenAPIDefinesReadOnlyRoleBindingsAndDraftIdentityGovernanceOperations(
 		{path: "/api/v1/organizations", method: "GET"},
 		{path: "/api/v1/organizations", method: "POST"},
 		{path: "/api/v1/role-bindings", method: "GET"},
+		{path: "/api/v1/role-bindings", method: "POST"},
+		{path: "/api/v1/role-bindings/{binding_id}", method: "DELETE"},
+		{path: "/api/v1/users/{user_id}/disable", method: "POST"},
+		{path: "/api/v1/users/{user_id}/enable", method: "POST"},
+		{path: "/api/v1/users/{user_id}/revoke-sessions", method: "POST"},
 		{path: "/api/v1/identity-sources", method: "GET"},
 		{path: "/api/v1/identity-sources", method: "POST"},
 		{path: "/api/v1/identity-sources/{source_id}", method: "PATCH"},
+		{path: "/api/v1/identity-sources/{source_id}/enable", method: "POST"},
+		{path: "/api/v1/identity-sources/{source_id}/disable", method: "POST"},
+		{path: "/api/v1/auth/reauth-challenges", method: "POST"},
+		{path: "/api/v1/auth/reauth-challenges/{challenge_id}/complete", method: "POST"},
 	} {
 		pathItem := document.Paths.Find(testCase.path)
 		if pathItem == nil || pathItem.GetOperation(testCase.method) == nil {
 			t.Fatalf("missing %s %s operation", testCase.method, testCase.path)
 		}
 	}
-	if operation := document.Paths.Find("/api/v1/role-bindings").Post; operation != nil {
-		t.Fatal("role binding creation must remain unavailable over HTTP in this P0 increment")
+	for _, schemaName := range []string{"HighRiskProof", "ReauthenticationChallenge", "ReauthenticationEvidence", "CreateRoleBindingRequest", "IAMVersionedHighRiskRequest", "IAMReasonedHighRiskRequest"} {
+		if schema := document.Components.Schemas[schemaName]; schema == nil || schema.Value == nil {
+			t.Fatalf("%s schema is missing", schemaName)
+		}
+	}
+	challenge := document.Components.Schemas["ReauthenticationChallenge"].Value
+	if _, leaked := challenge.Properties["evidence"]; leaked {
+		t.Fatal("challenge creation response must not expose evidence")
+	}
+	proof := document.Components.Schemas["HighRiskProof"].Value
+	for _, required := range []string{"challenge_id", "evidence", "confirmed"} {
+		if _, found := proof.Properties[required]; !found {
+			t.Fatalf("HighRiskProof.%s is missing", required)
+		}
 	}
 	identitySource := document.Components.Schemas["IdentitySource"].Value
 	if _, leaked := identitySource.Properties["secret_reference"]; leaked {

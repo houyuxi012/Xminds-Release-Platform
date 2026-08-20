@@ -223,7 +223,7 @@ INSERT INTO role_bindings (
 	}
 	if err := failingService.DisableUser(ctx,
 		identity.Principal{Subject: "admin", Kind: identity.PrincipalKindHuman, Roles: []identity.Role{identity.RoleAdmin}},
-		activationUserID, "rollback validation", iam.HighRiskProof{Confirmed: true, ChallengeID: "rollback", Evidence: "rollback"},
+		activationUserID, 2, "rollback validation", iam.HighRiskProof{Confirmed: true, ChallengeID: "rollback", Evidence: "rollback"},
 		iam.RequestContext{RequestID: uuid.NewString(), SourceIP: "127.0.0.1"}); !errors.Is(err, errIntegrationAuditFailure) {
 		t.Fatalf("DisableUser(audit failure) error = %v", err)
 	}
@@ -256,6 +256,387 @@ SELECT 'account', repeat(md5(value::text), 2), $1, 1, $2 FROM generate_series(1,
 	}
 	if cleaned != 64 {
 		t.Fatalf("bounded cleanup removed %d rows", cleaned)
+	}
+}
+
+func TestIAMPostgresReauthenticationConcurrencyAndAuditRollback(t *testing.T) {
+	databaseURL := integrationDatabaseURL(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	pool, err := database.Open(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if err := database.ApplyMigrations(ctx, pool, migrations.FS); err != nil {
+		t.Fatalf("ApplyMigrations() error = %v", err)
+	}
+	if _, err := pool.Exec(ctx, `TRUNCATE TABLE iam_reauthentication_challenges`); err != nil {
+		t.Fatalf("reset reauthentication tables: %v", err)
+	}
+	now := time.Date(2026, 8, 20, 17, 0, 0, 0, time.UTC)
+	repository := iam.NewPostgresRepository(pool)
+	goodAuditor := audit.NewService(audit.NewPostgresRepository(pool))
+	service, err := iam.NewReauthenticationService(iam.ReauthenticationConfig{
+		Repository: repository, Auditor: goodAuditor, Local: integrationLocalReauthenticator{},
+		Clock: func() time.Time { return now }, Policy: iam.DefaultReauthenticationPolicy(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	creator := identity.Principal{Subject: "postgres.admin", Kind: identity.PrincipalKindHuman, Roles: []identity.Role{identity.RoleAdmin}, TokenID: "oidc-old-token"}
+	completer := creator
+	completer.TokenID = "oidc-fresh-token"
+	completer.AuthenticatedAt = now.Add(-time.Minute)
+	completer.AuthenticationAssurance = 1
+	request := iam.RequestContext{RequestID: uuid.NewString(), SourceIP: "192.0.2.90"}
+
+	failingService, err := iam.NewReauthenticationService(iam.ReauthenticationConfig{
+		Repository: repository, Auditor: failingIAMAuditAppender{}, Local: integrationLocalReauthenticator{},
+		Clock: func() time.Time { return now }, Policy: iam.DefaultReauthenticationPolicy(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := failingService.CreateChallenge(ctx, creator, iam.ReauthenticationOperationUserDisable, request); err == nil {
+		t.Fatal("CreateChallenge() with failing audit error = nil")
+	}
+	var challengeCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM iam_reauthentication_challenges`).Scan(&challengeCount); err != nil || challengeCount != 0 {
+		t.Fatalf("challenge count after create rollback = %d, %v", challengeCount, err)
+	}
+
+	created, err := service.CreateChallenge(ctx, creator, iam.ReauthenticationOperationUserDisable, request)
+	if err != nil {
+		t.Fatalf("CreateChallenge() error = %v", err)
+	}
+	completeResults := make(chan iam.ReauthenticationEvidence, 2)
+	completeErrors := make(chan error, 2)
+	var group sync.WaitGroup
+	for range 2 {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			result, completeErr := service.CompleteChallenge(ctx, completer, created.ID, iam.CompleteReauthenticationCommand{}, request)
+			completeResults <- result
+			completeErrors <- completeErr
+		}()
+	}
+	group.Wait()
+	close(completeResults)
+	close(completeErrors)
+	completeSuccess, completeDenied := 0, 0
+	var completed iam.ReauthenticationEvidence
+	for result := range completeResults {
+		if result.Evidence != "" {
+			completed = result
+		}
+	}
+	for completeErr := range completeErrors {
+		if completeErr == nil {
+			completeSuccess++
+		} else if errors.Is(completeErr, iam.ErrHighRiskConfirmationRequired) {
+			completeDenied++
+		} else {
+			t.Fatalf("concurrent CompleteChallenge() error = %v", completeErr)
+		}
+	}
+	if completeSuccess != 1 || completeDenied != 1 || completed.Evidence == "" {
+		t.Fatalf("complete results: success=%d denied=%d evidence=%t", completeSuccess, completeDenied, completed.Evidence != "")
+	}
+	var evidenceDigest, createdTokenDigest, verifiedTokenDigest string
+	if err := pool.QueryRow(ctx, `SELECT evidence_digest, created_token_digest, verified_token_digest FROM iam_reauthentication_challenges WHERE id=$1`, created.ID).
+		Scan(&evidenceDigest, &createdTokenDigest, &verifiedTokenDigest); err != nil {
+		t.Fatal(err)
+	}
+	if evidenceDigest == completed.Evidence || evidenceDigest != integrationSHA256Hex(completed.Evidence) ||
+		createdTokenDigest != integrationSHA256Hex(creator.TokenID) || verifiedTokenDigest != integrationSHA256Hex(completer.TokenID) {
+		t.Fatalf("stored reauthentication digests are invalid")
+	}
+
+	proof := iam.HighRiskProof{ChallengeID: created.ID.String(), Evidence: completed.Evidence, Confirmed: true}
+	authorizeErrors := make(chan error, 2)
+	for range 2 {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			authorizeErrors <- service.Authorize(ctx, completer, string(iam.ReauthenticationOperationUserDisable), proof, request)
+		}()
+	}
+	group.Wait()
+	close(authorizeErrors)
+	authorizeSuccess, authorizeDenied := 0, 0
+	for authorizeErr := range authorizeErrors {
+		if authorizeErr == nil {
+			authorizeSuccess++
+		} else if errors.Is(authorizeErr, iam.ErrHighRiskConfirmationRequired) {
+			authorizeDenied++
+		} else {
+			t.Fatalf("concurrent Authorize() error = %v", authorizeErr)
+		}
+	}
+	if authorizeSuccess != 1 || authorizeDenied != 1 {
+		t.Fatalf("authorize results: success=%d denied=%d", authorizeSuccess, authorizeDenied)
+	}
+
+	rollbackChallenge, err := service.CreateChallenge(ctx, creator, iam.ReauthenticationOperationSSOEnable, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := failingService.CompleteChallenge(ctx, completer, rollbackChallenge.ID, iam.CompleteReauthenticationCommand{}, request); err == nil {
+		t.Fatal("CompleteChallenge() audit failure error = nil")
+	}
+	var status string
+	if err := pool.QueryRow(ctx, `SELECT status FROM iam_reauthentication_challenges WHERE id=$1`, rollbackChallenge.ID).Scan(&status); err != nil || status != "pending" {
+		t.Fatalf("status after complete rollback = %q, %v", status, err)
+	}
+	rollbackEvidence, err := service.CompleteChallenge(ctx, completer, rollbackChallenge.ID, iam.CompleteReauthenticationCommand{}, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := failingService.Authorize(ctx, completer, string(iam.ReauthenticationOperationSSOEnable), iam.HighRiskProof{ChallengeID: rollbackChallenge.ID.String(), Evidence: rollbackEvidence.Evidence, Confirmed: true}, request); !errors.Is(err, iam.ErrHighRiskConfirmationRequired) {
+		t.Fatalf("Authorize() audit failure error = %v", err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT status FROM iam_reauthentication_challenges WHERE id=$1`, rollbackChallenge.ID).Scan(&status); err != nil || status != "verified" {
+		t.Fatalf("status after consume rollback = %q, %v", status, err)
+	}
+
+	expiringChallenge, err := service.CreateChallenge(ctx, creator, iam.ReauthenticationOperationSSODisable, iam.RequestContext{RequestID: uuid.NewString(), SourceIP: "192.0.2.91"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	expiringEvidence, err := service.CompleteChallenge(ctx, completer, expiringChallenge.ID, iam.CompleteReauthenticationCommand{}, iam.RequestContext{RequestID: uuid.NewString(), SourceIP: "192.0.2.91"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pendingChallenge, err := service.CreateChallenge(ctx, creator, iam.ReauthenticationOperationUserEnable, iam.RequestContext{RequestID: uuid.NewString(), SourceIP: "192.0.2.91"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	futureService, err := iam.NewReauthenticationService(iam.ReauthenticationConfig{
+		Repository: repository, Auditor: goodAuditor, Local: integrationLocalReauthenticator{},
+		Clock: func() time.Time { return now.Add(6 * time.Minute) }, Policy: iam.DefaultReauthenticationPolicy(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := futureService.Authorize(ctx, completer, string(iam.ReauthenticationOperationSSODisable), iam.HighRiskProof{
+		ChallengeID: expiringChallenge.ID.String(), Evidence: expiringEvidence.Evidence, Confirmed: true,
+	}, iam.RequestContext{RequestID: uuid.NewString(), SourceIP: "192.0.2.92"}); !errors.Is(err, iam.ErrHighRiskConfirmationRequired) {
+		t.Fatalf("expired evidence authorization error = %v", err)
+	}
+	if _, err := futureService.CreateChallenge(ctx, creator, iam.ReauthenticationOperationUserDisable, iam.RequestContext{RequestID: uuid.NewString(), SourceIP: "192.0.2.92"}); err != nil {
+		t.Fatalf("trigger pending cleanup: %v", err)
+	}
+	for name, challengeID := range map[string]uuid.UUID{"verified": expiringChallenge.ID, "pending": pendingChallenge.ID} {
+		if err := pool.QueryRow(ctx, `SELECT status FROM iam_reauthentication_challenges WHERE id=$1`, challengeID).Scan(&status); err != nil || status != "expired" {
+			t.Fatalf("%s challenge cleanup status = %q, %v", name, status, err)
+		}
+	}
+}
+
+func TestIAMPostgresHighRiskWritesUseProductionProofAndTransactionalAudit(t *testing.T) {
+	databaseURL := integrationDatabaseURL(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	pool, err := database.Open(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if err := database.ApplyMigrations(ctx, pool, migrations.FS); err != nil {
+		t.Fatalf("ApplyMigrations() error = %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+TRUNCATE TABLE iam_reauthentication_challenges, local_sessions, local_auth_rate_limits, emergency_access_events,
+directory_sync_conflicts, directory_sync_jobs, role_bindings, organization_memberships, organization_units,
+local_password_history, local_credentials, user_principals, iam_login_state, identity_sources CASCADE;
+INSERT INTO iam_login_state (singleton, login_mode, version, updated_by, updated_at)
+VALUES (TRUE, 'local', 1, 'test:bootstrap', clock_timestamp())`); err != nil {
+		t.Fatalf("reset IAM tables: %v", err)
+	}
+
+	now := time.Date(2026, 8, 20, 18, 0, 0, 0, time.UTC)
+	sourceID, userID, emergencyID := uuid.New(), uuid.New(), uuid.New()
+	if _, err := pool.Exec(ctx, `
+INSERT INTO identity_sources (
+    id, name, source_kind, status, required_mappings_complete, verified_at, previewed_at,
+    version, created_at, updated_at
+) VALUES ($1, 'High Risk OIDC', 'oidc', 'verified', TRUE, $2, $2, 1, $2, $2)`, sourceID, now.Add(-time.Hour)); err != nil {
+		t.Fatalf("seed high-risk source: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+INSERT INTO user_principals (
+    id, username, display_name, user_kind, status, mfa_enrolled, credential_rotated_at,
+    version, created_at, updated_at
+) VALUES
+	    ($1, 'highrisk.target', 'High Risk Target', 'local', 'active', FALSE, $3, 1, $3, $3),
+	    ($2, 'highrisk.breakglass', 'High Risk Break Glass', 'emergency', 'active', TRUE, $3, 1, $3, $3)`, userID, emergencyID, now.Add(-time.Hour)); err != nil {
+		t.Fatalf("seed high-risk users: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+INSERT INTO local_credentials (
+    user_id, algorithm, parameters, salt, derived_key, failed_attempts, password_changed_at
+) VALUES ($1, 'argon2id', 'm=19456,t=1,p=1', decode(repeat('11', 16), 'hex'), decode(repeat('22', 32), 'hex'), 0, $2)`, userID, now.Add(-time.Hour)); err != nil {
+		t.Fatalf("seed high-risk local credential: %v", err)
+	}
+	insertSession := func(label string) uuid.UUID {
+		t.Helper()
+		sessionID := uuid.New()
+		if _, insertErr := pool.Exec(ctx, `
+INSERT INTO local_sessions (
+    id, token_digest, subject_id, authentication_method, mfa_level, authenticated_at,
+    last_used_at, absolute_expires_at, idle_expires_at, version
+) VALUES ($1, $2, $3, 'local_password', 0, $4, $4, $5, $5, 1)`,
+			sessionID, integrationSHA256Hex(label), userID, now.Add(-time.Hour), now.Add(time.Hour)); insertErr != nil {
+			t.Fatal(insertErr)
+		}
+		return sessionID
+	}
+	insertSession("role-delete-session")
+
+	repository := iam.NewPostgresRepository(pool)
+	auditor := audit.NewService(audit.NewPostgresRepository(pool))
+	reauthentication, err := iam.NewReauthenticationService(iam.ReauthenticationConfig{
+		Repository: repository, Auditor: auditor, Local: integrationLocalReauthenticator{},
+		Clock: func() time.Time { return now }, Policy: iam.DefaultReauthenticationPolicy(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	passwords, err := iam.NewPasswordManager(iam.PasswordPolicyConfig{
+		MinimumLength: 16, MemoryKiB: 19 * 1024, Iterations: 1, Parallelism: 1, SaltBytes: 16, DerivedKeyBytes: 32,
+	}, integrationBreachChecker{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := iam.NewService(iam.ServiceConfig{
+		Repository: repository, Auditor: auditor, Sessions: repository, Passwords: passwords,
+		HighRisk: reauthentication, Clock: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	creator := identity.Principal{Subject: "postgres.admin", Kind: identity.PrincipalKindHuman, Roles: []identity.Role{identity.RoleAdmin}, TokenID: "oidc-old-token"}
+	actor := creator
+	actor.TokenID = "oidc-fresh-token"
+	actor.AuthenticatedAt = now.Add(-time.Minute)
+	actor.AuthenticationAssurance = 1
+	auditRequests := make([]string, 0, 7)
+	proofFor := func(operation iam.ReauthenticationOperation) (iam.HighRiskProof, iam.RequestContext) {
+		t.Helper()
+		challengeRequest := iam.RequestContext{RequestID: uuid.NewString(), SourceIP: "192.0.2.100"}
+		created, createErr := reauthentication.CreateChallenge(ctx, creator, operation, challengeRequest)
+		if createErr != nil {
+			t.Fatalf("CreateChallenge(%s) error = %v", operation, createErr)
+		}
+		completed, completeErr := reauthentication.CompleteChallenge(ctx, actor, created.ID, iam.CompleteReauthenticationCommand{}, iam.RequestContext{RequestID: uuid.NewString(), SourceIP: "192.0.2.101"})
+		if completeErr != nil {
+			t.Fatalf("CompleteChallenge(%s) error = %v", operation, completeErr)
+		}
+		mutationRequest := iam.RequestContext{RequestID: uuid.NewString(), SourceIP: "192.0.2.102"}
+		return iam.HighRiskProof{ChallengeID: created.ID.String(), Evidence: completed.Evidence, Confirmed: true}, mutationRequest
+	}
+
+	proof, request := proofFor(iam.ReauthenticationOperationRoleBindingCreate)
+	binding, err := service.CreateRoleBinding(ctx, actor, iam.CreateRoleBindingCommand{
+		SubjectType: iam.SubjectTypeUser, SubjectID: userID, SubjectVersion: 1, Role: identity.RoleViewer,
+		ScopeType: iam.ScopeTypePlatform, Effect: iam.BindingEffectAllow,
+	}, proof, request)
+	if err != nil {
+		t.Fatalf("CreateRoleBinding() error = %v", err)
+	}
+	auditRequests = append(auditRequests, request.RequestID)
+
+	proof, request = proofFor(iam.ReauthenticationOperationRoleBindingDelete)
+	if err := service.DeleteRoleBinding(ctx, actor, binding.ID, 1, proof, request); err != nil {
+		t.Fatalf("DeleteRoleBinding() error = %v", err)
+	}
+	auditRequests = append(auditRequests, request.RequestID)
+
+	insertSession("disable-session")
+	proof, request = proofFor(iam.ReauthenticationOperationUserDisable)
+	if err := service.DisableUser(ctx, actor, userID, 1, "security incident", proof, request); err != nil {
+		t.Fatalf("DisableUser() error = %v", err)
+	}
+	auditRequests = append(auditRequests, request.RequestID)
+	proof, request = proofFor(iam.ReauthenticationOperationUserEnable)
+	if err := service.EnableUser(ctx, actor, userID, 2, "incident resolved", proof, request); err != nil {
+		t.Fatalf("EnableUser() error = %v", err)
+	}
+	auditRequests = append(auditRequests, request.RequestID)
+
+	insertSession("explicit-revoke-session")
+	proof, request = proofFor(iam.ReauthenticationOperationUserRevokeSessions)
+	if err := service.RevokeUserSessions(ctx, actor, userID, 3, "credential rotation", proof, request); err != nil {
+		t.Fatalf("RevokeUserSessions() error = %v", err)
+	}
+	auditRequests = append(auditRequests, request.RequestID)
+	var userStatus iam.UserStatus
+	var userVersion, activeSessions int
+	if err := pool.QueryRow(ctx, `SELECT status, version FROM user_principals WHERE id=$1`, userID).Scan(&userStatus, &userVersion); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM local_sessions WHERE subject_id=$1 AND revoked_at IS NULL`, userID).Scan(&activeSessions); err != nil {
+		t.Fatal(err)
+	}
+	if userStatus != iam.UserStatusActive || userVersion != 3 || activeSessions != 0 {
+		t.Fatalf("user lifecycle state: status=%s version=%d active_sessions=%d", userStatus, userVersion, activeSessions)
+	}
+
+	proof, request = proofFor(iam.ReauthenticationOperationSSOEnable)
+	if err := service.EnableSSO(ctx, actor, sourceID, 1, proof, request); err != nil {
+		t.Fatalf("EnableSSO() error = %v", err)
+	}
+	auditRequests = append(auditRequests, request.RequestID)
+	proof, request = proofFor(iam.ReauthenticationOperationSSODisable)
+	if err := service.DisableSSO(ctx, actor, sourceID, 2, proof, request); err != nil {
+		t.Fatalf("DisableSSO() error = %v", err)
+	}
+	auditRequests = append(auditRequests, request.RequestID)
+	var loginMode iam.LoginMode
+	var sourceStatus iam.IdentitySourceStatus
+	var sourceVersion int64
+	if err := pool.QueryRow(ctx, `SELECT login_mode FROM iam_login_state WHERE singleton=TRUE`).Scan(&loginMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT status, version FROM identity_sources WHERE id=$1`, sourceID).Scan(&sourceStatus, &sourceVersion); err != nil {
+		t.Fatal(err)
+	}
+	if loginMode != iam.LoginModeLocal || sourceStatus != iam.IdentitySourceStatusDisabled || sourceVersion != 3 {
+		t.Fatalf("SSO lifecycle state: mode=%s source_status=%s source_version=%d", loginMode, sourceStatus, sourceVersion)
+	}
+	var mutationAuditCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM audit_events WHERE request_id = ANY($1::uuid[]) AND action IN (
+        'identity.role_binding.create', 'identity.role_binding.delete', 'identity.user.disable', 'identity.user.enable',
+        'identity.user.revoke_sessions', 'identity.sso.enable', 'identity.sso.disable')`, auditRequests).Scan(&mutationAuditCount); err != nil {
+		t.Fatal(err)
+	}
+	if mutationAuditCount != 7 {
+		t.Fatalf("business mutation audit count = %d", mutationAuditCount)
+	}
+
+	rollbackSession := insertSession("business-audit-rollback-session")
+	rollbackProof, rollbackRequest := proofFor(iam.ReauthenticationOperationUserRevokeSessions)
+	failingBusiness, err := iam.NewService(iam.ServiceConfig{
+		Repository: repository, Auditor: failingIAMAuditAppender{}, Sessions: repository, Passwords: passwords,
+		HighRisk: reauthentication, Clock: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := failingBusiness.RevokeUserSessions(ctx, actor, userID, 3, "audit rollback", rollbackProof, rollbackRequest); !errors.Is(err, errIntegrationAuditFailure) {
+		t.Fatalf("RevokeUserSessions(audit failure) error = %v", err)
+	}
+	var revokedAt *time.Time
+	if err := pool.QueryRow(ctx, `SELECT revoked_at FROM local_sessions WHERE id=$1`, rollbackSession).Scan(&revokedAt); err != nil {
+		t.Fatal(err)
+	}
+	if revokedAt != nil {
+		t.Fatalf("business mutation committed despite audit failure: revoked_at=%s", revokedAt)
+	}
+	if err := service.RevokeUserSessions(ctx, actor, userID, 3, "replay after rollback", rollbackProof, iam.RequestContext{RequestID: uuid.NewString(), SourceIP: "192.0.2.103"}); !errors.Is(err, iam.ErrHighRiskConfirmationRequired) {
+		t.Fatalf("consumed proof replay error = %v", err)
 	}
 }
 
@@ -345,7 +726,7 @@ INSERT INTO local_sessions (
 	go func() {
 		switchDone <- service.EnableSSO(ctx,
 			identity.Principal{Subject: "admin", Kind: identity.PrincipalKindHuman, Roles: []identity.Role{identity.RoleAdmin}, TokenID: "barrier-admin"},
-			sourceID, iam.HighRiskProof{Confirmed: true, ChallengeID: "barrier", Evidence: "barrier"},
+			sourceID, 1, iam.HighRiskProof{Confirmed: true, ChallengeID: "barrier", Evidence: "barrier"},
 			iam.RequestContext{RequestID: uuid.NewString(), SourceIP: "127.0.0.1"})
 	}()
 	select {
@@ -552,7 +933,7 @@ INSERT INTO user_principals (
 		t.Fatal(err)
 	}
 	actor := identity.Principal{Subject: "admin", Kind: identity.PrincipalKindHuman, Roles: []identity.Role{identity.RoleAdmin}, TokenID: "admin-token"}
-	err = service.EnableSSO(ctx, actor, sourceID, iam.HighRiskProof{Confirmed: true, ChallengeID: "test", Evidence: "test"}, iam.RequestContext{RequestID: uuid.New().String(), SourceIP: "127.0.0.1"})
+	err = service.EnableSSO(ctx, actor, sourceID, 1, iam.HighRiskProof{Confirmed: true, ChallengeID: "test", Evidence: "test"}, iam.RequestContext{RequestID: uuid.New().String(), SourceIP: "127.0.0.1"})
 	if err != nil {
 		t.Fatalf("EnableSSO() error = %v", err)
 	}
@@ -828,7 +1209,7 @@ VALUES ($1, 'audit.reader', '审计阅读者', 'local', 'active', 1, $2, $2)`, u
 		t.Fatalf("CreateOrganization() error = %v", err)
 	}
 	if _, err := service.CreateRoleBinding(ctx, actor, iam.CreateRoleBindingCommand{
-		SubjectType: iam.SubjectTypeUser, SubjectID: userID, Role: identity.RoleAuditor, ScopeType: iam.ScopeTypePlatform, Effect: iam.BindingEffectAllow,
+		SubjectType: iam.SubjectTypeUser, SubjectID: userID, SubjectVersion: 1, Role: identity.RoleAuditor, ScopeType: iam.ScopeTypePlatform, Effect: iam.BindingEffectAllow,
 	}, iam.HighRiskProof{Confirmed: true, ChallengeID: "test", Evidence: "test"}, request); err != nil {
 		t.Fatalf("CreateRoleBinding() error = %v", err)
 	}
@@ -922,6 +1303,17 @@ func (integrationSessionRevoker) RevokeRegularLocalSessions(context.Context, pgx
 
 type integrationHighRiskAuthorizer struct{}
 
-func (integrationHighRiskAuthorizer) Authorize(context.Context, identity.Principal, string, iam.HighRiskProof) error {
+func (integrationHighRiskAuthorizer) Authorize(context.Context, identity.Principal, string, iam.HighRiskProof, iam.RequestContext) error {
 	return nil
+}
+
+type integrationLocalReauthenticator struct{}
+
+func (integrationLocalReauthenticator) Reauthenticate(context.Context, identity.Principal, iam.CompleteReauthenticationCommand, iam.RequestContext) error {
+	return nil
+}
+
+func integrationSHA256Hex(value string) string {
+	digest := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(digest[:])
 }

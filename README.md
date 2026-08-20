@@ -45,7 +45,7 @@ Xminds Release Platform 是面向企业软件交付场景的多产品可信发�
 - 白色管理台导航与详情抽屉、产品注册、断点续传、职责分离审批、SCM 能力探测、端点健康和审计证据主流程；
 - 真实 Chromium 组件测试与 Playwright 端到端主流程验收。
 
-当前管理 API 运行时已挂载产品、制品、Release、分发端点和审计查询/导出路由。业务路由统一位于 OIDC 人工身份、OIDC 工作负载身份和 Argon2id API Token 组合验证边界之后；任一验证器缺失都会拒绝启动或对业务路由 fail closed。存活、就绪和版本端点保持匿名可用。分发端点激活使用 DNS 解析地址固定、禁用环境代理和重定向的 TLS 探测，私有 CA 仅能通过受控 Secret 目录中的单文件引用。独立 Public API 只挂载公开目录和制品读取路由，不包含管理操作。Worker 已挂载目录发布、目录撤销和审计导出处理器；端点同步的具体目标写入适配器仍需在部署组合根注入。SCM 管理、用户与组织中心及统一日志中心属于后续待完成代码。所有签名材料与对象存储凭据必须在启动时显式注入，否则拒绝运行。
+当前管理 API 运行时已挂载产品、制品、Release、分发端点、审计查询/导出和 IAM 治理路由。业务路由统一位于 OIDC 人工身份、OIDC 工作负载身份和 Argon2id API Token 组合验证边界之后；任一验证器缺失都会拒绝启动或对业务路由 fail closed。角色变更、用户启停/会话撤销和 SSO 切换还必须消费与 actor、operation 及完成 Bearer token ID 精确绑定的服务端一次性重认证 evidence；工作负载和 API Token 不具备 human reauthentication 能力。存活、就绪和版本端点保持匿名可用。分发端点激活使用 DNS 解析地址固定、禁用环境代理和重定向的 TLS 探测，私有 CA 仅能通过受控 Secret 目录中的单文件引用。独立 Public API 只挂载公开目录和制品读取路由，不包含管理操作。Worker 已挂载目录发布、目录撤销和审计导出处理器；端点同步的具体目标写入适配器仍需在部署组合根注入。SCM 管理、目录同步与冲突处理及统一日志中心属于后续待完成代码。所有签名材料与对象存储凭据必须在启动时显式注入，否则拒绝运行。
 
 ## P0 能力范围
 
@@ -126,7 +126,7 @@ go run ./apps/release-worker
 - `POST /api/v1/auth/local/login`：本地账户登录；
 - `POST /api/v1/auth/emergency/login`：强制 MFA 的应急账户登录。
 
-上述 3 个认证入口不要求现有 Bearer，其他管理 API 仍在统一认证中间件之后。所有环境都必须配置绝对路径 `XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY`；生产、测试和预发环境还必须配置指向非可写 SHA-1/SHA-256 摘要文件的 `XMINDS_RELEASE_IAM_BREACH_CORPUS`，缺失时服务拒绝启动。仅显式 `development` 环境可通过 `XMINDS_RELEASE_IAM_USE_DEVELOPMENT_BREACH_CORPUS=true` 单独启用内置最小语料库；缺省环境、其他环境或与外部语料库同时配置时均拒绝启动。锁定阶段可通过 `XMINDS_RELEASE_IAM_LOCKOUT_STAGES=5:5m,8:30m,10:24h` 配置，次数和时长必须严格递增且满足运行时安全上下界。
+上述 3 个认证入口不要求现有 Bearer，重认证挑战创建/完成和其他管理 API 仍在统一认证中间件之后。所有环境都必须配置绝对路径 `XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY`；生产、测试和预发环境还必须配置指向非可写 SHA-1/SHA-256 摘要文件的 `XMINDS_RELEASE_IAM_BREACH_CORPUS`，缺失时服务拒绝启动。仅显式 `development` 环境可通过 `XMINDS_RELEASE_IAM_USE_DEVELOPMENT_BREACH_CORPUS=true` 单独启用内置最小语料库；缺省环境、其他环境或与外部语料库同时配置时均拒绝启动。锁定阶段可通过 `XMINDS_RELEASE_IAM_LOCKOUT_STAGES=5:5m,8:30m,10:24h` 配置，次数和时长必须严格递增且满足运行时安全上下界。高风险挑战 TTL、evidence TTL、OIDC 新鲜度/时钟偏差、终态保留期和有界清理批次可通过 `.env.example` 中的 `XMINDS_RELEASE_IAM_REAUTH_*` 变量调整；越过安全边界的配置会导致服务拒绝启动。
 
 默认 Public API 监听 `127.0.0.1:8081`，只提供：
 

@@ -198,6 +198,13 @@ func run(ctx context.Context, arguments []string, environ map[string]string) err
 	if err != nil {
 		return fmt.Errorf("configure local authentication service: %w", err)
 	}
+	reauthenticationService, err := iam.NewReauthenticationService(iam.ReauthenticationConfig{
+		Repository: iamRepository, Auditor: auditor, Local: localAuthenticator, Clock: time.Now,
+		Policy: runtimeConfig.LocalAuth.Reauthentication,
+	})
+	if err != nil {
+		return fmt.Errorf("configure high-risk reauthentication service: %w", err)
+	}
 	sessionVerifier, err := iam.NewSessionVerifier(iamRepository, runtimeConfig.LocalAuth.Policy, time.Now)
 	if err != nil {
 		return fmt.Errorf("configure local session verifier: %w", err)
@@ -216,7 +223,8 @@ func run(ctx context.Context, arguments []string, environ map[string]string) err
 		return fmt.Errorf("configure governed IAM principal resolver: %w", err)
 	}
 	iamService, err := iam.NewService(iam.ServiceConfig{
-		Repository: iamRepository, Auditor: auditor, Sessions: iamRepository, Passwords: iamPasswords, Clock: time.Now,
+		Repository: iamRepository, Auditor: auditor, Sessions: iamRepository, Passwords: iamPasswords,
+		HighRisk: reauthenticationService, Clock: time.Now,
 	})
 	if err != nil {
 		return fmt.Errorf("configure IAM service: %w", err)
@@ -237,7 +245,8 @@ func run(ctx context.Context, arguments []string, environ map[string]string) err
 					Application: auditor,
 					Transactor:  audit.PoolTransactor{Pool: pool},
 				},
-				IAM: iamService,
+				IAM:              iamService,
+				Reauthentication: reauthenticationService,
 			}),
 			func(router chi.Router) { iam.RegisterPublicAuthRoutes(router, localAuthenticator) },
 		),
@@ -260,12 +269,13 @@ func run(ctx context.Context, arguments []string, environ map[string]string) err
 }
 
 type managementApplications struct {
-	Products  product.ProductApplication
-	Artifacts artifact.ArtifactApplication
-	Releases  release.ReleaseApplication
-	Endpoints endpoint.EndpointApplication
-	Audits    auditManagementApplication
-	IAM       iam.IAMApplication
+	Products         product.ProductApplication
+	Artifacts        artifact.ArtifactApplication
+	Releases         release.ReleaseApplication
+	Endpoints        endpoint.EndpointApplication
+	Audits           auditManagementApplication
+	IAM              iam.IAMApplication
+	Reauthentication iam.ReauthenticationApplication
 }
 
 type auditManagementApplication struct {
@@ -292,6 +302,9 @@ func managementRoutes(applications managementApplications) httpserver.RouteRegis
 		}
 		if applications.IAM != nil {
 			iam.RegisterRoutes(router, applications.IAM)
+		}
+		if applications.Reauthentication != nil {
+			iam.RegisterReauthenticationRoutes(router, applications.Reauthentication)
 		}
 	}
 }

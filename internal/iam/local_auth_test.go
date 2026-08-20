@@ -15,7 +15,127 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"xminds-release-platform/internal/audit"
+	"xminds-release-platform/internal/identity"
 )
+
+func TestLocalReauthenticationReusesPasswordMFAAndDoesNotCreateSession(t *testing.T) {
+	harness := newActiveLocalAuthHarness(t, UserKindLocal, true, LoginModeLocal)
+	sessionID := uuid.MustParse("018f835d-7e4b-7abc-9f42-67a2f5f49003")
+	harness.repository.sessions[sessionID] = Session{
+		ID: sessionID, SubjectID: harness.userID, AuthenticationMethod: AuthenticationMethodLocal, MFALevel: 1,
+		AuthenticatedAt: harness.now.Add(-time.Hour), LastUsedAt: harness.now.Add(-time.Minute),
+		AbsoluteExpiresAt: harness.now.Add(time.Hour), IdleExpiresAt: harness.now.Add(time.Minute), Version: 1,
+	}
+	credential := harness.repository.credentials[harness.userID]
+	credential.FailedAttempts = 2
+	harness.repository.credentials[harness.userID] = credential
+	actor := identity.Principal{Subject: "release.operator", Kind: identity.PrincipalKindLocal, TokenID: sessionID.String(), AuthenticationAssurance: 1}
+
+	if err := harness.service.Reauthenticate(context.Background(), actor, CompleteReauthenticationCommand{
+		Password: "Current-Strong-Password!", MFAProof: "123456",
+	}, harness.request); err != nil {
+		t.Fatalf("Reauthenticate() error = %v", err)
+	}
+	credential = harness.repository.credentials[harness.userID]
+	if credential.FailedAttempts != 0 || !credential.LockedUntil.IsZero() || credential.MFALastCounter != 42 {
+		t.Fatalf("credential after reauthentication = %+v", credential)
+	}
+	if len(harness.repository.sessions) != 1 {
+		t.Fatalf("reauthentication created a session: %+v", harness.repository.sessions)
+	}
+	command := harness.auditor.commands[len(harness.auditor.commands)-1]
+	if command.Action != "identity.reauthentication.local" || command.Outcome != audit.OutcomeSuccess {
+		t.Fatalf("reauthentication audit = %+v", command)
+	}
+	attempt := harness.auditor.commands[len(harness.auditor.commands)-2]
+	if attempt.Action != "identity.reauthentication.local.attempt" || attempt.Metadata["entrypoint"] != "reauthentication" {
+		t.Fatalf("reauthentication rate-limit audit = %+v", attempt)
+	}
+	serialized := fmt.Sprintf("%v", command)
+	for _, secret := range []string{"Current-Strong-Password!", "123456", sessionID.String()} {
+		if strings.Contains(serialized, secret) {
+			t.Fatalf("reauthentication audit contains secret: %+v", command)
+		}
+	}
+}
+
+func TestLocalReauthenticationCredentialAndMFAFailuresUseProgressiveLockout(t *testing.T) {
+	for _, testCase := range []struct {
+		name     string
+		password string
+		mfaProof string
+	}{
+		{name: "password", password: "Wrong-Password-Value!", mfaProof: "123456"},
+		{name: "missing mfa", password: "Current-Strong-Password!", mfaProof: ""},
+		{name: "invalid mfa", password: "Current-Strong-Password!", mfaProof: "654321"},
+		{name: "replayed mfa", password: "Current-Strong-Password!", mfaProof: "123456"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			harness := newActiveLocalAuthHarness(t, UserKindLocal, true, LoginModeLocal)
+			sessionID := uuid.MustParse("018f835d-7e4b-7abc-9f42-67a2f5f49003")
+			harness.repository.sessions[sessionID] = validMemorySession(harness, sessionID)
+			if testCase.name == "replayed mfa" {
+				credential := harness.repository.credentials[harness.userID]
+				credential.MFALastCounter = 42
+				harness.repository.credentials[harness.userID] = credential
+			}
+			actor := identity.Principal{Subject: "release.operator", Kind: identity.PrincipalKindLocal, TokenID: sessionID.String(), AuthenticationAssurance: 1}
+			for attempt := 1; attempt <= 5; attempt++ {
+				err := harness.service.Reauthenticate(context.Background(), actor, CompleteReauthenticationCommand{Password: testCase.password, MFAProof: testCase.mfaProof}, harness.request)
+				if !errors.Is(err, ErrLocalAuthenticationFailed) {
+					t.Fatalf("attempt %d error = %v", attempt, err)
+				}
+			}
+			credential := harness.repository.credentials[harness.userID]
+			if credential.FailedAttempts != 5 || !credential.LockedUntil.Equal(harness.now.Add(5*time.Minute)) {
+				t.Fatalf("lockout = %+v", credential)
+			}
+		})
+	}
+}
+
+func TestIneligibleLocalReauthenticationHasNoEnumerationSideEffect(t *testing.T) {
+	for _, testCase := range []struct {
+		name   string
+		mutate func(*localAuthHarness, uuid.UUID)
+	}{
+		{name: "unknown session", mutate: func(h *localAuthHarness, id uuid.UUID) { delete(h.repository.sessions, id) }},
+		{name: "revoked session", mutate: func(h *localAuthHarness, id uuid.UUID) {
+			s := h.repository.sessions[id]
+			s.RevokedAt = h.now.Add(-time.Second)
+			h.repository.sessions[id] = s
+		}},
+		{name: "disabled user", mutate: func(h *localAuthHarness, _ uuid.UUID) {
+			u := h.repository.users[h.userID]
+			u.Status = UserStatusDisabled
+			h.repository.users[h.userID] = u
+		}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			harness := newActiveLocalAuthHarness(t, UserKindLocal, true, LoginModeLocal)
+			sessionID := uuid.MustParse("018f835d-7e4b-7abc-9f42-67a2f5f49003")
+			harness.repository.sessions[sessionID] = validMemorySession(harness, sessionID)
+			testCase.mutate(harness, sessionID)
+			before := harness.repository.credentials[harness.userID]
+			actor := identity.Principal{Subject: "release.operator", Kind: identity.PrincipalKindLocal, TokenID: sessionID.String(), AuthenticationAssurance: 1}
+			if err := harness.service.Reauthenticate(context.Background(), actor, CompleteReauthenticationCommand{Password: "Wrong-Password-Value!", MFAProof: "654321"}, harness.request); !errors.Is(err, ErrLocalAuthenticationFailed) {
+				t.Fatalf("Reauthenticate() error = %v", err)
+			}
+			after := harness.repository.credentials[harness.userID]
+			if after.FailedAttempts != before.FailedAttempts || !after.LockedUntil.Equal(before.LockedUntil) {
+				t.Fatalf("ineligible reauthentication changed failure state: before=%+v after=%+v", before, after)
+			}
+		})
+	}
+}
+
+func validMemorySession(harness *localAuthHarness, sessionID uuid.UUID) Session {
+	return Session{
+		ID: sessionID, SubjectID: harness.userID, AuthenticationMethod: AuthenticationMethodLocal, MFALevel: 1,
+		AuthenticatedAt: harness.now.Add(-time.Hour), LastUsedAt: harness.now.Add(-time.Minute),
+		AbsoluteExpiresAt: harness.now.Add(time.Hour), IdleExpiresAt: harness.now.Add(time.Minute), Version: 1,
+	}
+}
 
 func TestLocalLoginModeMatrixAndEmergencyEntryIsolation(t *testing.T) {
 	t.Parallel()
@@ -730,14 +850,24 @@ func (repository *memoryLocalAuthRepository) WithinTransaction(_ context.Context
 	credentials := cloneCredentials(repository.credentials)
 	history := cloneHistory(repository.history)
 	rateLimits := cloneRateLimits(repository.rateLimits)
+	sessions := cloneSessions(repository.sessions)
 	err := function(nil)
 	if err != nil {
 		repository.users = users
 		repository.credentials = credentials
 		repository.history = history
 		repository.rateLimits = rateLimits
+		repository.sessions = sessions
 	}
 	return err
+}
+
+func cloneSessions(source map[uuid.UUID]Session) map[uuid.UUID]Session {
+	result := make(map[uuid.UUID]Session, len(source))
+	for key, value := range source {
+		result[key] = value
+	}
+	return result
 }
 
 func cloneRateLimits(source map[string]memoryRateWindow) map[string]memoryRateWindow {
@@ -811,6 +941,22 @@ func (repository *memoryLocalAuthRepository) FindLogin(_ context.Context, _ pgx.
 	return repository.login, UserPrincipal{}, LocalCredential{}, false, ErrLocalAuthenticationFailed
 }
 
+func (repository *memoryLocalAuthRepository) FindLocalReauthentication(_ context.Context, _ pgx.Tx, username string, sessionID uuid.UUID) (LoginState, UserPrincipal, LocalCredential, Session, bool, error) {
+	if repository.findLoginError != nil {
+		return repository.login, UserPrincipal{}, LocalCredential{}, Session{}, false, repository.findLoginError
+	}
+	for id, user := range repository.users {
+		if user.Username == username {
+			session, exists := repository.sessions[sessionID]
+			if !exists {
+				return repository.login, UserPrincipal{}, LocalCredential{}, Session{}, false, ErrLocalAuthenticationFailed
+			}
+			return repository.login, user, repository.credentials[id], session, repository.admins[id], nil
+		}
+	}
+	return repository.login, UserPrincipal{}, LocalCredential{}, Session{}, false, ErrLocalAuthenticationFailed
+}
+
 func (repository *memoryLocalAuthRepository) ConsumeRateLimit(_ context.Context, _ pgx.Tx, scope RateLimitScope, keyDigest string, windowStart time.Time, limit int, expiresAt time.Time) (bool, error) {
 	key := string(scope) + ":" + keyDigest
 	window := repository.rateLimits[key]
@@ -853,6 +999,17 @@ func (repository *memoryLocalAuthRepository) SaveAuthenticationSuccess(_ context
 	}
 	repository.credentials[userID] = credential
 	repository.sessions[session.ID] = session
+	return nil
+}
+
+func (repository *memoryLocalAuthRepository) SaveReauthenticationSuccess(_ context.Context, _ pgx.Tx, userID uuid.UUID, mfaCounter int64) error {
+	credential := repository.credentials[userID]
+	credential.FailedAttempts = 0
+	credential.LockedUntil = time.Time{}
+	if mfaCounter > credential.MFALastCounter {
+		credential.MFALastCounter = mfaCounter
+	}
+	repository.credentials[userID] = credential
 	return nil
 }
 

@@ -133,3 +133,54 @@ func TestLoadLocalAuthRuntimeConfigParsesBoundedPolicy(t *testing.T) {
 		t.Fatalf("configuration = %+v", configuration)
 	}
 }
+
+func TestLoadLocalAuthRuntimeConfigParsesBoundedReauthenticationPolicy(t *testing.T) {
+	t.Parallel()
+	configuration, err := LoadLocalAuthRuntimeConfig(map[string]string{
+		"XMINDS_RELEASE_IAM_BREACH_CORPUS":             filepath.Join(t.TempDir(), "breaches.txt"),
+		"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY":      t.TempDir(),
+		"XMINDS_RELEASE_IAM_REAUTH_CHALLENGE_TTL":      "6m",
+		"XMINDS_RELEASE_IAM_REAUTH_EVIDENCE_TTL":       "90s",
+		"XMINDS_RELEASE_IAM_REAUTH_OIDC_MAXIMUM_AGE":   "4m",
+		"XMINDS_RELEASE_IAM_REAUTH_ALLOWED_CLOCK_SKEW": "45s",
+		"XMINDS_RELEASE_IAM_REAUTH_TERMINAL_RETENTION": "48h",
+		"XMINDS_RELEASE_IAM_REAUTH_CLEANUP_BATCH_SIZE": "256",
+	}, "production")
+	if err != nil {
+		t.Fatalf("LoadLocalAuthRuntimeConfig() error = %v", err)
+	}
+	want := ReauthenticationPolicy{
+		ChallengeTTL: 6 * time.Minute, EvidenceTTL: 90 * time.Second, OIDCMaximumAge: 4 * time.Minute,
+		AllowedClockSkew: 45 * time.Second, TerminalRetention: 48 * time.Hour, CleanupBatchSize: 256,
+	}
+	if !reflect.DeepEqual(configuration.Reauthentication, want) {
+		t.Fatalf("reauthentication policy = %+v, want %+v", configuration.Reauthentication, want)
+	}
+}
+
+func TestLoadLocalAuthRuntimeConfigRejectsUnsafeReauthenticationPolicy(t *testing.T) {
+	t.Parallel()
+	base := map[string]string{
+		"XMINDS_RELEASE_IAM_BREACH_CORPUS":        filepath.Join(t.TempDir(), "breaches.txt"),
+		"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY": t.TempDir(),
+	}
+	for key, value := range map[string]string{
+		"XMINDS_RELEASE_IAM_REAUTH_CHALLENGE_TTL":      "30s",
+		"XMINDS_RELEASE_IAM_REAUTH_EVIDENCE_TTL":       "6m",
+		"XMINDS_RELEASE_IAM_REAUTH_OIDC_MAXIMUM_AGE":   "11m",
+		"XMINDS_RELEASE_IAM_REAUTH_ALLOWED_CLOCK_SKEW": "3m",
+		"XMINDS_RELEASE_IAM_REAUTH_TERMINAL_RETENTION": "30m",
+		"XMINDS_RELEASE_IAM_REAUTH_CLEANUP_BATCH_SIZE": "0",
+	} {
+		t.Run(key, func(t *testing.T) {
+			environ := make(map[string]string, len(base)+1)
+			for name, configured := range base {
+				environ[name] = configured
+			}
+			environ[key] = value
+			if _, err := LoadLocalAuthRuntimeConfig(environ, "production"); !errors.Is(err, ErrLocalAuthRuntimeConfiguration) {
+				t.Fatalf("override %s=%s error = %v", key, value, err)
+			}
+		})
+	}
+}

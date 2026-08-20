@@ -50,6 +50,97 @@ func TestOIDCVerifierValidatesAndMapsHumanPrincipal(t *testing.T) {
 	}
 }
 
+func TestOIDCVerifierMapsFreshAuthenticationTimeAndIndependentMFAFactors(t *testing.T) {
+	issuer := newOIDCTestIssuer(t)
+	verifier, err := NewOIDCVerifier(context.Background(), OIDCVerifierConfig{
+		Issuer:   issuer.server.URL,
+		Audience: "xminds-console",
+	})
+	if err != nil {
+		t.Fatalf("NewOIDCVerifier() error = %v", err)
+	}
+	authenticatedAt := time.Now().UTC().Add(-time.Minute).Truncate(time.Second)
+	for _, testCase := range []struct {
+		name string
+		amr  []string
+	}{
+		{name: "explicit mfa", amr: []string{"mfa"}},
+		{name: "knowledge and possession", amr: []string{"pwd", "otp"}},
+		{name: "possession and inherence", amr: []string{"hwk", "face"}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			token := issuer.sign(t, map[string]any{
+				"sub": "alice", "aud": "xminds-console", "jti": "token-" + testCase.name,
+				"token_use": "human", "roles": []string{"auditor"}, "product_ids": []string{"product-a"},
+				"auth_time": authenticatedAt.Unix(), "amr": testCase.amr,
+			})
+			principal, verifyErr := verifier.Verify(context.Background(), token)
+			if verifyErr != nil {
+				t.Fatalf("Verify() error = %v", verifyErr)
+			}
+			if !principal.AuthenticatedAt.Equal(authenticatedAt) || principal.AuthenticationAssurance != 1 {
+				t.Fatalf("principal authentication = %#v", principal)
+			}
+		})
+	}
+}
+
+func TestOIDCVerifierKeepsOrdinaryAuthenticationCompatibleWithoutFreshMFAClaims(t *testing.T) {
+	issuer := newOIDCTestIssuer(t)
+	verifier, err := NewOIDCVerifier(context.Background(), OIDCVerifierConfig{
+		Issuer:   issuer.server.URL,
+		Audience: "xminds-console",
+	})
+	if err != nil {
+		t.Fatalf("NewOIDCVerifier() error = %v", err)
+	}
+	for _, testCase := range []struct {
+		name   string
+		claims map[string]any
+	}{
+		{name: "claims absent", claims: nil},
+		{name: "one factor plus unknown", claims: map[string]any{"auth_time": time.Now().Add(-time.Minute).Unix(), "amr": []string{"pwd", "vendor_unknown"}}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			claims := map[string]any{
+				"sub": "alice", "aud": "xminds-console", "jti": "token-" + testCase.name,
+				"token_use": "human", "roles": []string{"auditor"}, "product_ids": []string{"product-a"},
+			}
+			for key, value := range testCase.claims {
+				claims[key] = value
+			}
+			principal, verifyErr := verifier.Verify(context.Background(), issuer.sign(t, claims))
+			if verifyErr != nil {
+				t.Fatalf("Verify() error = %v", verifyErr)
+			}
+			if principal.AuthenticationAssurance != 0 {
+				t.Fatalf("AuthenticationAssurance = %d, want 0", principal.AuthenticationAssurance)
+			}
+		})
+	}
+}
+
+func TestWorkloadVerifierCannotAcquireHumanReauthenticationAssurance(t *testing.T) {
+	issuer := newOIDCTestIssuer(t)
+	verifier, err := NewWorkloadVerifier(context.Background(), OIDCVerifierConfig{
+		Issuer: issuer.server.URL, Audience: "xminds-workloads",
+	})
+	if err != nil {
+		t.Fatalf("NewWorkloadVerifier() error = %v", err)
+	}
+	principal, err := verifier.Verify(context.Background(), issuer.sign(t, map[string]any{
+		"sub": "ci-release", "aud": "xminds-workloads", "jti": "token-workload-assurance",
+		"token_use": "workload", "workload_provider": "github-actions", "roles": []string{"publisher"}, "product_ids": []string{"product-a"},
+		"auth_time": time.Now().Add(-time.Minute).Unix(), "amr": []string{"mfa"},
+	}))
+	if err != nil {
+		t.Fatalf("Verify() error = %v", err)
+	}
+	if !principal.AuthenticatedAt.IsZero() || principal.AuthenticationAssurance != 0 {
+		t.Fatalf("workload authentication = %#v", principal)
+	}
+}
+
 func TestOIDCVerifierRejectsWorkloadToken(t *testing.T) {
 	issuer := newOIDCTestIssuer(t)
 	verifier, err := NewOIDCVerifier(context.Background(), OIDCVerifierConfig{

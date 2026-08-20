@@ -7,7 +7,11 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/google/uuid"
+
+	"xminds-release-platform/internal/iam"
 	"xminds-release-platform/internal/identity"
 	"xminds-release-platform/internal/platform/buildinfo"
 	"xminds-release-platform/internal/platform/config"
@@ -138,6 +142,30 @@ func TestManagementRoutesExposeProductAPIWithVerifiedPrincipal(t *testing.T) {
 	}
 }
 
+func TestManagementRoutesExposeProtectedReauthenticationAPI(t *testing.T) {
+	t.Parallel()
+	application := &recordingReauthenticationApplication{}
+	verifier := mainVerifierFunc(func(context.Context, string) (identity.Principal, error) {
+		return identity.Principal{Subject: "admin", Kind: identity.PrincipalKindHuman, Roles: []identity.Role{identity.RoleAdmin}, TokenID: "token-1"}, nil
+	})
+	handler := httpserver.NewManagementHandler(
+		nil,
+		buildinfo.Current(),
+		identity.AuthenticationMiddleware(verifier),
+		managementRoutes(managementApplications{Reauthentication: application}),
+	)
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/auth/reauth-challenges", strings.NewReader(`{"operation":"identity.user.disable"}`))
+	request.Header.Set("Authorization", "Bearer signed-token")
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusCreated || application.operation != iam.ReauthenticationOperationUserDisable {
+		t.Fatalf("status = %d, operation = %q, body = %s", response.Code, application.operation, response.Body.String())
+	}
+}
+
 type mainVerifierFunc func(context.Context, string) (identity.Principal, error)
 
 func (function mainVerifierFunc) Verify(ctx context.Context, token string) (identity.Principal, error) {
@@ -146,6 +174,19 @@ func (function mainVerifierFunc) Verify(ctx context.Context, token string) (iden
 
 type recordingProductApplication struct {
 	listedBy string
+}
+
+type recordingReauthenticationApplication struct {
+	operation iam.ReauthenticationOperation
+}
+
+func (application *recordingReauthenticationApplication) CreateChallenge(_ context.Context, _ identity.Principal, operation iam.ReauthenticationOperation, _ iam.RequestContext) (iam.ReauthenticationChallengeResult, error) {
+	application.operation = operation
+	return iam.ReauthenticationChallengeResult{ID: uuid.MustParse("018f835d-7e4b-7abc-9f42-67a2f5f48e13"), Operation: operation, Status: iam.ReauthenticationStatusPending, ExpiresAt: time.Now().Add(time.Minute)}, nil
+}
+
+func (*recordingReauthenticationApplication) CompleteChallenge(context.Context, identity.Principal, uuid.UUID, iam.CompleteReauthenticationCommand, iam.RequestContext) (iam.ReauthenticationEvidence, error) {
+	return iam.ReauthenticationEvidence{}, errors.New("unexpected challenge completion")
 }
 
 func (*recordingProductApplication) Register(context.Context, identity.Principal, []byte, product.RequestContext) (product.Product, error) {

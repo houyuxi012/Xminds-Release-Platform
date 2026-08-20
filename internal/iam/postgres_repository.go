@@ -187,6 +187,34 @@ WHERE id = $1 AND version = $9
 	return nil
 }
 
+func (repository *PostgresRepository) UserCanBeEnabled(ctx context.Context, tx pgx.Tx, user UserPrincipal) (bool, error) {
+	if repository == nil || repository.pool == nil || user.ID == uuid.Nil {
+		return false, ErrIAMConfiguration
+	}
+	queryer := iamQueryer(repository.pool)
+	if tx != nil {
+		queryer = tx
+	}
+	var usable bool
+	switch user.Kind {
+	case UserKindExternal:
+		if user.IdentitySourceID == uuid.Nil {
+			return false, nil
+		}
+		err := queryer.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM identity_sources WHERE id=$1 AND status='enabled')`, user.IdentitySourceID).Scan(&usable)
+		return usable, err
+	case UserKindLocal, UserKindEmergency:
+		err := queryer.QueryRow(ctx, `SELECT EXISTS(
+    SELECT 1 FROM local_credentials
+    WHERE user_id=$1 AND algorithm='argon2id' AND password_changed_at IS NOT NULL AND activation_digest IS NULL
+      AND ($2::boolean=FALSE OR (mfa_secret_reference <> '' AND $3::boolean=TRUE))
+)`, user.ID, user.Kind == UserKindEmergency, user.MFAEnrolled).Scan(&usable)
+		return usable, err
+	default:
+		return false, nil
+	}
+}
+
 func (repository *PostgresRepository) InsertLocalUser(ctx context.Context, tx pgx.Tx, user UserPrincipal, credential LocalCredential) error {
 	if tx == nil || user.ID == uuid.Nil || credential.UserID != user.ID || user.Kind != UserKindLocal {
 		return ErrIAMConfiguration

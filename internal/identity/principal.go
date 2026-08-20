@@ -3,6 +3,7 @@ package identity
 import (
 	"errors"
 	"strings"
+	"time"
 )
 
 type PrincipalKind string
@@ -47,6 +48,7 @@ type Principal struct {
 	Provider                WorkloadProvider
 	Governed                bool
 	RoleScopes              []RoleScope
+	AuthenticatedAt         time.Time
 	AuthenticationAssurance int
 }
 

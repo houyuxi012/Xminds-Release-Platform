@@ -146,6 +146,48 @@ FOR UPDATE OF user_record, credential`, canonicalUsername)
 	return state, user, credential, administrator, nil
 }
 
+func (repository *PostgresRepository) FindLocalReauthentication(ctx context.Context, tx pgx.Tx, canonicalUsername string, sessionID uuid.UUID) (LoginState, UserPrincipal, LocalCredential, Session, bool, error) {
+	state, user, credential, administrator, err := repository.FindLogin(ctx, tx, canonicalUsername)
+	if err != nil {
+		return state, UserPrincipal{}, LocalCredential{}, Session{}, false, err
+	}
+	var session Session
+	var revokedAt *time.Time
+	err = tx.QueryRow(ctx, `
+SELECT id, token_digest, subject_id, authentication_method, mfa_level, authenticated_at,
+       last_used_at, absolute_expires_at, idle_expires_at, revoked_at, revocation_reason, version
+FROM local_sessions WHERE id=$1
+FOR UPDATE`, sessionID).Scan(
+		&session.ID, &session.TokenDigest, &session.SubjectID, &session.AuthenticationMethod, &session.MFALevel,
+		&session.AuthenticatedAt, &session.LastUsedAt, &session.AbsoluteExpiresAt, &session.IdleExpiresAt,
+		&revokedAt, &session.RevocationReason, &session.Version,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return state, UserPrincipal{}, LocalCredential{}, Session{}, false, ErrLocalAuthenticationFailed
+	}
+	if err != nil {
+		return state, UserPrincipal{}, LocalCredential{}, Session{}, false, fmt.Errorf("find local reauthentication session: %w", err)
+	}
+	if revokedAt != nil {
+		session.RevokedAt = revokedAt.UTC()
+	}
+	return state, user, credential, session, administrator, nil
+}
+
+func (repository *PostgresRepository) SaveReauthenticationSuccess(ctx context.Context, tx pgx.Tx, userID uuid.UUID, mfaCounter int64) error {
+	if repository == nil || repository.pool == nil || tx == nil || userID == uuid.Nil {
+		return ErrIAMConfiguration
+	}
+	_, err := tx.Exec(ctx, `
+UPDATE local_credentials SET failed_attempts=0, locked_until=NULL,
+    mfa_last_counter=CASE WHEN $2 > mfa_last_counter THEN $2 ELSE mfa_last_counter END
+WHERE user_id=$1`, userID, mfaCounter)
+	if err != nil {
+		return fmt.Errorf("save local reauthentication success: %w", err)
+	}
+	return nil
+}
+
 func (repository *PostgresRepository) ConsumeRateLimit(ctx context.Context, tx pgx.Tx, scope RateLimitScope, keyDigest string, windowStart time.Time, limit int, expiresAt time.Time) (bool, error) {
 	if repository == nil || repository.pool == nil {
 		return false, ErrIAMConfiguration

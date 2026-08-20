@@ -94,10 +94,7 @@ func (service *Service) ListOrganizations(ctx context.Context, actor identity.Pr
 }
 
 func (service *Service) CreateRoleBinding(ctx context.Context, actor identity.Principal, command CreateRoleBindingCommand, proof HighRiskProof, request RequestContext) (RoleBinding, error) {
-	if err := service.requireHighRisk(ctx, actor, "identity.role_binding.create", proof); err != nil {
-		return RoleBinding{}, err
-	}
-	if err := validateRoleBindingCommand(command); err != nil {
+	if err := service.requireIdentityManage(actor); err != nil {
 		return RoleBinding{}, err
 	}
 	now := service.clock().UTC().Truncate(time.Microsecond)
@@ -112,27 +109,30 @@ func (service *Service) CreateRoleBinding(ctx context.Context, actor identity.Pr
 			return RoleBinding{}, ErrRoleBindingInvalid
 		}
 	}
+	if err := validateRoleBindingCommand(command); err != nil {
+		return RoleBinding{}, err
+	}
+	if command.SubjectVersion < 1 {
+		return RoleBinding{}, ErrRoleBindingInvalid
+	}
+	if err := service.validateRoleBindingSubject(ctx, nil, command, false); err != nil {
+		return RoleBinding{}, err
+	}
+	administratorElevation := command.Role == identity.RoleAdmin && command.ScopeType == ScopeTypePlatform && command.Effect == BindingEffectAllow
+	if administratorElevation && service.sessions == nil {
+		return RoleBinding{}, ErrIAMConfiguration
+	}
+	if err := service.consumeHighRisk(ctx, actor, string(ReauthenticationOperationRoleBindingCreate), proof, request); err != nil {
+		return RoleBinding{}, err
+	}
 	id, err := uuid.NewV7()
 	if err != nil {
 		return RoleBinding{}, fmt.Errorf("generate role binding ID: %w", err)
 	}
 	binding := RoleBinding{ID: id, SubjectType: command.SubjectType, SubjectID: command.SubjectID, Role: command.Role, ScopeType: command.ScopeType, ProductID: strings.TrimSpace(command.ProductID), ChannelName: strings.TrimSpace(command.ChannelName), Effect: command.Effect, ValidFrom: command.ValidFrom, ValidUntil: command.ValidUntil, CreatedBy: actor.Subject, Version: 1, CreatedAt: now, UpdatedAt: now}
-	administratorElevation := binding.Role == identity.RoleAdmin && binding.ScopeType == ScopeTypePlatform && binding.Effect == BindingEffectAllow
-	if administratorElevation && service.sessions == nil {
-		return RoleBinding{}, ErrIAMConfiguration
-	}
 	err = service.repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
-		if binding.SubjectType == SubjectTypeUser {
-			subject, subjectErr := service.repository.GetUser(ctx, tx, binding.SubjectID)
-			if subjectErr != nil {
-				return subjectErr
-			}
-			if binding.Role == identity.RoleAdmin && binding.ScopeType == ScopeTypePlatform && binding.Effect == BindingEffectAllow &&
-				(subject.Kind == UserKindLocal || subject.Kind == UserKindEmergency) && !subject.MFAEnrolled {
-				return ErrRoleBindingInvalid
-			}
-		} else if _, subjectErr := service.repository.GetOrganization(ctx, tx, binding.SubjectID); subjectErr != nil {
-			return subjectErr
+		if validationErr := service.validateRoleBindingSubject(ctx, tx, command, true); validationErr != nil {
+			return validationErr
 		}
 		if insertErr := service.repository.InsertRoleBinding(ctx, tx, binding); insertErr != nil {
 			return insertErr
@@ -155,6 +155,31 @@ func (service *Service) CreateRoleBinding(ctx context.Context, actor identity.Pr
 	return binding, nil
 }
 
+func (service *Service) validateRoleBindingSubject(ctx context.Context, tx pgx.Tx, command CreateRoleBindingCommand, enforceSecurity bool) error {
+	if command.SubjectType == SubjectTypeUser {
+		subject, err := service.repository.GetUser(ctx, tx, command.SubjectID)
+		if err != nil {
+			return err
+		}
+		if subject.Version != command.SubjectVersion {
+			return ErrIAMConflict
+		}
+		if enforceSecurity && command.Role == identity.RoleAdmin && command.ScopeType == ScopeTypePlatform && command.Effect == BindingEffectAllow &&
+			(subject.Kind == UserKindLocal || subject.Kind == UserKindEmergency) && !subject.MFAEnrolled {
+			return ErrRoleBindingInvalid
+		}
+		return nil
+	}
+	organization, err := service.repository.GetOrganization(ctx, tx, command.SubjectID)
+	if err != nil {
+		return err
+	}
+	if organization.Version != command.SubjectVersion {
+		return ErrIAMConflict
+	}
+	return nil
+}
+
 func (service *Service) ListRoleBindings(ctx context.Context, actor identity.Principal, page Page) (RoleBindingPage, error) {
 	if err := service.authorizer.Require(actor, identity.ActionIdentityManage, ""); err != nil {
 		return RoleBindingPage{}, err
@@ -166,16 +191,26 @@ func (service *Service) ListRoleBindings(ctx context.Context, actor identity.Pri
 }
 
 func (service *Service) DeleteRoleBinding(ctx context.Context, actor identity.Principal, bindingID uuid.UUID, expectedVersion int64, proof HighRiskProof, request RequestContext) error {
-	if service.sessions == nil {
-		return ErrIAMConfiguration
-	}
-	if err := service.requireHighRisk(ctx, actor, "identity.role_binding.delete", proof); err != nil {
+	if err := service.requireIdentityManage(actor); err != nil {
 		return err
 	}
 	if bindingID == uuid.Nil || expectedVersion < 1 {
 		return ErrRoleBindingInvalid
 	}
-	err := service.repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
+	if service.sessions == nil {
+		return ErrIAMConfiguration
+	}
+	preflight, err := service.repository.GetRoleBinding(ctx, nil, bindingID)
+	if err != nil {
+		return err
+	}
+	if preflight.Version != expectedVersion {
+		return ErrIAMConflict
+	}
+	if err := service.consumeHighRisk(ctx, actor, string(ReauthenticationOperationRoleBindingDelete), proof, request); err != nil {
+		return err
+	}
+	err = service.repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
 		binding, err := service.repository.GetRoleBinding(ctx, tx, bindingID)
 		if err != nil {
 			return err
@@ -500,15 +535,25 @@ func validateRoleBindingCommand(command CreateRoleBindingCommand) error {
 	return nil
 }
 
-func (service *Service) EnableSSO(ctx context.Context, actor identity.Principal, sourceID uuid.UUID, proof HighRiskProof, request RequestContext) error {
+func (service *Service) EnableSSO(ctx context.Context, actor identity.Principal, sourceID uuid.UUID, expectedVersion int64, proof HighRiskProof, request RequestContext) error {
+	if err := service.requireIdentityManage(actor); err != nil {
+		return err
+	}
+	if sourceID == uuid.Nil || expectedVersion < 1 {
+		return ErrSSOPreconditionFailed
+	}
 	if service.sessions == nil {
 		return ErrIAMConfiguration
 	}
-	if err := service.requireHighRisk(ctx, actor, "identity.sso.enable", proof); err != nil {
+	preflightSource, err := service.repository.GetIdentitySource(ctx, nil, sourceID)
+	if err != nil {
 		return err
 	}
-	if sourceID == uuid.Nil {
-		return ErrSSOPreconditionFailed
+	if preflightSource.Version != expectedVersion {
+		return ErrIAMConflict
+	}
+	if err := service.consumeHighRisk(ctx, actor, string(ReauthenticationOperationSSOEnable), proof, request); err != nil {
+		return err
 	}
 	now := service.clock().UTC().Truncate(time.Microsecond)
 	return service.repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
@@ -526,6 +571,9 @@ func (service *Service) EnableSSO(ctx context.Context, actor identity.Principal,
 		emergencyCount, err := service.repository.CountUsableEmergencyAdministrators(ctx, tx, uuid.Nil, now)
 		if err != nil {
 			return err
+		}
+		if source.Version != expectedVersion {
+			return ErrIAMConflict
 		}
 		if source.Status != IdentitySourceStatusVerified || source.VerifiedAt.IsZero() || source.PreviewedAt.IsZero() ||
 			!source.RequiredMappingsComplete || emergencyCount < 1 {
@@ -613,8 +661,21 @@ func (service *Service) MarkIdentitySourceFault(ctx context.Context, actor ident
 	})
 }
 
-func (service *Service) DisableSSO(ctx context.Context, actor identity.Principal, proof HighRiskProof, request RequestContext) error {
-	if err := service.requireHighRisk(ctx, actor, "identity.sso.disable", proof); err != nil {
+func (service *Service) DisableSSO(ctx context.Context, actor identity.Principal, sourceID uuid.UUID, expectedVersion int64, proof HighRiskProof, request RequestContext) error {
+	if err := service.requireIdentityManage(actor); err != nil {
+		return err
+	}
+	if sourceID == uuid.Nil || expectedVersion < 1 {
+		return ErrSSOPreconditionFailed
+	}
+	preflightSource, err := service.repository.GetIdentitySource(ctx, nil, sourceID)
+	if err != nil {
+		return err
+	}
+	if preflightSource.Version != expectedVersion {
+		return ErrIAMConflict
+	}
+	if err := service.consumeHighRisk(ctx, actor, string(ReauthenticationOperationSSODisable), proof, request); err != nil {
 		return err
 	}
 	now := service.clock().UTC().Truncate(time.Microsecond)
@@ -629,6 +690,9 @@ func (service *Service) DisableSSO(ctx context.Context, actor identity.Principal
 		source, err := service.repository.GetIdentitySource(ctx, tx, state.ActiveSourceID)
 		if err != nil {
 			return err
+		}
+		if state.ActiveSourceID != sourceID || source.Version != expectedVersion {
+			return ErrIAMConflict
 		}
 		previousMode := state.Mode
 		previousFaultCode := state.FaultCode
@@ -658,25 +722,38 @@ func (service *Service) DisableSSO(ctx context.Context, actor identity.Principal
 	})
 }
 
-func (service *Service) DisableUser(ctx context.Context, actor identity.Principal, userID uuid.UUID, reason string, proof HighRiskProof, request RequestContext) error {
-	if service.sessions == nil {
-		return ErrIAMConfiguration
-	}
-	if err := service.requireHighRisk(ctx, actor, "identity.user.disable", proof); err != nil {
+func (service *Service) DisableUser(ctx context.Context, actor identity.Principal, userID uuid.UUID, expectedVersion int64, reason string, proof HighRiskProof, request RequestContext) error {
+	if err := service.requireIdentityManage(actor); err != nil {
 		return err
 	}
 	reason = strings.TrimSpace(reason)
-	if reason == "" || len(reason) > 512 {
+	if userID == uuid.Nil || expectedVersion < 1 || reason == "" || len(reason) > 256 {
 		return ErrDisableReasonRequired
 	}
+	if service.sessions == nil {
+		return ErrIAMConfiguration
+	}
+	preflight, err := service.repository.GetUser(ctx, nil, userID)
+	if err != nil {
+		return err
+	}
+	if preflight.Version != expectedVersion {
+		return ErrIAMConflict
+	}
+	if err := service.consumeHighRisk(ctx, actor, string(ReauthenticationOperationUserDisable), proof, request); err != nil {
+		return err
+	}
 	now := service.clock().UTC().Truncate(time.Microsecond)
-	err := service.repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
+	err = service.repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
 		user, err := service.repository.GetUser(ctx, tx, userID)
 		if err != nil {
 			return err
 		}
 		if user.Status == UserStatusDisabled {
 			return ErrUserAlreadyDisabled
+		}
+		if user.Version != expectedVersion {
+			return ErrIAMConflict
 		}
 		if user.Kind == UserKindEmergency {
 			remaining, err := service.repository.CountUsableEmergencyAdministrators(ctx, tx, user.ID, now)
@@ -713,6 +790,103 @@ func (service *Service) DisableUser(ctx context.Context, actor identity.Principa
 	return nil
 }
 
+func (service *Service) EnableUser(ctx context.Context, actor identity.Principal, userID uuid.UUID, expectedVersion int64, reason string, proof HighRiskProof, request RequestContext) error {
+	if err := service.requireIdentityManage(actor); err != nil {
+		return err
+	}
+	reason = strings.TrimSpace(reason)
+	if userID == uuid.Nil || expectedVersion < 1 || reason == "" || len(reason) > 256 {
+		return ErrEnableReasonRequired
+	}
+	preflight, err := service.repository.GetUser(ctx, nil, userID)
+	if err != nil {
+		return err
+	}
+	if preflight.Version != expectedVersion {
+		return ErrIAMConflict
+	}
+	if err := service.consumeHighRisk(ctx, actor, string(ReauthenticationOperationUserEnable), proof, request); err != nil {
+		return err
+	}
+	now := service.clock().UTC().Truncate(time.Microsecond)
+	return service.repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
+		user, getErr := service.repository.GetUser(ctx, tx, userID)
+		if getErr != nil {
+			return getErr
+		}
+		if user.Version != expectedVersion {
+			return ErrIAMConflict
+		}
+		if user.Status == UserStatusActive {
+			return ErrUserAlreadyEnabled
+		}
+		if user.Status != UserStatusDisabled {
+			return ErrUserCannotBeEnabled
+		}
+		usable, usabilityErr := service.repository.UserCanBeEnabled(ctx, tx, user)
+		if usabilityErr != nil {
+			return usabilityErr
+		}
+		if !usable {
+			return ErrUserCannotBeEnabled
+		}
+		previousStatus := user.Status
+		user.Status, user.DisabledAt, user.DisabledReason = UserStatusActive, time.Time{}, ""
+		user.Version++
+		user.UpdatedAt = now
+		if saveErr := service.repository.SaveUser(ctx, tx, user, expectedVersion); saveErr != nil {
+			return saveErr
+		}
+		_, appendErr := service.auditor.Append(ctx, tx, audit.AppendCommand{
+			Actor: actor, Action: "identity.user.enable", ResourceType: "user_principal", ResourceID: user.ID.String(),
+			Outcome: audit.OutcomeSuccess, RequestID: request.RequestID, SourceIP: request.SourceIP,
+			Metadata: map[string]any{"before_status": previousStatus, "after_status": user.Status, "reason": reason},
+		})
+		return appendErr
+	})
+}
+
+func (service *Service) RevokeUserSessions(ctx context.Context, actor identity.Principal, userID uuid.UUID, expectedVersion int64, reason string, proof HighRiskProof, request RequestContext) error {
+	if err := service.requireIdentityManage(actor); err != nil {
+		return err
+	}
+	reason = strings.TrimSpace(reason)
+	if userID == uuid.Nil || expectedVersion < 1 || reason == "" || len(reason) > 256 {
+		return ErrRevokeReasonRequired
+	}
+	if service.sessions == nil {
+		return ErrIAMConfiguration
+	}
+	preflight, err := service.repository.GetUser(ctx, nil, userID)
+	if err != nil {
+		return err
+	}
+	if preflight.Version != expectedVersion {
+		return ErrIAMConflict
+	}
+	if err := service.consumeHighRisk(ctx, actor, string(ReauthenticationOperationUserRevokeSessions), proof, request); err != nil {
+		return err
+	}
+	return service.repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
+		user, getErr := service.repository.GetUser(ctx, tx, userID)
+		if getErr != nil {
+			return getErr
+		}
+		if user.Version != expectedVersion {
+			return ErrIAMConflict
+		}
+		if revokeErr := service.sessions.RevokeSubject(ctx, tx, userID, reason); revokeErr != nil {
+			return fmt.Errorf("revoke user sessions: %w", revokeErr)
+		}
+		_, appendErr := service.auditor.Append(ctx, tx, audit.AppendCommand{
+			Actor: actor, Action: "identity.user.revoke_sessions", ResourceType: "user_principal", ResourceID: user.ID.String(),
+			Outcome: audit.OutcomeSuccess, RequestID: request.RequestID, SourceIP: request.SourceIP,
+			Metadata: map[string]any{"reason": reason, "version": user.Version},
+		})
+		return appendErr
+	})
+}
+
 func (service *Service) AuthenticateLocal(ctx context.Context, username, password string) (UserPrincipal, error) {
 	username = canonicalUsername(username)
 	state, user, credential, err := service.repository.FindLocalAuthentication(ctx, username)
@@ -733,17 +907,18 @@ func (service *Service) AuthenticateLocal(ctx context.Context, username, passwor
 	return user, nil
 }
 
-func (service *Service) requireHighRisk(ctx context.Context, actor identity.Principal, operation string, proof HighRiskProof) error {
+func (service *Service) requireIdentityManage(actor identity.Principal) error {
 	if service == nil || service.authorizer == nil || service.highRisk == nil {
 		return ErrIAMConfiguration
 	}
-	if err := service.authorizer.Require(actor, identity.ActionIdentityManage, ""); err != nil {
-		return err
-	}
+	return service.authorizer.Require(actor, identity.ActionIdentityManage, "")
+}
+
+func (service *Service) consumeHighRisk(ctx context.Context, actor identity.Principal, operation string, proof HighRiskProof, request RequestContext) error {
 	if !proof.Confirmed {
 		return ErrHighRiskConfirmationRequired
 	}
-	if err := service.highRisk.Authorize(ctx, actor, operation, proof); err != nil {
+	if err := service.highRisk.Authorize(ctx, actor, operation, proof, request); err != nil {
 		return ErrHighRiskConfirmationRequired
 	}
 	return nil

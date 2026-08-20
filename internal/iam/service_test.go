@@ -21,10 +21,10 @@ func TestEnableSSORequiresVerifiedSourceMappingPreviewAndEmergencyAccount(t *tes
 	harness := newIAMHarness(t)
 	harness.repository.sources[harness.sourceID] = IdentitySource{
 		ID: harness.sourceID, Kind: IdentitySourceOIDC, Status: IdentitySourceStatusDraft,
-		RequiredMappingsComplete: false,
+		RequiredMappingsComplete: false, Version: 1,
 	}
 
-	err := harness.service.EnableSSO(context.Background(), harness.admin, harness.sourceID, harness.proof(), harness.request)
+	err := harness.service.EnableSSO(context.Background(), harness.admin, harness.sourceID, 1, harness.proof(), harness.request)
 
 	if !errors.Is(err, ErrSSOPreconditionFailed) {
 		t.Fatalf("EnableSSO() error = %v", err)
@@ -32,13 +32,16 @@ func TestEnableSSORequiresVerifiedSourceMappingPreviewAndEmergencyAccount(t *tes
 	if harness.repository.login.Mode != LoginModeLocal {
 		t.Fatalf("login mode = %q", harness.repository.login.Mode)
 	}
+	if len(harness.highRisk.operations) != 1 || harness.highRisk.operations[0] != string(ReauthenticationOperationSSOEnable) {
+		t.Fatalf("business precondition did not consume proof: %+v", harness.highRisk.operations)
+	}
 }
 
 func TestFaultDoesNotEnableRegularLocalLogin(t *testing.T) {
 	t.Parallel()
 
 	harness := newIAMHarness(t)
-	if err := harness.service.EnableSSO(context.Background(), harness.admin, harness.sourceID, harness.proof(), harness.request); err != nil {
+	if err := harness.service.EnableSSO(context.Background(), harness.admin, harness.sourceID, 1, harness.proof(), harness.request); err != nil {
 		t.Fatalf("EnableSSO() error = %v", err)
 	}
 	if err := harness.service.MarkIdentitySourceFault(context.Background(), harness.system, harness.sourceID, "OIDC_UNREACHABLE", harness.request); err != nil {
@@ -63,7 +66,7 @@ func TestCannotDisableLastUsableEmergencyAdministrator(t *testing.T) {
 
 	harness := newIAMHarness(t)
 
-	err := harness.service.DisableUser(context.Background(), harness.admin, harness.emergencyAdminID, "rotation", harness.proof(), harness.request)
+	err := harness.service.DisableUser(context.Background(), harness.admin, harness.emergencyAdminID, 1, "rotation", harness.proof(), harness.request)
 
 	if !errors.Is(err, ErrLastEmergencyAdministrator) {
 		t.Fatalf("DisableUser() error = %v", err)
@@ -77,17 +80,17 @@ func TestDisableSSORequiresFreshConfirmationAndReturnsToLocalMode(t *testing.T) 
 	t.Parallel()
 
 	harness := newIAMHarness(t)
-	if err := harness.service.EnableSSO(context.Background(), harness.admin, harness.sourceID, harness.proof(), harness.request); err != nil {
+	if err := harness.service.EnableSSO(context.Background(), harness.admin, harness.sourceID, 1, harness.proof(), harness.request); err != nil {
 		t.Fatal(err)
 	}
-	if err := harness.service.DisableSSO(context.Background(), harness.admin, HighRiskProof{Confirmed: true, ChallengeID: "wrong", Evidence: "bad"}, harness.request); !errors.Is(err, ErrHighRiskConfirmationRequired) {
+	if err := harness.service.DisableSSO(context.Background(), harness.admin, harness.sourceID, 2, HighRiskProof{Confirmed: true, ChallengeID: "wrong", Evidence: "bad"}, harness.request); !errors.Is(err, ErrHighRiskConfirmationRequired) {
 		t.Fatalf("DisableSSO(unverified proof) error = %v", err)
 	}
 	if harness.repository.login.Mode != LoginModeSSO {
 		t.Fatalf("login mode after rejected disable = %q", harness.repository.login.Mode)
 	}
 
-	if err := harness.service.DisableSSO(context.Background(), harness.admin, harness.proof(), harness.request); err != nil {
+	if err := harness.service.DisableSSO(context.Background(), harness.admin, harness.sourceID, 2, harness.proof(), harness.request); err != nil {
 		t.Fatalf("DisableSSO() error = %v", err)
 	}
 	if harness.repository.login.Mode != LoginModeLocal || harness.repository.login.ActiveSourceID != uuid.Nil || harness.repository.login.FaultCode != "" {
@@ -177,11 +180,12 @@ func TestRoleBindingCreateAndDeleteAreAuditedAndOptimistic(t *testing.T) {
 
 	harness := newIAMHarness(t)
 	binding, err := harness.service.CreateRoleBinding(context.Background(), harness.admin, CreateRoleBindingCommand{
-		SubjectType: SubjectTypeUser,
-		SubjectID:   harness.emergencyAdminID,
-		Role:        identity.RoleAdmin,
-		ScopeType:   ScopeTypePlatform,
-		Effect:      BindingEffectAllow,
+		SubjectType:    SubjectTypeUser,
+		SubjectID:      harness.emergencyAdminID,
+		SubjectVersion: 1,
+		Role:           identity.RoleAdmin,
+		ScopeType:      ScopeTypePlatform,
+		Effect:         BindingEffectAllow,
 	}, harness.proof(), harness.request)
 	if err != nil {
 		t.Fatalf("CreateRoleBinding() error = %v", err)
@@ -208,10 +212,48 @@ func TestHighRiskWritesFailClosedWithoutServerSideAuthority(t *testing.T) {
 	harness := newIAMHarness(t)
 	harness.service.highRisk = nil
 	_, err := harness.service.CreateRoleBinding(context.Background(), harness.admin, CreateRoleBindingCommand{
-		SubjectType: SubjectTypeUser, SubjectID: harness.emergencyAdminID, Role: identity.RoleAuditor, ScopeType: ScopeTypePlatform, Effect: BindingEffectAllow,
+		SubjectType: SubjectTypeUser, SubjectID: harness.emergencyAdminID, SubjectVersion: 1, Role: identity.RoleAuditor, ScopeType: ScopeTypePlatform, Effect: BindingEffectAllow,
 	}, harness.proof(), harness.request)
 	if !errors.Is(err, ErrIAMConfiguration) {
 		t.Fatalf("CreateRoleBinding() error = %v", err)
+	}
+}
+
+func TestEveryHighRiskWriteChecksPermissionBeforeResourceOrProof(t *testing.T) {
+	unauthorized := identity.Principal{Subject: "viewer", Kind: identity.PrincipalKindHuman, TokenID: "viewer-token"}
+	for name, invoke := range map[string]func(*iamHarness) error{
+		"create role binding": func(harness *iamHarness) error {
+			_, err := harness.service.CreateRoleBinding(context.Background(), unauthorized, CreateRoleBindingCommand{}, HighRiskProof{}, harness.request)
+			return err
+		},
+		"delete role binding": func(harness *iamHarness) error {
+			return harness.service.DeleteRoleBinding(context.Background(), unauthorized, uuid.Nil, 0, HighRiskProof{}, harness.request)
+		},
+		"disable user": func(harness *iamHarness) error {
+			return harness.service.DisableUser(context.Background(), unauthorized, uuid.Nil, 0, "", HighRiskProof{}, harness.request)
+		},
+		"enable user": func(harness *iamHarness) error {
+			return harness.service.EnableUser(context.Background(), unauthorized, uuid.Nil, 0, "", HighRiskProof{}, harness.request)
+		},
+		"revoke user sessions": func(harness *iamHarness) error {
+			return harness.service.RevokeUserSessions(context.Background(), unauthorized, uuid.Nil, 0, "", HighRiskProof{}, harness.request)
+		},
+		"enable sso": func(harness *iamHarness) error {
+			return harness.service.EnableSSO(context.Background(), unauthorized, uuid.Nil, 0, HighRiskProof{}, harness.request)
+		},
+		"disable sso": func(harness *iamHarness) error {
+			return harness.service.DisableSSO(context.Background(), unauthorized, uuid.Nil, 0, HighRiskProof{}, harness.request)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			harness := newIAMHarness(t)
+			if err := invoke(harness); !errors.Is(err, identity.ErrActionDenied) {
+				t.Fatalf("unauthorized write error = %v", err)
+			}
+			if len(harness.highRisk.operations) != 0 {
+				t.Fatalf("unauthorized write consumed proof: %+v", harness.highRisk.operations)
+			}
+		})
 	}
 }
 
@@ -220,9 +262,9 @@ func TestUserDisableAndRoleRemovalRollBackWhenSessionRevocationFails(t *testing.
 	t.Run("disable user", func(t *testing.T) {
 		harness := newIAMHarness(t)
 		backupID := uuid.MustParse("018f835d-7e4b-7abc-9f42-67a2f5f48e15")
-		harness.repository.users[backupID] = UserPrincipal{ID: backupID, Username: "backup-break-glass", Kind: UserKindEmergency, Status: UserStatusActive, MFAEnrolled: true}
+		harness.repository.users[backupID] = UserPrincipal{ID: backupID, Username: "backup-break-glass", Kind: UserKindEmergency, Status: UserStatusActive, MFAEnrolled: true, Version: 1}
 		harness.sessions.err = revocationFailure
-		err := harness.service.DisableUser(context.Background(), harness.admin, harness.emergencyAdminID, "security response", harness.proof(), harness.request)
+		err := harness.service.DisableUser(context.Background(), harness.admin, harness.emergencyAdminID, 1, "security response", harness.proof(), harness.request)
 		if !errors.Is(err, revocationFailure) {
 			t.Fatalf("DisableUser() error = %v", err)
 		}
@@ -233,7 +275,7 @@ func TestUserDisableAndRoleRemovalRollBackWhenSessionRevocationFails(t *testing.
 	t.Run("delete role binding", func(t *testing.T) {
 		harness := newIAMHarness(t)
 		binding, err := harness.service.CreateRoleBinding(context.Background(), harness.admin, CreateRoleBindingCommand{
-			SubjectType: SubjectTypeUser, SubjectID: harness.emergencyAdminID, Role: identity.RoleAdmin,
+			SubjectType: SubjectTypeUser, SubjectID: harness.emergencyAdminID, SubjectVersion: 1, Role: identity.RoleAdmin,
 			ScopeType: ScopeTypePlatform, Effect: BindingEffectAllow,
 		}, harness.proof(), harness.request)
 		if err != nil {
@@ -255,7 +297,7 @@ func TestSessionRevocationDependentWritesFailClosedWithoutRevoker(t *testing.T) 
 	harness.service.sessions = nil
 	localUserID := uuid.MustParse("018f835d-7e4b-7abc-9f42-67a2f5f48e18")
 	harness.repository.users[localUserID] = UserPrincipal{ID: localUserID, Username: "local.user", Kind: UserKindLocal, Status: UserStatusActive, Version: 1}
-	if err := harness.service.DisableUser(context.Background(), harness.admin, localUserID, "security response", harness.proof(), harness.request); !errors.Is(err, ErrIAMConfiguration) {
+	if err := harness.service.DisableUser(context.Background(), harness.admin, localUserID, 1, "security response", harness.proof(), harness.request); !errors.Is(err, ErrIAMConfiguration) {
 		t.Fatalf("DisableUser() error = %v", err)
 	}
 	bindingID := uuid.MustParse("018f835d-7e4b-7abc-9f42-67a2f5f48e19")
@@ -275,7 +317,7 @@ func TestOrganizationRoleRemovalRevokesCurrentMemberSessions(t *testing.T) {
 		t.Fatal(err)
 	}
 	binding, err := harness.service.CreateRoleBinding(context.Background(), harness.admin, CreateRoleBindingCommand{
-		SubjectType: SubjectTypeOrganization, SubjectID: organization.ID, Role: identity.RoleAdmin,
+		SubjectType: SubjectTypeOrganization, SubjectID: organization.ID, SubjectVersion: organization.Version, Role: identity.RoleAdmin,
 		ScopeType: ScopeTypePlatform, Effect: BindingEffectAllow,
 	}, harness.proof(), harness.request)
 	if err != nil {
@@ -293,10 +335,10 @@ func TestDirectLocalAdministratorGrantRequiresMFAEnrollment(t *testing.T) {
 	harness := newIAMHarness(t)
 	localID := uuid.MustParse("018f835d-7e4b-7abc-9f42-67a2f5f48e16")
 	harness.repository.users[localID] = UserPrincipal{
-		ID: localID, Username: "local.operator", Kind: UserKindLocal, Status: UserStatusActive, MFAEnrolled: false,
+		ID: localID, Username: "local.operator", Kind: UserKindLocal, Status: UserStatusActive, MFAEnrolled: false, Version: 1,
 	}
 	_, err := harness.service.CreateRoleBinding(context.Background(), harness.admin, CreateRoleBindingCommand{
-		SubjectType: SubjectTypeUser, SubjectID: localID, Role: identity.RoleAdmin,
+		SubjectType: SubjectTypeUser, SubjectID: localID, SubjectVersion: 1, Role: identity.RoleAdmin,
 		ScopeType: ScopeTypePlatform, Effect: BindingEffectAllow,
 	}, harness.proof(), harness.request)
 	if !errors.Is(err, ErrRoleBindingInvalid) {
@@ -305,16 +347,19 @@ func TestDirectLocalAdministratorGrantRequiresMFAEnrollment(t *testing.T) {
 	if len(harness.repository.roleBindings) != 0 {
 		t.Fatalf("unsafe administrator binding persisted: %+v", harness.repository.roleBindings)
 	}
+	if len(harness.highRisk.operations) != 1 || harness.highRisk.operations[0] != string(ReauthenticationOperationRoleBindingCreate) {
+		t.Fatalf("administrator safety validation did not consume proof: %+v", harness.highRisk.operations)
+	}
 }
 
 func TestAdministratorElevationRevokesExistingSubjectSessions(t *testing.T) {
 	harness := newIAMHarness(t)
 	localID := uuid.MustParse("018f835d-7e4b-7abc-9f42-67a2f5f48e17")
 	harness.repository.users[localID] = UserPrincipal{
-		ID: localID, Username: "local.mfa.operator", Kind: UserKindLocal, Status: UserStatusActive, MFAEnrolled: true,
+		ID: localID, Username: "local.mfa.operator", Kind: UserKindLocal, Status: UserStatusActive, MFAEnrolled: true, Version: 1,
 	}
 	if _, err := harness.service.CreateRoleBinding(context.Background(), harness.admin, CreateRoleBindingCommand{
-		SubjectType: SubjectTypeUser, SubjectID: localID, Role: identity.RoleAdmin,
+		SubjectType: SubjectTypeUser, SubjectID: localID, SubjectVersion: 1, Role: identity.RoleAdmin,
 		ScopeType: ScopeTypePlatform, Effect: BindingEffectAllow,
 	}, harness.proof(), harness.request); err != nil {
 		t.Fatalf("CreateRoleBinding() error = %v", err)
@@ -355,6 +400,197 @@ func TestIdentitySourceDraftVerifyAndPreviewDoNotExposeSecretReference(t *testin
 	}
 }
 
+func TestHighRiskWritesValidateVersionBeforeProofAndConsumeBeforeBusinessTransaction(t *testing.T) {
+	harness := newIAMHarness(t)
+	userID := uuid.MustParse("018f835d-7e4b-7abc-9f42-67a2f5f48e30")
+	harness.repository.users[userID] = UserPrincipal{
+		ID: userID, Username: "release.operator", Kind: UserKindLocal, Status: UserStatusActive,
+		Version: 3, CreatedAt: harness.now.Add(-time.Hour), UpdatedAt: harness.now.Add(-time.Hour),
+	}
+	harness.repository.credentials[userID] = LocalCredential{UserID: userID, Password: PasswordDigest{Algorithm: "argon2id", Parameters: "m=65536,t=3,p=2,l=32", Salt: make([]byte, 16), DerivedKey: make([]byte, 32)}, PasswordChangedAt: harness.now.Add(-time.Hour)}
+
+	if err := harness.service.DisableUser(context.Background(), harness.admin, userID, 2, "security response", harness.proof(), harness.request); !errors.Is(err, ErrIAMConflict) {
+		t.Fatalf("DisableUser(stale version) error = %v", err)
+	}
+	if len(harness.highRisk.operations) != 0 {
+		t.Fatalf("stale request consumed proof: %+v", harness.highRisk.operations)
+	}
+	if err := harness.service.DisableUser(context.Background(), harness.admin, userID, 3, "security response", harness.proof(), harness.request); err != nil {
+		t.Fatalf("DisableUser() error = %v", err)
+	}
+	if harness.repository.users[userID].Version != 4 || harness.repository.users[userID].Status != UserStatusDisabled || len(harness.highRisk.operations) != 1 {
+		t.Fatalf("disabled user or proof calls = user:%+v calls:%+v", harness.repository.users[userID], harness.highRisk.operations)
+	}
+
+	if err := harness.service.EnableUser(context.Background(), harness.admin, userID, 4, "incident closed", harness.proof(), harness.request); err != nil {
+		t.Fatalf("EnableUser() error = %v", err)
+	}
+	if harness.repository.users[userID].Version != 5 || harness.repository.users[userID].Status != UserStatusActive {
+		t.Fatalf("enabled user = %+v", harness.repository.users[userID])
+	}
+	if err := harness.service.RevokeUserSessions(context.Background(), harness.admin, userID, 5, "credential rotation", harness.proof(), harness.request); err != nil {
+		t.Fatalf("RevokeUserSessions() error = %v", err)
+	}
+	if harness.repository.users[userID].Version != 5 || len(harness.sessions.subjects) != 2 {
+		t.Fatalf("revoke sessions changed user version or missed revocation: user=%+v sessions=%+v", harness.repository.users[userID], harness.sessions.subjects)
+	}
+	if got := harness.highRisk.operations; len(got) != 3 || got[0] != string(ReauthenticationOperationUserDisable) || got[1] != string(ReauthenticationOperationUserEnable) || got[2] != string(ReauthenticationOperationUserRevokeSessions) {
+		t.Fatalf("high-risk operations = %+v", got)
+	}
+}
+
+func TestCreateRoleBindingRequiresCurrentSubjectVersionBeforeProofConsumption(t *testing.T) {
+	harness := newIAMHarness(t)
+	_, err := harness.service.CreateRoleBinding(context.Background(), harness.admin, CreateRoleBindingCommand{
+		SubjectType: SubjectTypeUser, SubjectID: harness.emergencyAdminID, SubjectVersion: 99,
+		Role: identity.RoleViewer, ScopeType: ScopeTypePlatform, Effect: BindingEffectAllow,
+	}, harness.proof(), harness.request)
+	if !errors.Is(err, ErrIAMConflict) {
+		t.Fatalf("CreateRoleBinding(stale subject) error = %v", err)
+	}
+	if len(harness.highRisk.operations) != 0 {
+		t.Fatalf("stale subject consumed proof: %+v", harness.highRisk.operations)
+	}
+}
+
+func TestCreateRoleBindingValidatesEffectiveTimeWindowBeforeProofConsumption(t *testing.T) {
+	harness := newIAMHarness(t)
+	_, err := harness.service.CreateRoleBinding(context.Background(), harness.admin, CreateRoleBindingCommand{
+		SubjectType: SubjectTypeUser, SubjectID: harness.emergencyAdminID, SubjectVersion: 1,
+		Role: identity.RoleViewer, ScopeType: ScopeTypePlatform, Effect: BindingEffectAllow,
+		ValidUntil: harness.now.Add(-time.Minute),
+	}, harness.proof(), harness.request)
+	if !errors.Is(err, ErrRoleBindingInvalid) {
+		t.Fatalf("CreateRoleBinding(invalid time window) error = %v", err)
+	}
+	if len(harness.highRisk.operations) != 0 {
+		t.Fatalf("invalid time window consumed proof: %+v", harness.highRisk.operations)
+	}
+}
+
+func TestEveryHighRiskWriteRejectsStaleVersionBeforeProofConsumption(t *testing.T) {
+	for name, invoke := range map[string]func(*iamHarness) error{
+		"create role binding": func(harness *iamHarness) error {
+			_, err := harness.service.CreateRoleBinding(context.Background(), harness.admin, CreateRoleBindingCommand{
+				SubjectType: SubjectTypeUser, SubjectID: harness.emergencyAdminID, SubjectVersion: 2,
+				Role: identity.RoleViewer, ScopeType: ScopeTypePlatform, Effect: BindingEffectAllow,
+			}, harness.proof(), harness.request)
+			return err
+		},
+		"delete role binding": func(harness *iamHarness) error {
+			bindingID := uuid.MustParse("018f835d-7e4b-7abc-9f42-67a2f5f48e41")
+			harness.repository.roleBindings[bindingID] = RoleBinding{ID: bindingID, SubjectType: SubjectTypeUser, SubjectID: harness.emergencyAdminID, Role: identity.RoleViewer, ScopeType: ScopeTypePlatform, Effect: BindingEffectAllow, Version: 2}
+			return harness.service.DeleteRoleBinding(context.Background(), harness.admin, bindingID, 1, harness.proof(), harness.request)
+		},
+		"disable user": func(harness *iamHarness) error {
+			return harness.service.DisableUser(context.Background(), harness.admin, harness.emergencyAdminID, 2, "security response", harness.proof(), harness.request)
+		},
+		"enable user": func(harness *iamHarness) error {
+			user := harness.repository.users[harness.emergencyAdminID]
+			user.Status, user.DisabledAt, user.DisabledReason = UserStatusDisabled, harness.now.Add(-time.Hour), "test"
+			harness.repository.users[user.ID] = user
+			return harness.service.EnableUser(context.Background(), harness.admin, user.ID, 2, "restore", harness.proof(), harness.request)
+		},
+		"revoke user sessions": func(harness *iamHarness) error {
+			return harness.service.RevokeUserSessions(context.Background(), harness.admin, harness.emergencyAdminID, 2, "rotation", harness.proof(), harness.request)
+		},
+		"enable sso": func(harness *iamHarness) error {
+			return harness.service.EnableSSO(context.Background(), harness.admin, harness.sourceID, 2, harness.proof(), harness.request)
+		},
+		"disable sso": func(harness *iamHarness) error {
+			harness.repository.login.Mode, harness.repository.login.ActiveSourceID = LoginModeSSO, harness.sourceID
+			source := harness.repository.sources[harness.sourceID]
+			source.Status = IdentitySourceStatusEnabled
+			harness.repository.sources[source.ID] = source
+			return harness.service.DisableSSO(context.Background(), harness.admin, harness.sourceID, 2, harness.proof(), harness.request)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			harness := newIAMHarness(t)
+			if err := invoke(harness); !errors.Is(err, ErrIAMConflict) {
+				t.Fatalf("stale version error = %v", err)
+			}
+			if len(harness.highRisk.operations) != 0 {
+				t.Fatalf("stale version consumed proof: %+v", harness.highRisk.operations)
+			}
+		})
+	}
+}
+
+func TestEveryHighRiskWriteRejectsMissingOrUnconfirmedProof(t *testing.T) {
+	for name, invoke := range map[string]func(*iamHarness, HighRiskProof) error{
+		"create role binding": func(harness *iamHarness, proof HighRiskProof) error {
+			_, err := harness.service.CreateRoleBinding(context.Background(), harness.admin, CreateRoleBindingCommand{
+				SubjectType: SubjectTypeUser, SubjectID: harness.emergencyAdminID, SubjectVersion: 1,
+				Role: identity.RoleViewer, ScopeType: ScopeTypePlatform, Effect: BindingEffectAllow,
+			}, proof, harness.request)
+			return err
+		},
+		"delete role binding": func(harness *iamHarness, proof HighRiskProof) error {
+			bindingID := uuid.MustParse("018f835d-7e4b-7abc-9f42-67a2f5f48e42")
+			harness.repository.roleBindings[bindingID] = RoleBinding{ID: bindingID, SubjectType: SubjectTypeUser, SubjectID: harness.emergencyAdminID, Role: identity.RoleViewer, ScopeType: ScopeTypePlatform, Effect: BindingEffectAllow, Version: 1}
+			return harness.service.DeleteRoleBinding(context.Background(), harness.admin, bindingID, 1, proof, harness.request)
+		},
+		"disable user": func(harness *iamHarness, proof HighRiskProof) error {
+			return harness.service.DisableUser(context.Background(), harness.admin, harness.emergencyAdminID, 1, "security response", proof, harness.request)
+		},
+		"enable user": func(harness *iamHarness, proof HighRiskProof) error {
+			localID := uuid.MustParse("018f835d-7e4b-7abc-9f42-67a2f5f48e43")
+			harness.repository.users[localID] = UserPrincipal{ID: localID, Username: "disabled.local", Kind: UserKindLocal, Status: UserStatusDisabled, Version: 1, DisabledAt: harness.now.Add(-time.Hour), DisabledReason: "test"}
+			harness.repository.credentials[localID] = LocalCredential{UserID: localID, Password: PasswordDigest{Algorithm: "argon2id", Parameters: "m=65536,t=3,p=2,l=32", Salt: make([]byte, 16), DerivedKey: make([]byte, 32)}, PasswordChangedAt: harness.now.Add(-time.Hour)}
+			return harness.service.EnableUser(context.Background(), harness.admin, localID, 1, "restore", proof, harness.request)
+		},
+		"revoke user sessions": func(harness *iamHarness, proof HighRiskProof) error {
+			return harness.service.RevokeUserSessions(context.Background(), harness.admin, harness.emergencyAdminID, 1, "rotation", proof, harness.request)
+		},
+		"enable sso": func(harness *iamHarness, proof HighRiskProof) error {
+			return harness.service.EnableSSO(context.Background(), harness.admin, harness.sourceID, 1, proof, harness.request)
+		},
+		"disable sso": func(harness *iamHarness, proof HighRiskProof) error {
+			harness.repository.login.Mode, harness.repository.login.ActiveSourceID = LoginModeSSO, harness.sourceID
+			source := harness.repository.sources[harness.sourceID]
+			source.Status = IdentitySourceStatusEnabled
+			harness.repository.sources[source.ID] = source
+			return harness.service.DisableSSO(context.Background(), harness.admin, harness.sourceID, 1, proof, harness.request)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			for proofName, proof := range map[string]HighRiskProof{
+				"missing":     {},
+				"unconfirmed": {ChallengeID: "server-challenge", Evidence: "server-evidence", Confirmed: false},
+			} {
+				t.Run(proofName, func(t *testing.T) {
+					harness := newIAMHarness(t)
+					if err := invoke(harness, proof); !errors.Is(err, ErrHighRiskConfirmationRequired) {
+						t.Fatalf("proof rejection error = %v", err)
+					}
+					if len(harness.highRisk.operations) != 0 {
+						t.Fatalf("unconfirmed proof reached authority: %+v", harness.highRisk.operations)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestEnableUserConsumesProofButOnlyTransitionsDisabledAccounts(t *testing.T) {
+	for name, status := range map[string]UserStatus{"pending": UserStatusPending, "locked": UserStatusLocked} {
+		t.Run(name, func(t *testing.T) {
+			harness := newIAMHarness(t)
+			userID := uuid.MustParse("018f835d-7e4b-7abc-9f42-67a2f5f48e44")
+			harness.repository.users[userID] = UserPrincipal{ID: userID, Username: "non-disabled.local", Kind: UserKindLocal, Status: status, Version: 1}
+			harness.repository.credentials[userID] = LocalCredential{UserID: userID, Password: PasswordDigest{Algorithm: "argon2id", Parameters: "m=65536,t=3,p=2,l=32", Salt: make([]byte, 16), DerivedKey: make([]byte, 32)}, PasswordChangedAt: harness.now.Add(-time.Hour)}
+			err := harness.service.EnableUser(context.Background(), harness.admin, userID, 1, "manual enable", harness.proof(), harness.request)
+			if !errors.Is(err, ErrUserCannotBeEnabled) {
+				t.Fatalf("EnableUser(%s) error = %v", status, err)
+			}
+			if len(harness.highRisk.operations) != 1 || harness.highRisk.operations[0] != string(ReauthenticationOperationUserEnable) || harness.repository.users[userID].Status != status {
+				t.Fatalf("invalid transition changed state or consumed proof: user=%+v operations=%+v", harness.repository.users[userID], harness.highRisk.operations)
+			}
+		})
+	}
+}
+
 type iamHarness struct {
 	service          *Service
 	repository       *memoryIAMRepository
@@ -366,6 +602,7 @@ type iamHarness struct {
 	request          RequestContext
 	auditor          *iamAuditRecorder
 	sessions         *iamSessionRecorder
+	highRisk         *recordingHighRiskAuthorizer
 }
 
 func newIAMHarness(t *testing.T) *iamHarness {
@@ -377,19 +614,21 @@ func newIAMHarness(t *testing.T) *iamHarness {
 		login: LoginState{Mode: LoginModeLocal, Version: 1, UpdatedAt: now},
 		sources: map[uuid.UUID]IdentitySource{sourceID: {
 			ID: sourceID, Kind: IdentitySourceOIDC, Status: IdentitySourceStatusVerified,
-			VerifiedAt: now.Add(-time.Minute), RequiredMappingsComplete: true, PreviewedAt: now.Add(-30 * time.Second),
+			VerifiedAt: now.Add(-time.Minute), RequiredMappingsComplete: true, PreviewedAt: now.Add(-30 * time.Second), Version: 1,
 		}},
 		users: map[uuid.UUID]UserPrincipal{emergencyID: {
 			ID: emergencyID, Username: "break-glass", Kind: UserKindEmergency, Status: UserStatusActive,
-			MFAEnrolled: true, CredentialRotatedAt: now.Add(-24 * time.Hour),
+			MFAEnrolled: true, CredentialRotatedAt: now.Add(-24 * time.Hour), Version: 1,
 		}},
+		credentials:   make(map[uuid.UUID]LocalCredential),
 		organizations: make(map[uuid.UUID]OrganizationUnit),
 		roleBindings:  make(map[uuid.UUID]RoleBinding),
 	}
 	auditor := &iamAuditRecorder{}
 	sessions := &iamSessionRecorder{}
+	highRisk := &recordingHighRiskAuthorizer{}
 	service, err := NewService(ServiceConfig{
-		Repository: repository, Auditor: auditor, Sessions: sessions, Passwords: deterministicPasswordManager{}, Directory: iamDirectoryAdapter{}, HighRisk: iamHighRiskAuthorizer{},
+		Repository: repository, Auditor: auditor, Sessions: sessions, Passwords: deterministicPasswordManager{}, Directory: iamDirectoryAdapter{}, HighRisk: highRisk,
 		Clock: func() time.Time { return now },
 	})
 	if err != nil {
@@ -397,7 +636,7 @@ func newIAMHarness(t *testing.T) *iamHarness {
 	}
 	return &iamHarness{
 		service: service, repository: repository, now: now, sourceID: sourceID, emergencyAdminID: emergencyID,
-		auditor: auditor, sessions: sessions,
+		auditor: auditor, sessions: sessions, highRisk: highRisk,
 		admin:   identity.Principal{Subject: "admin", Kind: identity.PrincipalKindHuman, Roles: []identity.Role{identity.RoleAdmin}, TokenID: "admin-token"},
 		system:  identity.Principal{Subject: "identity-monitor", Kind: identity.PrincipalKindWorkload, Roles: []identity.Role{identity.RoleAdmin}, TokenID: "monitor-token", Provider: identity.WorkloadProviderAPIToken},
 		request: RequestContext{RequestID: "018f835d-7e4b-7abc-9f42-67a2f5f48e13", SourceIP: "127.0.0.1"},
@@ -516,6 +755,21 @@ func (repository *memoryIAMRepository) SaveUser(_ context.Context, _ pgx.Tx, use
 	}
 	repository.users[user.ID] = user
 	return nil
+}
+
+func (repository *memoryIAMRepository) UserCanBeEnabled(_ context.Context, _ pgx.Tx, user UserPrincipal) (bool, error) {
+	if user.Kind == UserKindExternal {
+		source, exists := repository.sources[user.IdentitySourceID]
+		return exists && source.Status == IdentitySourceStatusEnabled, nil
+	}
+	credential, exists := repository.credentials[user.ID]
+	if !exists || credential.Password.Algorithm != "argon2id" || credential.PasswordChangedAt.IsZero() || credential.ActivationDigest != "" {
+		return false, nil
+	}
+	if user.Kind == UserKindEmergency && (!user.MFAEnrolled || credential.MFASecretReference == "") {
+		return false, nil
+	}
+	return true, nil
 }
 
 func (repository *memoryIAMRepository) FindLocalAuthentication(context.Context, string) (LoginState, UserPrincipal, LocalCredential, error) {
@@ -657,10 +911,26 @@ func (recorder *iamSessionRecorder) RevokeOrganizationMembers(_ context.Context,
 
 type iamHighRiskAuthorizer struct{}
 
-func (iamHighRiskAuthorizer) Authorize(_ context.Context, _ identity.Principal, _ string, proof HighRiskProof) error {
+func (iamHighRiskAuthorizer) Authorize(_ context.Context, _ identity.Principal, _ string, proof HighRiskProof, _ RequestContext) error {
 	if proof.ChallengeID != "server-challenge" || proof.Evidence != "server-evidence" {
 		return ErrHighRiskConfirmationRequired
 	}
+	return nil
+}
+
+type recordingHighRiskAuthorizer struct {
+	operations []string
+	err        error
+}
+
+func (authorizer *recordingHighRiskAuthorizer) Authorize(_ context.Context, _ identity.Principal, operation string, proof HighRiskProof, _ RequestContext) error {
+	if authorizer.err != nil {
+		return authorizer.err
+	}
+	if proof.ChallengeID != "server-challenge" || proof.Evidence != "server-evidence" {
+		return ErrHighRiskConfirmationRequired
+	}
+	authorizer.operations = append(authorizer.operations, operation)
 	return nil
 }
 

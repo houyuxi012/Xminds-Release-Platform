@@ -138,19 +138,54 @@ func (verifier *OIDCVerifier) Verify(ctx context.Context, rawToken string) (Prin
 			return Principal{}, ErrWorkloadProviderInvalid
 		}
 	}
+	var authenticatedAt time.Time
+	authenticationAssurance := 0
+	if verifier.principalKind == PrincipalKindHuman {
+		if raw, exists := claims["auth_time"]; exists {
+			var unixSeconds int64
+			if err := json.Unmarshal(raw, &unixSeconds); err != nil || unixSeconds <= 0 {
+				return Principal{}, fmt.Errorf("authentication time claim: %w", ErrTokenClaimsInvalid)
+			}
+			authenticatedAt = time.Unix(unixSeconds, 0).UTC()
+		}
+		if raw, exists := claims["amr"]; exists {
+			var methods []string
+			if err := json.Unmarshal(raw, &methods); err != nil {
+				return Principal{}, fmt.Errorf("authentication methods claim: %w", ErrTokenClaimsInvalid)
+			}
+			authenticationAssurance = authenticationAssuranceFromMethods(methods)
+		}
+	}
 
 	principal := Principal{
-		Subject:    strings.TrimSpace(subject),
-		Kind:       verifier.principalKind,
-		Roles:      roles,
-		ProductIDs: productIDs,
-		TokenID:    strings.TrimSpace(tokenID),
-		Provider:   provider,
+		Subject: strings.TrimSpace(subject), Kind: verifier.principalKind, Roles: roles,
+		ProductIDs: productIDs, TokenID: strings.TrimSpace(tokenID), Provider: provider,
+		AuthenticatedAt: authenticatedAt, AuthenticationAssurance: authenticationAssurance,
 	}
 	if err := principal.Validate(); err != nil {
 		return Principal{}, err
 	}
 	return principal, nil
+}
+
+func authenticationAssuranceFromMethods(methods []string) int {
+	categories := map[string]struct{}{}
+	for _, method := range methods {
+		switch strings.ToLower(strings.TrimSpace(method)) {
+		case "mfa":
+			return 1
+		case "pwd", "pin", "kba":
+			categories["knowledge"] = struct{}{}
+		case "otp", "sms", "hwk", "swk", "sc", "tel", "fido", "fido2", "webauthn", "pop":
+			categories["possession"] = struct{}{}
+		case "face", "fpt", "iris", "retina", "vbm", "voice":
+			categories["inherence"] = struct{}{}
+		}
+	}
+	if len(categories) >= 2 {
+		return 1
+	}
+	return 0
 }
 
 func normalizeOIDCConfig(config OIDCVerifierConfig) (OIDCVerifierConfig, error) {

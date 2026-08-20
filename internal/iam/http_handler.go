@@ -29,9 +29,16 @@ type IAMApplication interface {
 	CreateOrganization(ctx context.Context, actor identity.Principal, command CreateOrganizationCommand, request RequestContext) (OrganizationUnit, error)
 	ListOrganizations(ctx context.Context, actor identity.Principal, page Page) (OrganizationPage, error)
 	ListRoleBindings(ctx context.Context, actor identity.Principal, page Page) (RoleBindingPage, error)
+	CreateRoleBinding(ctx context.Context, actor identity.Principal, command CreateRoleBindingCommand, proof HighRiskProof, request RequestContext) (RoleBinding, error)
+	DeleteRoleBinding(ctx context.Context, actor identity.Principal, bindingID uuid.UUID, expectedVersion int64, proof HighRiskProof, request RequestContext) error
+	DisableUser(ctx context.Context, actor identity.Principal, userID uuid.UUID, expectedVersion int64, reason string, proof HighRiskProof, request RequestContext) error
+	EnableUser(ctx context.Context, actor identity.Principal, userID uuid.UUID, expectedVersion int64, reason string, proof HighRiskProof, request RequestContext) error
+	RevokeUserSessions(ctx context.Context, actor identity.Principal, userID uuid.UUID, expectedVersion int64, reason string, proof HighRiskProof, request RequestContext) error
 	CreateIdentitySource(ctx context.Context, actor identity.Principal, command CreateIdentitySourceCommand, request RequestContext) (IdentitySource, error)
 	ListIdentitySources(ctx context.Context, actor identity.Principal, page Page) (IdentitySourcePage, error)
 	PatchIdentitySourceDraft(ctx context.Context, actor identity.Principal, sourceID uuid.UUID, command PatchIdentitySourceCommand, request RequestContext) (IdentitySource, error)
+	EnableSSO(ctx context.Context, actor identity.Principal, sourceID uuid.UUID, expectedVersion int64, proof HighRiskProof, request RequestContext) error
+	DisableSSO(ctx context.Context, actor identity.Principal, sourceID uuid.UUID, expectedVersion int64, proof HighRiskProof, request RequestContext) error
 }
 
 func NewHTTPHandler(application IAMApplication) http.Handler {
@@ -50,17 +57,36 @@ func RegisterRoutes(router chi.Router, application IAMApplication) {
 	router.Route("/api/v1/users", func(router chi.Router) {
 		router.Get("/", listUsersHandler(application))
 		router.Get("/{user_id}", getUserHandler(application))
+		router.Post("/{user_id}/disable", userLifecycleHandler(application, "disable"))
+		router.Post("/{user_id}/enable", userLifecycleHandler(application, "enable"))
+		router.Post("/{user_id}/revoke-sessions", userLifecycleHandler(application, "revoke_sessions"))
 	})
 	router.Route("/api/v1/organizations", func(router chi.Router) {
 		router.Get("/", listOrganizationsHandler(application))
 		router.Post("/", createOrganizationHandler(application))
 	})
-	router.Get("/api/v1/role-bindings", listRoleBindingsHandler(application))
+	router.Route("/api/v1/role-bindings", func(router chi.Router) {
+		router.Get("/", listRoleBindingsHandler(application))
+		router.Post("/", createRoleBindingHandler(application))
+		router.Delete("/{binding_id}", deleteRoleBindingHandler(application))
+	})
 	router.Route("/api/v1/identity-sources", func(router chi.Router) {
 		router.Get("/", listIdentitySourcesHandler(application))
 		router.Post("/", createIdentitySourceHandler(application))
 		router.Patch("/{source_id}", patchIdentitySourceHandler(application))
+		router.Post("/{source_id}/enable", identitySourceLifecycleHandler(application, true))
+		router.Post("/{source_id}/disable", identitySourceLifecycleHandler(application, false))
 	})
+}
+
+type reauthenticationProofInput struct {
+	ChallengeID string `json:"challenge_id"`
+	Evidence    string `json:"evidence"`
+	Confirmed   bool   `json:"confirmed"`
+}
+
+func (input reauthenticationProofInput) proof() HighRiskProof {
+	return HighRiskProof{ChallengeID: input.ChallengeID, Evidence: input.Evidence, Confirmed: input.Confirmed}
 }
 
 func createLocalUserHandler(application IAMApplication) http.HandlerFunc {
@@ -219,6 +245,145 @@ func listRoleBindingsHandler(application IAMApplication) http.HandlerFunc {
 	}
 }
 
+func createRoleBindingHandler(application IAMApplication) http.HandlerFunc {
+	type input struct {
+		SubjectType      SubjectType                `json:"subject_type"`
+		SubjectID        uuid.UUID                  `json:"subject_id"`
+		SubjectVersion   int64                      `json:"subject_version"`
+		Role             identity.Role              `json:"role"`
+		ScopeType        ScopeType                  `json:"scope_type"`
+		ProductID        string                     `json:"product_id"`
+		ChannelName      string                     `json:"channel_name"`
+		Effect           BindingEffect              `json:"effect"`
+		ValidFrom        time.Time                  `json:"valid_from"`
+		ValidUntil       time.Time                  `json:"valid_until"`
+		Reauthentication reauthenticationProofInput `json:"reauth"`
+	}
+	return func(writer http.ResponseWriter, request *http.Request) {
+		principal, ok := requireIAMPrincipal(writer, request)
+		if !ok {
+			return
+		}
+		var body input
+		if err := decodeIAMJSON(request, &body); err != nil {
+			writeIAMProblem(writer, request, http.StatusBadRequest, "REQUEST_BODY_INVALID", "Request body is invalid", err)
+			return
+		}
+		binding, err := application.CreateRoleBinding(request.Context(), principal, CreateRoleBindingCommand{
+			SubjectType: body.SubjectType, SubjectID: body.SubjectID, SubjectVersion: body.SubjectVersion, Role: body.Role,
+			ScopeType: body.ScopeType, ProductID: body.ProductID, ChannelName: body.ChannelName, Effect: body.Effect,
+			ValidFrom: body.ValidFrom, ValidUntil: body.ValidUntil,
+		}, body.Reauthentication.proof(), iamRequestContext(request))
+		if err != nil {
+			writeIAMApplicationError(writer, request, err)
+			return
+		}
+		writer.Header().Set("Location", "/api/v1/role-bindings/"+binding.ID.String())
+		writeIAMJSON(writer, http.StatusCreated, toRoleBindingResponse(binding))
+	}
+}
+
+func deleteRoleBindingHandler(application IAMApplication) http.HandlerFunc {
+	type input struct {
+		Version          int64                      `json:"version"`
+		Reauthentication reauthenticationProofInput `json:"reauth"`
+	}
+	return func(writer http.ResponseWriter, request *http.Request) {
+		principal, ok := requireIAMPrincipal(writer, request)
+		if !ok {
+			return
+		}
+		bindingID, err := uuid.Parse(chi.URLParam(request, "binding_id"))
+		if err != nil || bindingID == uuid.Nil {
+			writeIAMProblem(writer, request, http.StatusBadRequest, "ROLE_BINDING_ID_INVALID", "Role binding ID is invalid", ErrRoleBindingInvalid)
+			return
+		}
+		var body input
+		if err := decodeIAMJSON(request, &body); err != nil {
+			writeIAMProblem(writer, request, http.StatusBadRequest, "REQUEST_BODY_INVALID", "Request body is invalid", err)
+			return
+		}
+		if err := application.DeleteRoleBinding(request.Context(), principal, bindingID, body.Version, body.Reauthentication.proof(), iamRequestContext(request)); err != nil {
+			writeIAMApplicationError(writer, request, err)
+			return
+		}
+		writer.WriteHeader(http.StatusNoContent)
+	}
+}
+
+func userLifecycleHandler(application IAMApplication, action string) http.HandlerFunc {
+	type input struct {
+		Version          int64                      `json:"version"`
+		Reason           string                     `json:"reason"`
+		Reauthentication reauthenticationProofInput `json:"reauth"`
+	}
+	return func(writer http.ResponseWriter, request *http.Request) {
+		principal, ok := requireIAMPrincipal(writer, request)
+		if !ok {
+			return
+		}
+		userID, err := uuid.Parse(chi.URLParam(request, "user_id"))
+		if err != nil || userID == uuid.Nil {
+			writeIAMProblem(writer, request, http.StatusBadRequest, "USER_ID_INVALID", "User ID is invalid", ErrUserInputInvalid)
+			return
+		}
+		var body input
+		if err := decodeIAMJSON(request, &body); err != nil {
+			writeIAMProblem(writer, request, http.StatusBadRequest, "REQUEST_BODY_INVALID", "Request body is invalid", err)
+			return
+		}
+		proof, requestContext := body.Reauthentication.proof(), iamRequestContext(request)
+		switch action {
+		case "disable":
+			err = application.DisableUser(request.Context(), principal, userID, body.Version, body.Reason, proof, requestContext)
+		case "enable":
+			err = application.EnableUser(request.Context(), principal, userID, body.Version, body.Reason, proof, requestContext)
+		case "revoke_sessions":
+			err = application.RevokeUserSessions(request.Context(), principal, userID, body.Version, body.Reason, proof, requestContext)
+		default:
+			err = ErrIAMConfiguration
+		}
+		if err != nil {
+			writeIAMApplicationError(writer, request, err)
+			return
+		}
+		writer.WriteHeader(http.StatusNoContent)
+	}
+}
+
+func identitySourceLifecycleHandler(application IAMApplication, enable bool) http.HandlerFunc {
+	type input struct {
+		Version          int64                      `json:"version"`
+		Reauthentication reauthenticationProofInput `json:"reauth"`
+	}
+	return func(writer http.ResponseWriter, request *http.Request) {
+		principal, ok := requireIAMPrincipal(writer, request)
+		if !ok {
+			return
+		}
+		sourceID, err := uuid.Parse(chi.URLParam(request, "source_id"))
+		if err != nil || sourceID == uuid.Nil {
+			writeIAMProblem(writer, request, http.StatusBadRequest, "IDENTITY_SOURCE_ID_INVALID", "Identity source ID is invalid", ErrIdentitySourceInputInvalid)
+			return
+		}
+		var body input
+		if err := decodeIAMJSON(request, &body); err != nil {
+			writeIAMProblem(writer, request, http.StatusBadRequest, "REQUEST_BODY_INVALID", "Request body is invalid", err)
+			return
+		}
+		if enable {
+			err = application.EnableSSO(request.Context(), principal, sourceID, body.Version, body.Reauthentication.proof(), iamRequestContext(request))
+		} else {
+			err = application.DisableSSO(request.Context(), principal, sourceID, body.Version, body.Reauthentication.proof(), iamRequestContext(request))
+		}
+		if err != nil {
+			writeIAMApplicationError(writer, request, err)
+			return
+		}
+		writer.WriteHeader(http.StatusNoContent)
+	}
+}
+
 func createIdentitySourceHandler(application IAMApplication) http.HandlerFunc {
 	type input struct {
 		Name                     string             `json:"name"`
@@ -357,7 +522,8 @@ func iamRequestContext(request *http.Request) RequestContext {
 
 func writeIAMApplicationError(writer http.ResponseWriter, request *http.Request, err error) {
 	switch {
-	case errors.Is(err, ErrUserInputInvalid), errors.Is(err, ErrPageInvalid), errors.Is(err, ErrRoleBindingInvalid), errors.Is(err, ErrIdentitySourceInputInvalid):
+	case errors.Is(err, ErrUserInputInvalid), errors.Is(err, ErrPageInvalid), errors.Is(err, ErrRoleBindingInvalid), errors.Is(err, ErrIdentitySourceInputInvalid),
+		errors.Is(err, ErrDisableReasonRequired), errors.Is(err, ErrEnableReasonRequired), errors.Is(err, ErrRevokeReasonRequired):
 		writeIAMProblem(writer, request, http.StatusBadRequest, "IAM_INPUT_INVALID", "Identity request is invalid", err)
 	case errors.Is(err, identity.ErrActionDenied):
 		writeIAMProblem(writer, request, http.StatusForbidden, "IAM_ACCESS_DENIED", "Identity access is denied", err)
@@ -371,6 +537,16 @@ func writeIAMApplicationError(writer http.ResponseWriter, request *http.Request,
 		writeIAMProblem(writer, request, http.StatusNotFound, "IDENTITY_SOURCE_NOT_FOUND", "Identity source was not found", err)
 	case errors.Is(err, ErrIAMConflict):
 		writeIAMProblem(writer, request, http.StatusConflict, "IAM_RECORD_CONFLICT", "Identity record conflicts with current state", err)
+	case errors.Is(err, ErrSSOPreconditionFailed), errors.Is(err, ErrLoginModeTransitionInvalid), errors.Is(err, ErrLastEmergencyAdministrator),
+		errors.Is(err, ErrUserAlreadyDisabled), errors.Is(err, ErrUserAlreadyEnabled), errors.Is(err, ErrUserCannotBeEnabled):
+		writeIAMProblem(writer, request, http.StatusConflict, "IAM_STATE_PRECONDITION_FAILED", "Identity state precondition failed", err)
+	case errors.Is(err, ErrHighRiskConfirmationRequired):
+		writeIAMProblem(writer, request, http.StatusForbidden, "HIGH_RISK_CONFIRMATION_REQUIRED", "Fresh reauthentication and explicit confirmation are required", err)
+	case errors.Is(err, ErrLocalAuthenticationLimited):
+		writer.Header().Set("Retry-After", "300")
+		writeIAMProblem(writer, request, http.StatusTooManyRequests, "AUTHENTICATION_RATE_LIMITED", "Authentication rate limit exceeded", err)
+	case errors.Is(err, ErrLocalAuthenticationFailed):
+		writeIAMProblem(writer, request, http.StatusUnauthorized, "AUTHENTICATION_FAILED", "Authentication failed", err)
 	default:
 		writeIAMProblem(writer, request, http.StatusInternalServerError, "INTERNAL_ERROR", "Internal server error", err)
 	}
@@ -378,7 +554,15 @@ func writeIAMApplicationError(writer http.ResponseWriter, request *http.Request,
 
 func writeIAMProblem(writer http.ResponseWriter, request *http.Request, status int, code, title string, cause error) {
 	httpx.WriteProblem(writer, httpx.NewProblem(status, code, title, cause).
-		WithRequestID(httpx.RequestIDFromContext(request.Context())).WithInstance(request.URL.Path))
+		WithRequestID(httpx.RequestIDFromContext(request.Context())).WithInstance(iamProblemInstance(request.URL.Path)))
+}
+
+func iamProblemInstance(path string) string {
+	const challengePrefix = "/api/v1/auth/reauth-challenges/"
+	if strings.HasPrefix(path, challengePrefix) {
+		return challengePrefix + "{challenge_id}/complete"
+	}
+	return path
 }
 
 func writeIAMJSON(writer http.ResponseWriter, status int, value any) {

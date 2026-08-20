@@ -7,9 +7,11 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
 	"xminds-release-platform/internal/identity"
@@ -89,7 +91,28 @@ func TestHTTPHandlerMapsIAMConflictToProblemDetails(t *testing.T) {
 	}
 }
 
-func TestHTTPHandlerCreatesOrganizationAndDoesNotMountRoleBindingWrites(t *testing.T) {
+func TestHTTPHandlerMapsGovernedStatePreconditionsToConflict(t *testing.T) {
+	t.Parallel()
+	for name, applicationError := range map[string]error{
+		"sso precondition":      ErrSSOPreconditionFailed,
+		"login mode transition": ErrLoginModeTransitionInvalid,
+		"last emergency admin":  ErrLastEmergencyAdministrator,
+		"already disabled":      ErrUserAlreadyDisabled,
+		"already enabled":       ErrUserAlreadyEnabled,
+		"source unusable":       ErrUserCannotBeEnabled,
+	} {
+		t.Run(name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "/api/v1/users", nil)
+			response := httptest.NewRecorder()
+			writeIAMApplicationError(response, request, applicationError)
+			if response.Code != http.StatusConflict {
+				t.Fatalf("status = %d, body = %s", response.Code, response.Body)
+			}
+		})
+	}
+}
+
+func TestHTTPHandlerCreatesOrganizationAndMountsGovernedRoleBindingWrites(t *testing.T) {
 	t.Parallel()
 
 	organizationID := uuid.MustParse("018f835d-7e4b-7abc-9f42-67a2f5f48e71")
@@ -105,12 +128,126 @@ func TestHTTPHandlerCreatesOrganizationAndDoesNotMountRoleBindingWrites(t *testi
 	if response.Code != http.StatusCreated || application.organizationCommand.Name != "Release Engineering" {
 		t.Fatalf("status = %d, command = %+v, body = %s", response.Code, application.organizationCommand, response.Body)
 	}
-	writeRequest := httptest.NewRequest(http.MethodPost, "/api/v1/role-bindings", bytes.NewBufferString(`{}`))
+	writeRequest := httptest.NewRequest(http.MethodPost, "/api/v1/role-bindings", bytes.NewBufferString(`{
+        "subject_type":"user","subject_id":"018f835d-7e4b-7abc-9f42-67a2f5f48e73","subject_version":4,
+        "role":"auditor","scope_type":"platform","effect":"allow",
+        "reauth":{"challenge_id":"018f835d-7e4b-7abc-9f42-67a2f5f48e74","evidence":"opaque-once","confirmed":true}
+    }`))
 	writeRequest.Header.Set("Authorization", "Bearer token")
+	writeRequest.Header.Set("Content-Type", "application/json")
 	writeResponse := httptest.NewRecorder()
 	handler.ServeHTTP(writeResponse, writeRequest)
-	if writeResponse.Code != http.StatusMethodNotAllowed && writeResponse.Code != http.StatusNotFound {
-		t.Fatalf("role binding write status = %d", writeResponse.Code)
+	if writeResponse.Code != http.StatusCreated || application.highRiskAction != "role_binding.create" || application.roleBindingCommand.SubjectVersion != 4 || !application.highRiskProof.Confirmed {
+		t.Fatalf("role binding write status = %d action=%q command=%+v proof=%+v body=%s", writeResponse.Code, application.highRiskAction, application.roleBindingCommand, application.highRiskProof, writeResponse.Body)
+	}
+}
+
+func TestHTTPHandlerMountsAllGovernedIAMWritesWithStrictVersionsAndProofs(t *testing.T) {
+	application := &stubIAMApplication{}
+	handler := authenticatedIAMHandler(application)
+	for _, testCase := range []struct {
+		name, method, path, body, action string
+		status                           int
+	}{
+		{name: "delete binding", method: http.MethodDelete, path: "/api/v1/role-bindings/018f835d-7e4b-7abc-9f42-67a2f5f48e75", body: `{"version":7,"reauth":{"challenge_id":"018f835d-7e4b-7abc-9f42-67a2f5f48e74","evidence":"opaque-once","confirmed":true}}`, action: "role_binding.delete", status: http.StatusNoContent},
+		{name: "disable user", method: http.MethodPost, path: "/api/v1/users/018f835d-7e4b-7abc-9f42-67a2f5f48e76/disable", body: `{"version":8,"reason":"incident","reauth":{"challenge_id":"018f835d-7e4b-7abc-9f42-67a2f5f48e74","evidence":"opaque-once","confirmed":true}}`, action: "user.disable", status: http.StatusNoContent},
+		{name: "enable user", method: http.MethodPost, path: "/api/v1/users/018f835d-7e4b-7abc-9f42-67a2f5f48e76/enable", body: `{"version":9,"reason":"incident closed","reauth":{"challenge_id":"018f835d-7e4b-7abc-9f42-67a2f5f48e74","evidence":"opaque-once","confirmed":true}}`, action: "user.enable", status: http.StatusNoContent},
+		{name: "revoke sessions", method: http.MethodPost, path: "/api/v1/users/018f835d-7e4b-7abc-9f42-67a2f5f48e76/revoke-sessions", body: `{"version":10,"reason":"rotation","reauth":{"challenge_id":"018f835d-7e4b-7abc-9f42-67a2f5f48e74","evidence":"opaque-once","confirmed":true}}`, action: "user.revoke_sessions", status: http.StatusNoContent},
+		{name: "enable sso", method: http.MethodPost, path: "/api/v1/identity-sources/018f835d-7e4b-7abc-9f42-67a2f5f48e77/enable", body: `{"version":11,"reauth":{"challenge_id":"018f835d-7e4b-7abc-9f42-67a2f5f48e74","evidence":"opaque-once","confirmed":true}}`, action: "sso.enable", status: http.StatusNoContent},
+		{name: "disable sso", method: http.MethodPost, path: "/api/v1/identity-sources/018f835d-7e4b-7abc-9f42-67a2f5f48e77/disable", body: `{"version":12,"reauth":{"challenge_id":"018f835d-7e4b-7abc-9f42-67a2f5f48e74","evidence":"opaque-once","confirmed":true}}`, action: "sso.disable", status: http.StatusNoContent},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			application.highRiskAction = ""
+			request := httptest.NewRequest(testCase.method, testCase.path, bytes.NewBufferString(testCase.body))
+			request.Header.Set("Authorization", "Bearer token")
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != testCase.status || application.highRiskAction != testCase.action || application.highRiskVersion < 1 || !application.highRiskProof.Confirmed {
+				t.Fatalf("status=%d action=%q version=%d proof=%+v body=%s", response.Code, application.highRiskAction, application.highRiskVersion, application.highRiskProof, response.Body)
+			}
+		})
+	}
+}
+
+func TestReauthenticationHTTPReturnsEvidenceOnlyFromSuccessfulCompletion(t *testing.T) {
+	challengeID := uuid.MustParse("018f835d-7e4b-7abc-9f42-67a2f5f48e90")
+	application := &stubReauthenticationApplication{
+		created:   ReauthenticationChallengeResult{ID: challengeID, Operation: ReauthenticationOperationUserDisable, Status: ReauthenticationStatusPending, ExpiresAt: time.Date(2026, 8, 20, 12, 5, 0, 0, time.UTC)},
+		completed: ReauthenticationEvidence{ChallengeID: challengeID, Evidence: "returned-exactly-once", ExpiresAt: time.Date(2026, 8, 20, 12, 2, 0, 0, time.UTC)},
+	}
+	router := chi.NewRouter()
+	RegisterReauthenticationRoutes(router, application)
+	handler := identity.AuthenticationMiddleware(iamStaticVerifier{principal: identity.Principal{Subject: "admin", Kind: identity.PrincipalKindLocal, Roles: []identity.Role{identity.RoleAdmin}, TokenID: "018f835d-7e4b-7abc-9f42-67a2f5f48e93"}})(router)
+
+	createRequest := httptest.NewRequest(http.MethodPost, "/api/v1/auth/reauth-challenges", bytes.NewBufferString(`{"operation":"identity.user.disable"}`))
+	createRequest.Header.Set("Authorization", "Bearer bearer-value")
+	createRequest.Header.Set("Content-Type", "application/json")
+	createResponse := httptest.NewRecorder()
+	handler.ServeHTTP(createResponse, createRequest)
+	if createResponse.Code != http.StatusCreated || bytes.Contains(createResponse.Body.Bytes(), []byte("evidence")) || createResponse.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("create response status=%d headers=%v body=%s", createResponse.Code, createResponse.Header(), createResponse.Body)
+	}
+
+	completeRequest := httptest.NewRequest(http.MethodPost, "/api/v1/auth/reauth-challenges/"+challengeID.String()+"/complete", bytes.NewBufferString(`{"password":"not-logged","mfa_proof":"834129"}`))
+	completeRequest.Header.Set("Authorization", "Bearer bearer-value")
+	completeRequest.Header.Set("Content-Type", "application/json")
+	completeResponse := httptest.NewRecorder()
+	handler.ServeHTTP(completeResponse, completeRequest)
+	if completeResponse.Code != http.StatusOK || !bytes.Contains(completeResponse.Body.Bytes(), []byte("returned-exactly-once")) || completeResponse.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("complete response status=%d headers=%v body=%s", completeResponse.Code, completeResponse.Header(), completeResponse.Body)
+	}
+	if application.completeCommand.Password != "not-logged" || application.completeCommand.MFAProof != "834129" {
+		t.Fatalf("complete command = %+v", application.completeCommand)
+	}
+}
+
+func TestReauthenticationHTTPFailureNeverReflectsSensitiveMaterial(t *testing.T) {
+	challengeID := "018f835d-7e4b-7abc-9f42-67a2f5f48e91"
+	password, mfaProof := "DoNotReflect-Password", "834129"
+	application := &stubReauthenticationApplication{completeError: ErrHighRiskConfirmationRequired}
+	router := chi.NewRouter()
+	RegisterReauthenticationRoutes(router, application)
+	handler := identity.AuthenticationMiddleware(iamStaticVerifier{principal: identity.Principal{Subject: "admin", Kind: identity.PrincipalKindLocal, Roles: []identity.Role{identity.RoleAdmin}, TokenID: "bearer-token-id"}})(router)
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/auth/reauth-challenges/"+challengeID+"/complete", bytes.NewBufferString(`{"password":"`+password+`","mfa_proof":"`+mfaProof+`"}`))
+	request.Header.Set("Authorization", "Bearer bearer-secret")
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body)
+	}
+	for _, sensitive := range []string{challengeID, password, mfaProof, "bearer-secret", "bearer-token-id"} {
+		if bytes.Contains(response.Body.Bytes(), []byte(sensitive)) {
+			t.Fatalf("problem response reflected sensitive material %q: %s", sensitive, response.Body)
+		}
+	}
+}
+
+func TestReauthenticationHTTPRejectsOutOfContractLocalFactors(t *testing.T) {
+	challengeID := "018f835d-7e4b-7abc-9f42-67a2f5f48e92"
+	for name, body := range map[string]string{
+		"oversized password": `{"password":"` + strings.Repeat("p", 1025) + `"}`,
+		"malformed mfa":      `{"password":"valid","mfa_proof":"12ab56"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			application := &stubReauthenticationApplication{}
+			router := chi.NewRouter()
+			RegisterReauthenticationRoutes(router, application)
+			handler := identity.AuthenticationMiddleware(iamStaticVerifier{principal: identity.Principal{Subject: "admin", Kind: identity.PrincipalKindLocal, Roles: []identity.Role{identity.RoleAdmin}, TokenID: "018f835d-7e4b-7abc-9f42-67a2f5f48e93"}})(router)
+			request := httptest.NewRequest(http.MethodPost, "/api/v1/auth/reauth-challenges/"+challengeID+"/complete", bytes.NewBufferString(body))
+			request.Header.Set("Authorization", "Bearer bearer-value")
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+
+			handler.ServeHTTP(response, request)
+
+			if response.Code != http.StatusBadRequest || application.completeCommand.Password != "" || application.completeCommand.MFAProof != "" {
+				t.Fatalf("status=%d command=%+v body=%s", response.Code, application.completeCommand, response.Body)
+			}
+		})
 	}
 }
 
@@ -157,6 +294,10 @@ type stubIAMApplication struct {
 	organizationCommand   CreateOrganizationCommand
 	identitySource        IdentitySource
 	identitySourceCommand CreateIdentitySourceCommand
+	roleBindingCommand    CreateRoleBindingCommand
+	highRiskProof         HighRiskProof
+	highRiskAction        string
+	highRiskVersion       int64
 }
 
 func (application *stubIAMApplication) CreateLocalUser(_ context.Context, _ identity.Principal, command CreateLocalUserCommand, request RequestContext) (LocalUserProvisioning, error) {
@@ -187,9 +328,60 @@ func (application *stubIAMApplication) ListRoleBindings(context.Context, identit
 	return RoleBindingPage{}, errors.New("unexpected ListRoleBindings call")
 }
 
+func (application *stubIAMApplication) CreateRoleBinding(_ context.Context, _ identity.Principal, command CreateRoleBindingCommand, proof HighRiskProof, _ RequestContext) (RoleBinding, error) {
+	application.roleBindingCommand, application.highRiskProof, application.highRiskAction, application.highRiskVersion = command, proof, "role_binding.create", command.SubjectVersion
+	return RoleBinding{ID: uuid.MustParse("018f835d-7e4b-7abc-9f42-67a2f5f48e72"), Version: 1}, nil
+}
+
+func (application *stubIAMApplication) DeleteRoleBinding(_ context.Context, _ identity.Principal, _ uuid.UUID, version int64, proof HighRiskProof, _ RequestContext) error {
+	application.highRiskProof, application.highRiskAction, application.highRiskVersion = proof, "role_binding.delete", version
+	return nil
+}
+
+func (application *stubIAMApplication) DisableUser(_ context.Context, _ identity.Principal, _ uuid.UUID, version int64, _ string, proof HighRiskProof, _ RequestContext) error {
+	application.highRiskProof, application.highRiskAction, application.highRiskVersion = proof, "user.disable", version
+	return nil
+}
+
+func (application *stubIAMApplication) EnableUser(_ context.Context, _ identity.Principal, _ uuid.UUID, version int64, _ string, proof HighRiskProof, _ RequestContext) error {
+	application.highRiskProof, application.highRiskAction, application.highRiskVersion = proof, "user.enable", version
+	return nil
+}
+
+func (application *stubIAMApplication) RevokeUserSessions(_ context.Context, _ identity.Principal, _ uuid.UUID, version int64, _ string, proof HighRiskProof, _ RequestContext) error {
+	application.highRiskProof, application.highRiskAction, application.highRiskVersion = proof, "user.revoke_sessions", version
+	return nil
+}
+
+func (application *stubIAMApplication) EnableSSO(_ context.Context, _ identity.Principal, _ uuid.UUID, version int64, proof HighRiskProof, _ RequestContext) error {
+	application.highRiskProof, application.highRiskAction, application.highRiskVersion = proof, "sso.enable", version
+	return nil
+}
+
+func (application *stubIAMApplication) DisableSSO(_ context.Context, _ identity.Principal, _ uuid.UUID, version int64, proof HighRiskProof, _ RequestContext) error {
+	application.highRiskProof, application.highRiskAction, application.highRiskVersion = proof, "sso.disable", version
+	return nil
+}
+
 func (application *stubIAMApplication) CreateIdentitySource(_ context.Context, _ identity.Principal, command CreateIdentitySourceCommand, _ RequestContext) (IdentitySource, error) {
 	application.identitySourceCommand = command
 	return application.identitySource, nil
+}
+
+type stubReauthenticationApplication struct {
+	created         ReauthenticationChallengeResult
+	completed       ReauthenticationEvidence
+	completeCommand CompleteReauthenticationCommand
+	completeError   error
+}
+
+func (application *stubReauthenticationApplication) CreateChallenge(context.Context, identity.Principal, ReauthenticationOperation, RequestContext) (ReauthenticationChallengeResult, error) {
+	return application.created, nil
+}
+
+func (application *stubReauthenticationApplication) CompleteChallenge(_ context.Context, _ identity.Principal, _ uuid.UUID, command CompleteReauthenticationCommand, _ RequestContext) (ReauthenticationEvidence, error) {
+	application.completeCommand = command
+	return application.completed, application.completeError
 }
 
 func (application *stubIAMApplication) ListIdentitySources(context.Context, identity.Principal, Page) (IdentitySourcePage, error) {

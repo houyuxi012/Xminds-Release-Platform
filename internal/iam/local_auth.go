@@ -92,6 +92,11 @@ type LoginRepository interface {
 	SaveAuthenticationSuccess(ctx context.Context, tx pgx.Tx, userID uuid.UUID, mfaCounter int64, session Session) error
 }
 
+type LocalReauthenticationRepository interface {
+	FindLocalReauthentication(ctx context.Context, tx pgx.Tx, canonicalUsername string, sessionID uuid.UUID) (LoginState, UserPrincipal, LocalCredential, Session, bool, error)
+	SaveReauthenticationSuccess(ctx context.Context, tx pgx.Tx, userID uuid.UUID, mfaCounter int64) error
+}
+
 type LocalAuthConfig struct {
 	Repository    ActivationRepository
 	Auditor       AuditAppender
@@ -103,28 +108,62 @@ type LocalAuthConfig struct {
 }
 
 type LocalAuthService struct {
-	repository    ActivationRepository
-	login         LoginRepository
-	auditor       AuditAppender
-	passwords     PasswordService
-	dummyPassword PasswordDigest
-	mfa           MFAVerifier
-	policy        LocalAuthPolicy
-	clock         func() time.Time
+	repository       ActivationRepository
+	login            LoginRepository
+	reauthentication LocalReauthenticationRepository
+	auditor          AuditAppender
+	passwords        PasswordService
+	dummyPassword    PasswordDigest
+	mfa              MFAVerifier
+	policy           LocalAuthPolicy
+	clock            func() time.Time
 }
 
 func NewLocalAuthService(config LocalAuthConfig) (*LocalAuthService, error) {
 	login, ok := config.Repository.(LoginRepository)
-	if config.Repository == nil || !ok || config.Auditor == nil || config.Passwords == nil || config.MFA == nil || config.Clock == nil || !validLocalAuthPolicy(config.Policy) {
+	reauthentication, reauthenticationOK := config.Repository.(LocalReauthenticationRepository)
+	if config.Repository == nil || !ok || !reauthenticationOK || config.Auditor == nil || config.Passwords == nil || config.MFA == nil || config.Clock == nil || !validLocalAuthPolicy(config.Policy) {
 		return nil, ErrIAMConfiguration
 	}
 	if _, _, _, _, err := parsePasswordDigest(config.DummyPassword); err != nil {
 		return nil, ErrIAMConfiguration
 	}
 	return &LocalAuthService{
-		repository: config.Repository, login: login, auditor: config.Auditor, passwords: config.Passwords,
+		repository: config.Repository, login: login, reauthentication: reauthentication, auditor: config.Auditor, passwords: config.Passwords,
 		dummyPassword: config.DummyPassword, mfa: config.MFA, policy: cloneLocalAuthPolicy(config.Policy), clock: config.Clock,
 	}, nil
+}
+
+type localFactorResult struct {
+	authenticated        bool
+	authenticationFailed bool
+	reasonCode           string
+	mfaCounter           int64
+}
+
+func (service *LocalAuthService) verifyLocalFactors(ctx context.Context, user UserPrincipal, credential LocalCredential, administrator, eligible bool, password, mfaProof string) localFactorResult {
+	result := localFactorResult{authenticated: eligible, reasonCode: "CREDENTIAL_INVALID"}
+	passwordDigest := service.dummyPassword
+	if eligible {
+		passwordDigest = credential.Password
+	}
+	if passwordErr := service.passwords.Verify(password, passwordDigest); eligible && passwordErr != nil {
+		result.authenticated, result.authenticationFailed, result.reasonCode = false, true, "CREDENTIAL_INVALID"
+	}
+	requiresMFA := user.Kind == UserKindEmergency || administrator
+	if result.authenticated && requiresMFA {
+		if !user.MFAEnrolled || credential.MFASecretReference == "" || strings.TrimSpace(mfaProof) == "" {
+			result.authenticated, result.authenticationFailed, result.reasonCode = false, true, "MFA_REQUIRED"
+		} else {
+			assertion, verifyErr := service.mfa.Verify(ctx, credential.MFASecretReference, mfaProof)
+			if verifyErr != nil || assertion.Counter <= credential.MFALastCounter {
+				result.authenticated, result.authenticationFailed, result.reasonCode = false, true, "MFA_PROOF_INVALID"
+			} else {
+				result.mfaCounter = assertion.Counter
+			}
+		}
+	}
+	return result
 }
 
 func cloneLocalAuthPolicy(policy LocalAuthPolicy) LocalAuthPolicy {
@@ -174,38 +213,18 @@ func (service *LocalAuthService) loginWithMethod(ctx context.Context, command Lo
 		if eligible && credential.LockedUntil.After(now) {
 			eligible, reasonCode = false, "CREDENTIAL_LOCKED"
 		}
-		passwordDigest := service.dummyPassword
-		if eligible {
-			passwordDigest = credential.Password
-		}
-		passwordErr := service.passwords.Verify(command.Password, passwordDigest)
-		authenticated := eligible
-		authenticationFailed := eligible && passwordErr != nil
-		if authenticationFailed {
-			authenticated, reasonCode = false, "CREDENTIAL_INVALID"
-		}
-		mfaCounter := int64(0)
-		requiresMFA := user.Kind == UserKindEmergency || administrator
-		if authenticated && requiresMFA {
-			if !user.MFAEnrolled || credential.MFASecretReference == "" || strings.TrimSpace(command.MFAProof) == "" {
-				authenticated, authenticationFailed, reasonCode = false, true, "MFA_REQUIRED"
-			} else {
-				assertion, verifyErr := service.mfa.Verify(ctx, credential.MFASecretReference, command.MFAProof)
-				if verifyErr != nil || assertion.Counter <= credential.MFALastCounter {
-					authenticated, authenticationFailed, reasonCode = false, true, "MFA_PROOF_INVALID"
-				} else {
-					mfaCounter = assertion.Counter
-				}
-			}
-		}
-		if !authenticated {
-			if authenticationFailed {
+		factors := service.verifyLocalFactors(ctx, user, credential, administrator, eligible, command.Password, command.MFAProof)
+		if !factors.authenticated {
+			if factors.authenticationFailed {
 				attempts := credential.FailedAttempts + 1
 				if err := service.login.SaveAuthenticationFailure(ctx, tx, user.ID, attempts, lockUntilForAttempts(now, attempts, service.policy.LockoutStages)); err != nil {
 					return err
 				}
 			}
 			outcome = ErrLocalAuthenticationFailed
+			if reasonCode == "CREDENTIAL_INVALID" {
+				reasonCode = factors.reasonCode
+			}
 			return service.appendLoginAudit(ctx, tx, user, method, audit.OutcomeDenied, reasonCode, request)
 		}
 		token, digest, generationErr := generateSessionToken()
@@ -222,10 +241,10 @@ func (service *LocalAuthService) loginWithMethod(ctx context.Context, command Lo
 		}
 		session := Session{
 			ID: sessionID, TokenDigest: digest, SubjectID: user.ID, AuthenticationMethod: method,
-			MFALevel: boolToMFA(requiresMFA), AuthenticatedAt: now, LastUsedAt: now,
+			MFALevel: boolToMFA(user.Kind == UserKindEmergency || administrator), AuthenticatedAt: now, LastUsedAt: now,
 			AbsoluteExpiresAt: now.Add(absolute), IdleExpiresAt: now.Add(idle), Version: 1,
 		}
-		if err := service.login.SaveAuthenticationSuccess(ctx, tx, user.ID, mfaCounter, session); err != nil {
+		if err := service.login.SaveAuthenticationSuccess(ctx, tx, user.ID, factors.mfaCounter, session); err != nil {
 			return err
 		}
 		if err := service.appendLoginAudit(ctx, tx, user, method, audit.OutcomeSuccess, "AUTHENTICATED", request); err != nil {
@@ -244,6 +263,63 @@ func (service *LocalAuthService) loginWithMethod(ctx context.Context, command Lo
 		return LoginResult{}, outcome
 	}
 	return result, nil
+}
+
+func (service *LocalAuthService) Reauthenticate(ctx context.Context, actor identity.Principal, command CompleteReauthenticationCommand, request RequestContext) error {
+	if service == nil || service.reauthentication == nil || actor.Kind != identity.PrincipalKindLocal {
+		return ErrLocalAuthenticationFailed
+	}
+	sessionID, err := uuid.Parse(strings.TrimSpace(actor.TokenID))
+	if err != nil || sessionID == uuid.Nil || sessionID.Version() != 7 {
+		return ErrLocalAuthenticationFailed
+	}
+	username := canonicalUsername(actor.Subject)
+	now := service.clock().UTC().Truncate(time.Microsecond)
+	allowed, err := service.consumeAuthenticationAttempt(ctx, username, AuthenticationMethodReauthentication, request, now)
+	if err != nil {
+		return err
+	}
+	if !allowed {
+		return ErrLocalAuthenticationLimited
+	}
+	var outcome error
+	err = service.repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
+		state, user, credential, session, administrator, findErr := service.reauthentication.FindLocalReauthentication(ctx, tx, username, sessionID)
+		if findErr != nil && !errors.Is(findErr, ErrLocalAuthenticationFailed) {
+			return findErr
+		}
+		eligible := findErr == nil && user.Username == username && user.Status == UserStatusActive && !credential.LockedUntil.After(now) &&
+			session.ID == sessionID && session.SubjectID == user.ID && session.RevokedAt.IsZero() && session.AbsoluteExpiresAt.After(now) && session.IdleExpiresAt.After(now)
+		if eligible {
+			switch session.AuthenticationMethod {
+			case AuthenticationMethodLocal:
+				eligible = user.Kind == UserKindLocal && (state.Mode == LoginModeLocal || state.Mode == LoginModeConfiguring)
+			case AuthenticationMethodEmergency:
+				eligible = user.Kind == UserKindEmergency && session.MFALevel >= 1
+			default:
+				eligible = false
+			}
+		}
+		factors := service.verifyLocalFactors(ctx, user, credential, administrator, eligible, command.Password, command.MFAProof)
+		if !factors.authenticated {
+			if factors.authenticationFailed {
+				attempts := credential.FailedAttempts + 1
+				if saveErr := service.login.SaveAuthenticationFailure(ctx, tx, user.ID, attempts, lockUntilForAttempts(now, attempts, service.policy.LockoutStages)); saveErr != nil {
+					return saveErr
+				}
+			}
+			outcome = ErrLocalAuthenticationFailed
+			return service.appendAuthenticationAudit(ctx, tx, user, "identity.reauthentication.local", audit.OutcomeDenied, factors.reasonCode, request)
+		}
+		if saveErr := service.reauthentication.SaveReauthenticationSuccess(ctx, tx, user.ID, factors.mfaCounter); saveErr != nil {
+			return saveErr
+		}
+		return service.appendAuthenticationAudit(ctx, tx, user, "identity.reauthentication.local", audit.OutcomeSuccess, "REAUTHENTICATED", request)
+	})
+	if err != nil {
+		return err
+	}
+	return outcome
 }
 
 func (service *LocalAuthService) consumeAuthenticationAttempt(ctx context.Context, username string, method AuthenticationMethod, request RequestContext, now time.Time) (bool, error) {
@@ -295,8 +371,11 @@ func (service *LocalAuthService) appendLoginAudit(ctx context.Context, tx pgx.Tx
 
 func (service *LocalAuthService) appendAuthenticationAttemptAudit(ctx context.Context, tx pgx.Tx, method AuthenticationMethod, outcome audit.Outcome, reasonCode string, request RequestContext) error {
 	action, entrypoint := "identity.local_user.login.attempt", "local"
-	if method == AuthenticationMethodEmergency {
+	switch method {
+	case AuthenticationMethodEmergency:
 		action, entrypoint = "identity.emergency.login.attempt", "emergency"
+	case AuthenticationMethodReauthentication:
+		action, entrypoint = "identity.reauthentication.local.attempt", "reauthentication"
 	}
 	return service.appendAuthenticationAuditWithMetadata(ctx, tx, UserPrincipal{}, action, outcome, reasonCode, request, map[string]any{"entrypoint": entrypoint})
 }

@@ -17,6 +17,7 @@ type LocalAuthRuntimeConfig struct {
 	Password                   PasswordPolicyConfig
 	TOTP                       TOTPConfig
 	Policy                     LocalAuthPolicy
+	Reauthentication           ReauthenticationPolicy
 }
 
 func LoadLocalAuthRuntimeConfig(environ map[string]string, environment string) (LocalAuthRuntimeConfig, error) {
@@ -26,8 +27,9 @@ func LoadLocalAuthRuntimeConfig(environ map[string]string, environment string) (
 		Password: PasswordPolicyConfig{
 			MinimumLength: 16, MemoryKiB: 64 * 1024, Iterations: 3, Parallelism: 2, SaltBytes: 16, DerivedKeyBytes: 32,
 		},
-		TOTP:   TOTPConfig{Digits: 6, Period: 30 * time.Second, Skew: 1, Algorithm: "SHA1"},
-		Policy: DefaultLocalAuthPolicy(),
+		TOTP:             TOTPConfig{Digits: 6, Period: 30 * time.Second, Skew: 1, Algorithm: "SHA1"},
+		Policy:           DefaultLocalAuthPolicy(),
+		Reauthentication: DefaultReauthenticationPolicy(),
 	}
 	environment = strings.ToLower(strings.TrimSpace(environment))
 	developmentCorpus := strings.ToLower(strings.TrimSpace(environ["XMINDS_RELEASE_IAM_USE_DEVELOPMENT_BREACH_CORPUS"]))
@@ -133,7 +135,32 @@ func LoadLocalAuthRuntimeConfig(environ map[string]string, environment string) (
 	if algorithm := strings.TrimSpace(environ["XMINDS_RELEASE_IAM_TOTP_ALGORITHM"]); algorithm != "" {
 		configuration.TOTP.Algorithm = strings.ToUpper(algorithm)
 	}
+	configuration.Reauthentication.ChallengeTTL, err = optionalDuration(environ, "XMINDS_RELEASE_IAM_REAUTH_CHALLENGE_TTL", configuration.Reauthentication.ChallengeTTL)
+	if err != nil {
+		return LocalAuthRuntimeConfig{}, err
+	}
+	configuration.Reauthentication.EvidenceTTL, err = optionalDuration(environ, "XMINDS_RELEASE_IAM_REAUTH_EVIDENCE_TTL", configuration.Reauthentication.EvidenceTTL)
+	if err != nil {
+		return LocalAuthRuntimeConfig{}, err
+	}
+	configuration.Reauthentication.OIDCMaximumAge, err = optionalDuration(environ, "XMINDS_RELEASE_IAM_REAUTH_OIDC_MAXIMUM_AGE", configuration.Reauthentication.OIDCMaximumAge)
+	if err != nil {
+		return LocalAuthRuntimeConfig{}, err
+	}
+	configuration.Reauthentication.AllowedClockSkew, err = optionalDuration(environ, "XMINDS_RELEASE_IAM_REAUTH_ALLOWED_CLOCK_SKEW", configuration.Reauthentication.AllowedClockSkew)
+	if err != nil {
+		return LocalAuthRuntimeConfig{}, err
+	}
+	configuration.Reauthentication.TerminalRetention, err = optionalDuration(environ, "XMINDS_RELEASE_IAM_REAUTH_TERMINAL_RETENTION", configuration.Reauthentication.TerminalRetention)
+	if err != nil {
+		return LocalAuthRuntimeConfig{}, err
+	}
+	configuration.Reauthentication.CleanupBatchSize, err = optionalInt(environ, "XMINDS_RELEASE_IAM_REAUTH_CLEANUP_BATCH_SIZE", configuration.Reauthentication.CleanupBatchSize)
+	if err != nil {
+		return LocalAuthRuntimeConfig{}, err
+	}
 	if !validPasswordPolicy(configuration.Password) || !validLocalAuthPolicy(configuration.Policy) ||
+		!validReauthenticationPolicy(configuration.Reauthentication) ||
 		(configuration.TOTP.Digits != 6 && configuration.TOTP.Digits != 8) || configuration.TOTP.Skew < 0 || configuration.TOTP.Skew > 2 ||
 		configuration.TOTP.Period < 30*time.Second || configuration.TOTP.Period > 2*time.Minute ||
 		(configuration.TOTP.Algorithm != "SHA1" && configuration.TOTP.Algorithm != "SHA256") {
