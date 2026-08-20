@@ -8,6 +8,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"xminds-release-platform/internal/audit"
+	"xminds-release-platform/internal/identity"
 )
 
 type Repository interface {
@@ -49,6 +50,10 @@ type PasswordVerifier interface {
 type PasswordService interface {
 	PasswordVerifier
 	Hash(ctx context.Context, password string) (PasswordDigest, error)
+}
+
+type HighRiskAuthorizer interface {
+	Authorize(ctx context.Context, actor identity.Principal, operation string, proof HighRiskProof) error
 }
 
 type DirectoryAdapter interface {

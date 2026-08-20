@@ -44,6 +44,16 @@ type Principal struct {
 	ProductIDs []string
 	TokenID    string
 	Provider   WorkloadProvider
+	Governed   bool
+	RoleScopes []RoleScope
+}
+
+type RoleScope struct {
+	Role        Role
+	Effect      string
+	ScopeType   string
+	ProductID   string
+	ChannelName string
 }
 
 func (principal Principal) Validate() error {

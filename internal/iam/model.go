@@ -195,9 +195,12 @@ type LocalCredential struct {
 	ActivationExpiresAt time.Time
 }
 
-type HighRiskConfirmation struct {
-	Confirmed         bool
-	ReauthenticatedAt time.Time
+// HighRiskProof contains opaque verifier-bound material. It intentionally has
+// no client-supplied time: freshness is established only by the authority.
+type HighRiskProof struct {
+	ChallengeID string
+	Evidence    string
+	Confirmed   bool
 }
 
 type RequestContext struct {

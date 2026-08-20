@@ -176,8 +176,13 @@ func run(ctx context.Context, arguments []string, environ map[string]string) err
 	if err != nil {
 		return fmt.Errorf("configure IAM activation credentials: %w", err)
 	}
+	iamRepository := iam.NewPostgresRepository(pool)
+	governedResolver, err := iam.NewGovernedPrincipalResolver(iamRepository, time.Now)
+	if err != nil {
+		return fmt.Errorf("configure governed IAM principal resolver: %w", err)
+	}
 	iamService, err := iam.NewService(iam.ServiceConfig{
-		Repository: iam.NewPostgresRepository(pool), Auditor: auditor, Passwords: iamPasswords, Clock: time.Now,
+		Repository: iamRepository, Auditor: auditor, Passwords: iamPasswords, Clock: time.Now,
 	})
 	if err != nil {
 		return fmt.Errorf("configure IAM service: %w", err)
@@ -188,7 +193,7 @@ func run(ctx context.Context, arguments []string, environ map[string]string) err
 		Handler: httpserver.NewManagementHandler(
 			pool,
 			buildinfo.Current(),
-			identity.AuthenticationMiddleware(managementVerifier),
+			identity.AuthenticationMiddleware(managementVerifier, governedResolver),
 			managementRoutes(managementApplications{
 				Products:  productService,
 				Artifacts: artifactService,

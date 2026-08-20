@@ -24,7 +24,7 @@ func TestEnableSSORequiresVerifiedSourceMappingPreviewAndEmergencyAccount(t *tes
 		RequiredMappingsComplete: false,
 	}
 
-	err := harness.service.EnableSSO(context.Background(), harness.admin, harness.sourceID, harness.confirmation(), harness.request)
+	err := harness.service.EnableSSO(context.Background(), harness.admin, harness.sourceID, harness.proof(), harness.request)
 
 	if !errors.Is(err, ErrSSOPreconditionFailed) {
 		t.Fatalf("EnableSSO() error = %v", err)
@@ -38,7 +38,7 @@ func TestFaultDoesNotEnableRegularLocalLogin(t *testing.T) {
 	t.Parallel()
 
 	harness := newIAMHarness(t)
-	if err := harness.service.EnableSSO(context.Background(), harness.admin, harness.sourceID, harness.confirmation(), harness.request); err != nil {
+	if err := harness.service.EnableSSO(context.Background(), harness.admin, harness.sourceID, harness.proof(), harness.request); err != nil {
 		t.Fatalf("EnableSSO() error = %v", err)
 	}
 	if err := harness.service.MarkIdentitySourceFault(context.Background(), harness.system, harness.sourceID, "OIDC_UNREACHABLE", harness.request); err != nil {
@@ -60,7 +60,7 @@ func TestCannotDisableLastUsableEmergencyAdministrator(t *testing.T) {
 
 	harness := newIAMHarness(t)
 
-	err := harness.service.DisableUser(context.Background(), harness.admin, harness.emergencyAdminID, "rotation", harness.confirmation(), harness.request)
+	err := harness.service.DisableUser(context.Background(), harness.admin, harness.emergencyAdminID, "rotation", harness.proof(), harness.request)
 
 	if !errors.Is(err, ErrLastEmergencyAdministrator) {
 		t.Fatalf("DisableUser() error = %v", err)
@@ -74,18 +74,17 @@ func TestDisableSSORequiresFreshConfirmationAndReturnsToLocalMode(t *testing.T) 
 	t.Parallel()
 
 	harness := newIAMHarness(t)
-	if err := harness.service.EnableSSO(context.Background(), harness.admin, harness.sourceID, harness.confirmation(), harness.request); err != nil {
+	if err := harness.service.EnableSSO(context.Background(), harness.admin, harness.sourceID, harness.proof(), harness.request); err != nil {
 		t.Fatal(err)
 	}
-	stale := HighRiskConfirmation{Confirmed: true, ReauthenticatedAt: harness.now.Add(-10 * time.Minute)}
-	if err := harness.service.DisableSSO(context.Background(), harness.admin, stale, harness.request); !errors.Is(err, ErrHighRiskConfirmationRequired) {
-		t.Fatalf("DisableSSO(stale) error = %v", err)
+	if err := harness.service.DisableSSO(context.Background(), harness.admin, HighRiskProof{Confirmed: true, ChallengeID: "wrong", Evidence: "bad"}, harness.request); !errors.Is(err, ErrHighRiskConfirmationRequired) {
+		t.Fatalf("DisableSSO(unverified proof) error = %v", err)
 	}
 	if harness.repository.login.Mode != LoginModeSSO {
 		t.Fatalf("login mode after rejected disable = %q", harness.repository.login.Mode)
 	}
 
-	if err := harness.service.DisableSSO(context.Background(), harness.admin, harness.confirmation(), harness.request); err != nil {
+	if err := harness.service.DisableSSO(context.Background(), harness.admin, harness.proof(), harness.request); err != nil {
 		t.Fatalf("DisableSSO() error = %v", err)
 	}
 	if harness.repository.login.Mode != LoginModeLocal || harness.repository.login.ActiveSourceID != uuid.Nil || harness.repository.login.FaultCode != "" {
@@ -174,14 +173,14 @@ func TestRoleBindingCreateAndDeleteAreAuditedAndOptimistic(t *testing.T) {
 		Role:        identity.RoleAuditor,
 		ScopeType:   ScopeTypePlatform,
 		Effect:      BindingEffectAllow,
-	}, harness.request)
+	}, harness.proof(), harness.request)
 	if err != nil {
 		t.Fatalf("CreateRoleBinding() error = %v", err)
 	}
 	if binding.ID == uuid.Nil || binding.Version != 1 {
 		t.Fatalf("binding = %+v", binding)
 	}
-	if err := harness.service.DeleteRoleBinding(context.Background(), harness.admin, binding.ID, binding.Version, harness.request); err != nil {
+	if err := harness.service.DeleteRoleBinding(context.Background(), harness.admin, binding.ID, binding.Version, harness.proof(), harness.request); err != nil {
 		t.Fatalf("DeleteRoleBinding() error = %v", err)
 	}
 	if _, exists := harness.repository.roleBindings[binding.ID]; exists {
@@ -189,6 +188,18 @@ func TestRoleBindingCreateAndDeleteAreAuditedAndOptimistic(t *testing.T) {
 	}
 	if len(harness.auditor.commands) != 2 || harness.auditor.commands[1].Action != "identity.role_binding.delete" {
 		t.Fatalf("audit commands = %+v", harness.auditor.commands)
+	}
+}
+
+func TestHighRiskWritesFailClosedWithoutServerSideAuthority(t *testing.T) {
+	t.Parallel()
+	harness := newIAMHarness(t)
+	harness.service.highRisk = nil
+	_, err := harness.service.CreateRoleBinding(context.Background(), harness.admin, CreateRoleBindingCommand{
+		SubjectType: SubjectTypeUser, SubjectID: harness.emergencyAdminID, Role: identity.RoleAuditor, ScopeType: ScopeTypePlatform, Effect: BindingEffectAllow,
+	}, harness.proof(), harness.request)
+	if !errors.Is(err, ErrIAMConfiguration) {
+		t.Fatalf("CreateRoleBinding() error = %v", err)
 	}
 }
 
@@ -202,8 +213,11 @@ func TestIdentitySourceDraftVerifyAndPreviewDoNotExposeSecretReference(t *testin
 	if err != nil {
 		t.Fatalf("CreateIdentitySource() error = %v", err)
 	}
-	if source.SecretReference != "secret://iam/corporate-scim" || source.Status != IdentitySourceStatusDraft || source.ID == uuid.Nil {
+	if source.SecretReference != "" || source.Status != IdentitySourceStatusDraft || source.ID == uuid.Nil {
 		t.Fatalf("source = %+v", source)
+	}
+	if harness.repository.sources[source.ID].SecretReference != "secret://iam/corporate-scim" {
+		t.Fatal("identity source secret reference was not persisted internally")
 	}
 	if _, err := harness.service.VerifyIdentitySource(context.Background(), harness.admin, source.ID, harness.request); err != nil {
 		t.Fatalf("VerifyIdentitySource() error = %v", err)
@@ -252,7 +266,7 @@ func newIAMHarness(t *testing.T) *iamHarness {
 	}
 	auditor := &iamAuditRecorder{}
 	service, err := NewService(ServiceConfig{
-		Repository: repository, Auditor: auditor, Sessions: iamSessionRecorder{}, Passwords: deterministicPasswordManager{}, Directory: iamDirectoryAdapter{},
+		Repository: repository, Auditor: auditor, Sessions: iamSessionRecorder{}, Passwords: deterministicPasswordManager{}, Directory: iamDirectoryAdapter{}, HighRisk: iamHighRiskAuthorizer{},
 		Clock: func() time.Time { return now },
 	})
 	if err != nil {
@@ -267,8 +281,8 @@ func newIAMHarness(t *testing.T) *iamHarness {
 	}
 }
 
-func (harness *iamHarness) confirmation() HighRiskConfirmation {
-	return HighRiskConfirmation{Confirmed: true, ReauthenticatedAt: harness.now.Add(-time.Minute)}
+func (harness *iamHarness) proof() HighRiskProof {
+	return HighRiskProof{Confirmed: true, ChallengeID: "server-challenge", Evidence: "server-evidence"}
 }
 
 type memoryIAMRepository struct {
@@ -455,6 +469,15 @@ func (recorder *iamAuditRecorder) Append(_ context.Context, _ pgx.Tx, command au
 type iamSessionRecorder struct{}
 
 func (iamSessionRecorder) RevokeSubject(context.Context, uuid.UUID, string) error { return nil }
+
+type iamHighRiskAuthorizer struct{}
+
+func (iamHighRiskAuthorizer) Authorize(_ context.Context, _ identity.Principal, _ string, proof HighRiskProof) error {
+	if proof.ChallengeID != "server-challenge" || proof.Evidence != "server-evidence" {
+		return ErrHighRiskConfirmationRequired
+	}
+	return nil
+}
 
 type iamDirectoryAdapter struct{}
 

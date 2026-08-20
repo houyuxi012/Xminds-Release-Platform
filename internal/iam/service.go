@@ -32,6 +32,7 @@ type ServiceConfig struct {
 	Sessions   SessionRevoker
 	Passwords  PasswordService
 	Directory  DirectoryAdapter
+	HighRisk   HighRiskAuthorizer
 	Clock      func() time.Time
 }
 
@@ -41,6 +42,7 @@ type Service struct {
 	sessions   SessionRevoker
 	passwords  PasswordService
 	directory  DirectoryAdapter
+	highRisk   HighRiskAuthorizer
 	authorizer *identity.Authorizer
 	clock      func() time.Time
 }
@@ -91,8 +93,8 @@ func (service *Service) ListOrganizations(ctx context.Context, actor identity.Pr
 	return service.repository.ListOrganizations(ctx, page)
 }
 
-func (service *Service) CreateRoleBinding(ctx context.Context, actor identity.Principal, command CreateRoleBindingCommand, request RequestContext) (RoleBinding, error) {
-	if err := service.authorizer.Require(actor, identity.ActionIdentityManage, ""); err != nil {
+func (service *Service) CreateRoleBinding(ctx context.Context, actor identity.Principal, command CreateRoleBindingCommand, proof HighRiskProof, request RequestContext) (RoleBinding, error) {
+	if err := service.requireHighRisk(ctx, actor, "identity.role_binding.create", proof); err != nil {
 		return RoleBinding{}, err
 	}
 	if err := validateRoleBindingCommand(command); err != nil {
@@ -145,8 +147,8 @@ func (service *Service) ListRoleBindings(ctx context.Context, actor identity.Pri
 	return service.repository.ListRoleBindings(ctx, page)
 }
 
-func (service *Service) DeleteRoleBinding(ctx context.Context, actor identity.Principal, bindingID uuid.UUID, expectedVersion int64, request RequestContext) error {
-	if err := service.authorizer.Require(actor, identity.ActionIdentityManage, ""); err != nil {
+func (service *Service) DeleteRoleBinding(ctx context.Context, actor identity.Principal, bindingID uuid.UUID, expectedVersion int64, proof HighRiskProof, request RequestContext) error {
+	if err := service.requireHighRisk(ctx, actor, "identity.role_binding.delete", proof); err != nil {
 		return err
 	}
 	if bindingID == uuid.Nil || expectedVersion < 1 {
@@ -192,7 +194,7 @@ func (service *Service) CreateIdentitySource(ctx context.Context, actor identity
 	if err != nil {
 		return IdentitySource{}, err
 	}
-	return source, nil
+	return redactIdentitySource(source), nil
 }
 
 func (service *Service) ListIdentitySources(ctx context.Context, actor identity.Principal, page Page) (IdentitySourcePage, error) {
@@ -202,7 +204,14 @@ func (service *Service) ListIdentitySources(ctx context.Context, actor identity.
 	if !validIAMPage(page) {
 		return IdentitySourcePage{}, ErrPageInvalid
 	}
-	return service.repository.ListIdentitySources(ctx, page)
+	result, err := service.repository.ListIdentitySources(ctx, page)
+	if err != nil {
+		return IdentitySourcePage{}, err
+	}
+	for index := range result.Items {
+		result.Items[index] = redactIdentitySource(result.Items[index])
+	}
+	return result, nil
 }
 
 func (service *Service) PatchIdentitySourceDraft(ctx context.Context, actor identity.Principal, sourceID uuid.UUID, command PatchIdentitySourceCommand, request RequestContext) (IdentitySource, error) {
@@ -252,7 +261,7 @@ func (service *Service) PatchIdentitySourceDraft(ctx context.Context, actor iden
 	if err != nil {
 		return IdentitySource{}, err
 	}
-	return patched, nil
+	return redactIdentitySource(patched), nil
 }
 
 func (service *Service) VerifyIdentitySource(ctx context.Context, actor identity.Principal, sourceID uuid.UUID, request RequestContext) (CapabilityReport, error) {
@@ -420,7 +429,7 @@ func NewService(config ServiceConfig) (*Service, error) {
 		return nil, ErrIAMConfiguration
 	}
 	return &Service{
-		repository: config.Repository, auditor: config.Auditor, sessions: config.Sessions, directory: config.Directory,
+		repository: config.Repository, auditor: config.Auditor, sessions: config.Sessions, directory: config.Directory, highRisk: config.HighRisk,
 		passwords: config.Passwords, authorizer: identity.NewAuthorizer(), clock: config.Clock,
 	}, nil
 }
@@ -459,8 +468,8 @@ func validateRoleBindingCommand(command CreateRoleBindingCommand) error {
 	return nil
 }
 
-func (service *Service) EnableSSO(ctx context.Context, actor identity.Principal, sourceID uuid.UUID, confirmation HighRiskConfirmation, request RequestContext) error {
-	if err := service.requireHighRisk(actor, confirmation); err != nil {
+func (service *Service) EnableSSO(ctx context.Context, actor identity.Principal, sourceID uuid.UUID, proof HighRiskProof, request RequestContext) error {
+	if err := service.requireHighRisk(ctx, actor, "identity.sso.enable", proof); err != nil {
 		return err
 	}
 	if sourceID == uuid.Nil {
@@ -560,8 +569,8 @@ func (service *Service) MarkIdentitySourceFault(ctx context.Context, actor ident
 	})
 }
 
-func (service *Service) DisableSSO(ctx context.Context, actor identity.Principal, confirmation HighRiskConfirmation, request RequestContext) error {
-	if err := service.requireHighRisk(actor, confirmation); err != nil {
+func (service *Service) DisableSSO(ctx context.Context, actor identity.Principal, proof HighRiskProof, request RequestContext) error {
+	if err := service.requireHighRisk(ctx, actor, "identity.sso.disable", proof); err != nil {
 		return err
 	}
 	now := service.clock().UTC().Truncate(time.Microsecond)
@@ -605,11 +614,11 @@ func (service *Service) DisableSSO(ctx context.Context, actor identity.Principal
 	})
 }
 
-func (service *Service) DisableUser(ctx context.Context, actor identity.Principal, userID uuid.UUID, reason string, confirmation HighRiskConfirmation, request RequestContext) error {
+func (service *Service) DisableUser(ctx context.Context, actor identity.Principal, userID uuid.UUID, reason string, proof HighRiskProof, request RequestContext) error {
 	if service.sessions == nil {
 		return ErrIAMConfiguration
 	}
-	if err := service.requireHighRisk(actor, confirmation); err != nil {
+	if err := service.requireHighRisk(ctx, actor, "identity.user.disable", proof); err != nil {
 		return err
 	}
 	reason = strings.TrimSpace(reason)
@@ -680,16 +689,17 @@ func (service *Service) AuthenticateLocal(ctx context.Context, username, passwor
 	return user, nil
 }
 
-func (service *Service) requireHighRisk(actor identity.Principal, confirmation HighRiskConfirmation) error {
-	if service == nil || service.authorizer == nil || service.clock == nil {
+func (service *Service) requireHighRisk(ctx context.Context, actor identity.Principal, operation string, proof HighRiskProof) error {
+	if service == nil || service.authorizer == nil || service.highRisk == nil {
 		return ErrIAMConfiguration
 	}
 	if err := service.authorizer.Require(actor, identity.ActionIdentityManage, ""); err != nil {
 		return err
 	}
-	now := service.clock().UTC()
-	reauthenticatedAt := confirmation.ReauthenticatedAt.UTC()
-	if !confirmation.Confirmed || reauthenticatedAt.IsZero() || reauthenticatedAt.After(now) || now.Sub(reauthenticatedAt) > maximumReauthenticationAge {
+	if !proof.Confirmed {
+		return ErrHighRiskConfirmationRequired
+	}
+	if err := service.highRisk.Authorize(ctx, actor, operation, proof); err != nil {
 		return ErrHighRiskConfirmationRequired
 	}
 	return nil
@@ -697,4 +707,9 @@ func (service *Service) requireHighRisk(actor identity.Principal, confirmation H
 
 func canonicalUsername(username string) string {
 	return strings.ToLower(strings.TrimSpace(username))
+}
+
+func redactIdentitySource(source IdentitySource) IdentitySource {
+	source.SecretReference = ""
+	return source
 }

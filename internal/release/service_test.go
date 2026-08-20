@@ -99,6 +99,21 @@ func TestCreateRejectsInvalidImmutableReleaseInputs(t *testing.T) {
 	}
 }
 
+func TestGovernedExplicitDenyBlocksProtectedReleaseCreate(t *testing.T) {
+	t.Parallel()
+
+	principal := releasePrincipal("governed-publisher", identity.RolePublisher)
+	principal.Governed = true
+	principal.RoleScopes = []identity.RoleScope{
+		{Role: identity.RolePublisher, Effect: "allow", ScopeType: "product", ProductID: "ngep"},
+		{Role: identity.RolePublisher, Effect: "deny", ScopeType: "platform"},
+	}
+	_, err := newTestReleaseService().Create(context.Background(), principal, validCreateCommand(), testRequestContext())
+	if !errors.Is(err, identity.ErrActionDenied) {
+		t.Fatalf("Create() error = %v, want governed explicit deny", err)
+	}
+}
+
 func TestCreateRejectsArtifactFromAnotherProductWithoutLeakingItsExistence(t *testing.T) {
 	t.Parallel()
 

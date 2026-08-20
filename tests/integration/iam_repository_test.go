@@ -65,16 +65,14 @@ INSERT INTO user_principals (
 		t.Fatal(err)
 	}
 	service, err := iam.NewService(iam.ServiceConfig{
-		Repository: repository, Auditor: auditor, Sessions: integrationSessionRevoker{}, Passwords: passwords,
+		Repository: repository, Auditor: auditor, Sessions: integrationSessionRevoker{}, Passwords: passwords, HighRisk: integrationHighRiskAuthorizer{},
 		Clock: func() time.Time { return now },
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	actor := identity.Principal{Subject: "admin", Kind: identity.PrincipalKindHuman, Roles: []identity.Role{identity.RoleAdmin}, TokenID: "admin-token"}
-	err = service.EnableSSO(ctx, actor, sourceID, iam.HighRiskConfirmation{
-		Confirmed: true, ReauthenticatedAt: now.Add(-time.Minute),
-	}, iam.RequestContext{RequestID: uuid.New().String(), SourceIP: "127.0.0.1"})
+	err = service.EnableSSO(ctx, actor, sourceID, iam.HighRiskProof{Confirmed: true, ChallengeID: "test", Evidence: "test"}, iam.RequestContext{RequestID: uuid.New().String(), SourceIP: "127.0.0.1"})
 	if err != nil {
 		t.Fatalf("EnableSSO() error = %v", err)
 	}
@@ -130,7 +128,7 @@ VALUES (TRUE, 'local', 1, 'test:bootstrap', clock_timestamp())
 	}
 	repository := iam.NewPostgresRepository(pool)
 	service, err := iam.NewService(iam.ServiceConfig{
-		Repository: repository, Auditor: audit.NewService(audit.NewPostgresRepository(pool)), Passwords: passwords,
+		Repository: repository, Auditor: audit.NewService(audit.NewPostgresRepository(pool)), Passwords: passwords, HighRisk: integrationHighRiskAuthorizer{},
 		Clock: func() time.Time { return now },
 	})
 	if err != nil {
@@ -201,7 +199,7 @@ VALUES ($1, 'audit.reader', '审计阅读者', 'local', 'active', 1, $2, $2)`, u
 		t.Fatal(err)
 	}
 	service, err := iam.NewService(iam.ServiceConfig{
-		Repository: repository, Auditor: audit.NewService(audit.NewPostgresRepository(pool)), Passwords: passwords,
+		Repository: repository, Auditor: audit.NewService(audit.NewPostgresRepository(pool)), Passwords: passwords, HighRisk: integrationHighRiskAuthorizer{},
 		Clock: func() time.Time { return now },
 	})
 	if err != nil {
@@ -215,7 +213,7 @@ VALUES ($1, 'audit.reader', '审计阅读者', 'local', 'active', 1, $2, $2)`, u
 	}
 	if _, err := service.CreateRoleBinding(ctx, actor, iam.CreateRoleBindingCommand{
 		SubjectType: iam.SubjectTypeUser, SubjectID: userID, Role: identity.RoleAuditor, ScopeType: iam.ScopeTypePlatform, Effect: iam.BindingEffectAllow,
-	}, request); err != nil {
+	}, iam.HighRiskProof{Confirmed: true, ChallengeID: "test", Evidence: "test"}, request); err != nil {
 		t.Fatalf("CreateRoleBinding() error = %v", err)
 	}
 	source, err := service.CreateIdentitySource(ctx, actor, iam.CreateIdentitySourceCommand{Name: "Corporate OIDC", Kind: iam.IdentitySourceOIDC, SecretReference: "secret://iam/corporate-oidc"}, request)
@@ -258,3 +256,9 @@ func (integrationBreachChecker) IsBreached(context.Context, string) (bool, error
 type integrationSessionRevoker struct{}
 
 func (integrationSessionRevoker) RevokeSubject(context.Context, uuid.UUID, string) error { return nil }
+
+type integrationHighRiskAuthorizer struct{}
+
+func (integrationHighRiskAuthorizer) Authorize(context.Context, identity.Principal, string, iam.HighRiskProof) error {
+	return nil
+}

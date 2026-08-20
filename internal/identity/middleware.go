@@ -17,9 +17,13 @@ type Verifier interface {
 	Verify(ctx context.Context, rawToken string) (Principal, error)
 }
 
+type PrincipalResolver interface {
+	ResolvePrincipal(ctx context.Context, principal Principal) (Principal, error)
+}
+
 type principalContextKey struct{}
 
-func AuthenticationMiddleware(verifier Verifier) func(http.Handler) http.Handler {
+func AuthenticationMiddleware(verifier Verifier, resolvers ...PrincipalResolver) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 			rawToken, ok := bearerToken(request)
@@ -39,6 +43,13 @@ func AuthenticationMiddleware(verifier Verifier) func(http.Handler) http.Handler
 			if err := principal.Validate(); err != nil {
 				writeAuthenticationProblem(writer, request, "AUTHENTICATION_FAILED", "Authentication failed", err)
 				return
+			}
+			if len(resolvers) > 0 && resolvers[0] != nil {
+				principal, err = resolvers[0].ResolvePrincipal(request.Context(), principal)
+				if err != nil || principal.Validate() != nil {
+					writeAuthenticationProblem(writer, request, "AUTHENTICATION_FAILED", "Authentication failed", err)
+					return
+				}
 			}
 			ctx := context.WithValue(request.Context(), principalContextKey{}, principal)
 			next.ServeHTTP(writer, request.WithContext(ctx))
