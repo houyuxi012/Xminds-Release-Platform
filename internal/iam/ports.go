@@ -81,9 +81,11 @@ type DirectoryAdapter interface {
 }
 
 type CapabilityReport struct {
-	Reachable           bool
-	RequiredAttributes  []string
-	SupportsIncremental bool
+	Reachable                bool     `json:"reachable"`
+	RequiredAttributes       []string `json:"required_mappings"`
+	RequiredMappingsComplete bool     `json:"required_mappings_complete"`
+	SupportsIncremental      bool     `json:"supports_incremental"`
+	SupportsPagination       bool     `json:"supports_pagination"`
 }
 
 type SyncDiff struct {
@@ -94,13 +96,34 @@ type SyncDiff struct {
 }
 
 type SyncPage struct {
-	Users      []DirectoryUser
-	NextCursor string
+	Users               []DirectoryUser
+	Organizations       []DirectoryOrganization
+	Memberships         []DirectoryMembership
+	OrganizationParents []DirectoryOrganizationParent
+	NextCursor          string
+	Complete            bool
 }
 
 type DirectoryUser struct {
 	ExternalSubject string
+	Username        string
 	DisplayName     string
 	Email           string
 	Enabled         bool
+}
+
+type DirectoryOrganization struct {
+	ExternalID       string
+	Name             string
+	ParentExternalID string
+}
+
+type DirectoryMembership struct {
+	OrganizationExternalID string
+	UserExternalSubject    string
+}
+
+type DirectoryOrganizationParent struct {
+	OrganizationExternalID string
+	ParentExternalID       string
 }

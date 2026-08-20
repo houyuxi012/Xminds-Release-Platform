@@ -1,0 +1,182 @@
+package iam
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+
+	"xminds-release-platform/internal/audit"
+	"xminds-release-platform/internal/identity"
+	"xminds-release-platform/internal/platform/jobs"
+)
+
+func TestDirectorySyncServiceCreatesPreviewJobOutboxAndAuditAtomically(t *testing.T) {
+	now := time.Date(2026, 8, 21, 10, 0, 0, 0, time.UTC)
+	source := IdentitySource{
+		ID: uuid.New(), Kind: IdentitySourceSCIM, Status: IdentitySourceStatusVerified,
+		SecretReference: "secret://iam/scim", VerifiedAt: now.Add(-time.Hour), Version: 7,
+	}
+	store := &directorySyncStoreFake{source: source}
+	queue := &directorySyncJobQueueFake{}
+	auditor := &directorySyncAuditFake{}
+	service, err := NewDirectorySyncService(DirectorySyncServiceConfig{
+		Store: store, Jobs: queue, Auditor: auditor, Clock: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("NewDirectorySyncService() error = %v", err)
+	}
+	created, err := service.Start(context.Background(), directorySyncAdmin(), source.ID, DirectorySyncModePreview, 7, RequestContext{
+		RequestID: uuid.NewString(), SourceIP: "192.0.2.15",
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if created.ID == uuid.Nil || created.RunMarker != uuid.Nil || created.IdentitySourceID != source.ID || created.SourceVersion != 7 || created.Mode != DirectorySyncModePreview || created.Status != DirectorySyncStatusPending {
+		t.Fatalf("Start() job = %#v", created)
+	}
+	if store.inserted.ID != created.ID || store.inserted.RunMarker == uuid.Nil || len(queue.jobs) != 1 || len(auditor.commands) != 1 || !store.committed {
+		t.Fatalf("atomic effects inserted=%#v jobs=%d audits=%d committed=%v", store.inserted, len(queue.jobs), len(auditor.commands), store.committed)
+	}
+	if queue.jobs[0].Kind != JobKindDirectorySync || queue.jobs[0].AggregateID != created.ID {
+		t.Fatalf("outbox job = %#v", queue.jobs[0])
+	}
+	if strings.Contains(string(queue.jobs[0].Payload), source.SecretReference) || strings.Contains(string(queue.jobs[0].Payload), "cursor") {
+		t.Fatalf("outbox payload leaked secret/cursor: %s", queue.jobs[0].Payload)
+	}
+	var payload DirectorySyncJobPayload
+	if err := json.Unmarshal(queue.jobs[0].Payload, &payload); err != nil || payload.JobID != created.ID || payload.SourceID != source.ID || payload.Mode != DirectorySyncModePreview {
+		t.Fatalf("outbox payload = %#v, error = %v", payload, err)
+	}
+	if auditor.commands[0].Action != "identity.directory_sync.preview.request" {
+		t.Fatalf("audit action = %q", auditor.commands[0].Action)
+	}
+}
+
+func TestDirectorySyncServiceRejectsOIDCApplyAndStaleSourceVersionBeforeEnqueue(t *testing.T) {
+	tests := []struct {
+		name            string
+		source          IdentitySource
+		expectedVersion int64
+		want            error
+	}{
+		{
+			name: "oidc apply", source: IdentitySource{ID: uuid.New(), Kind: IdentitySourceOIDC, Status: IdentitySourceStatusVerified, VerifiedAt: time.Now(), Version: 3},
+			expectedVersion: 3, want: ErrDirectoryApplyUnsupported,
+		},
+		{
+			name: "stale source", source: IdentitySource{ID: uuid.New(), Kind: IdentitySourceSCIM, Status: IdentitySourceStatusVerified, VerifiedAt: time.Now(), Version: 4},
+			expectedVersion: 3, want: ErrIAMConflict,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &directorySyncStoreFake{source: test.source}
+			queue := &directorySyncJobQueueFake{}
+			service, err := NewDirectorySyncService(DirectorySyncServiceConfig{Store: store, Jobs: queue, Auditor: &directorySyncAuditFake{}, Clock: time.Now})
+			if err != nil {
+				t.Fatalf("NewDirectorySyncService() error = %v", err)
+			}
+			_, err = service.Start(context.Background(), directorySyncAdmin(), test.source.ID, DirectorySyncModeApply, test.expectedVersion, RequestContext{RequestID: uuid.NewString()})
+			if !errors.Is(err, test.want) {
+				t.Fatalf("Start() error = %v, want %v", err, test.want)
+			}
+			if len(queue.jobs) != 0 || store.inserted.ID != uuid.Nil || store.committed {
+				t.Fatalf("rejected start produced effects: %#v %#v", store.inserted, queue.jobs)
+			}
+		})
+	}
+}
+
+func TestDirectorySyncServiceRollsBackWhenAuditFails(t *testing.T) {
+	source := IdentitySource{ID: uuid.New(), Kind: IdentitySourceSCIM, Status: IdentitySourceStatusVerified, VerifiedAt: time.Now(), Version: 2}
+	store := &directorySyncStoreFake{source: source}
+	queue := &directorySyncJobQueueFake{}
+	auditor := &directorySyncAuditFake{err: errors.New("audit unavailable")}
+	service, err := NewDirectorySyncService(DirectorySyncServiceConfig{Store: store, Jobs: queue, Auditor: auditor, Clock: time.Now})
+	if err != nil {
+		t.Fatalf("NewDirectorySyncService() error = %v", err)
+	}
+	_, err = service.Start(context.Background(), directorySyncAdmin(), source.ID, DirectorySyncModePreview, 2, RequestContext{RequestID: uuid.NewString()})
+	if err == nil || store.committed {
+		t.Fatalf("Start() error = %v, committed = %v", err, store.committed)
+	}
+}
+
+func TestDirectorySyncServiceConflictListHidesUnknownSource(t *testing.T) {
+	source := IdentitySource{ID: uuid.New(), Kind: IdentitySourceSCIM, Status: IdentitySourceStatusVerified, VerifiedAt: time.Now(), Version: 2}
+	service, err := NewDirectorySyncService(DirectorySyncServiceConfig{
+		Store: &directorySyncStoreFake{source: source}, Jobs: &directorySyncJobQueueFake{}, Auditor: &directorySyncAuditFake{}, Clock: time.Now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = service.ListConflicts(context.Background(), directorySyncAdmin(), uuid.New(), Page{Limit: 50})
+	if !errors.Is(err, ErrIdentitySourceNotFound) {
+		t.Fatalf("ListConflicts(unknown source) error = %v", err)
+	}
+}
+
+type directorySyncStoreFake struct {
+	source    IdentitySource
+	inserted  DirectorySyncJob
+	committed bool
+}
+
+func (store *directorySyncStoreFake) WithinTransaction(ctx context.Context, function func(pgx.Tx) error) error {
+	if err := function(nil); err != nil {
+		store.inserted = DirectorySyncJob{}
+		return err
+	}
+	store.committed = true
+	return nil
+}
+
+func (store *directorySyncStoreFake) GetIdentitySource(_ context.Context, _ pgx.Tx, id uuid.UUID) (IdentitySource, error) {
+	if id != store.source.ID {
+		return IdentitySource{}, ErrIdentitySourceNotFound
+	}
+	return store.source, nil
+}
+
+func (store *directorySyncStoreFake) InsertDirectorySyncJob(_ context.Context, _ pgx.Tx, job DirectorySyncJob) error {
+	store.inserted = job
+	return nil
+}
+
+func (store *directorySyncStoreFake) GetDirectorySyncJob(context.Context, uuid.UUID, uuid.UUID) (DirectorySyncJob, error) {
+	return DirectorySyncJob{}, errors.New("unexpected GetDirectorySyncJob call")
+}
+
+func (store *directorySyncStoreFake) ListDirectorySyncConflicts(context.Context, uuid.UUID, Page) (DirectorySyncConflictPage, error) {
+	return DirectorySyncConflictPage{}, errors.New("unexpected ListDirectorySyncConflicts call")
+}
+
+type directorySyncJobQueueFake struct{ jobs []jobs.Job }
+
+func (queue *directorySyncJobQueueFake) Enqueue(_ context.Context, _ pgx.Tx, job jobs.Job) error {
+	queue.jobs = append(queue.jobs, job)
+	return nil
+}
+
+type directorySyncAuditFake struct {
+	commands []audit.AppendCommand
+	err      error
+}
+
+func (recorder *directorySyncAuditFake) Append(_ context.Context, _ pgx.Tx, command audit.AppendCommand) (audit.Event, error) {
+	if recorder.err != nil {
+		return audit.Event{}, recorder.err
+	}
+	recorder.commands = append(recorder.commands, command)
+	return audit.Event{}, nil
+}
+
+func directorySyncAdmin() identity.Principal {
+	return identity.Principal{Subject: "user:directory-admin", Kind: identity.PrincipalKindHuman, Roles: []identity.Role{identity.RoleAdmin}}
+}

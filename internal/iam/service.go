@@ -27,28 +27,30 @@ var identityFaultCodePattern = regexp.MustCompile(`^[A-Z][A-Z0-9_]{2,63}$`)
 var localUsernamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{2,127}$`)
 
 type ServiceConfig struct {
-	Repository   Repository
-	ScopeCatalog ScopeCatalogValidator
-	BreakGlass   BreakGlassInvariant
-	Auditor      AuditAppender
-	Sessions     SessionRevoker
-	Passwords    PasswordService
-	Directory    DirectoryAdapter
-	HighRisk     HighRiskAuthorizer
-	Clock        func() time.Time
+	Repository    Repository
+	ScopeCatalog  ScopeCatalogValidator
+	BreakGlass    BreakGlassInvariant
+	Auditor       AuditAppender
+	Sessions      SessionRevoker
+	Passwords     PasswordService
+	Directory     DirectoryAdapter
+	DirectorySync *DirectorySyncService
+	HighRisk      HighRiskAuthorizer
+	Clock         func() time.Time
 }
 
 type Service struct {
-	repository   Repository
-	scopeCatalog ScopeCatalogValidator
-	breakGlass   BreakGlassInvariant
-	auditor      AuditAppender
-	sessions     SessionRevoker
-	passwords    PasswordService
-	directory    DirectoryAdapter
-	highRisk     HighRiskAuthorizer
-	authorizer   *identity.Authorizer
-	clock        func() time.Time
+	repository    Repository
+	scopeCatalog  ScopeCatalogValidator
+	breakGlass    BreakGlassInvariant
+	auditor       AuditAppender
+	sessions      SessionRevoker
+	passwords     PasswordService
+	directory     DirectoryAdapter
+	directorySync *DirectorySyncService
+	highRisk      HighRiskAuthorizer
+	authorizer    *identity.Authorizer
+	clock         func() time.Time
 }
 
 func (service *Service) CreateOrganization(ctx context.Context, actor identity.Principal, command CreateOrganizationCommand, request RequestContext) (OrganizationUnit, error) {
@@ -352,6 +354,10 @@ func (service *Service) PatchIdentitySourceDraft(ctx context.Context, actor iden
 }
 
 func (service *Service) VerifyIdentitySource(ctx context.Context, actor identity.Principal, sourceID uuid.UUID, request RequestContext) (CapabilityReport, error) {
+	return service.VerifyIdentitySourceVersioned(ctx, actor, sourceID, 0, request)
+}
+
+func (service *Service) VerifyIdentitySourceVersioned(ctx context.Context, actor identity.Principal, sourceID uuid.UUID, expectedVersion int64, request RequestContext) (CapabilityReport, error) {
 	if err := service.authorizer.Require(actor, identity.ActionIdentityManage, ""); err != nil {
 		return CapabilityReport{}, err
 	}
@@ -364,6 +370,9 @@ func (service *Service) VerifyIdentitySource(ctx context.Context, actor identity
 	}
 	if source.Status != IdentitySourceStatusDraft && source.Status != IdentitySourceStatusVerified {
 		return CapabilityReport{}, ErrIdentitySourceInputInvalid
+	}
+	if expectedVersion > 0 && source.Version != expectedVersion {
+		return CapabilityReport{}, ErrIAMConflict
 	}
 	report, err := service.directory.Verify(ctx, source)
 	if err != nil {
@@ -389,6 +398,27 @@ func (service *Service) VerifyIdentitySource(ctx context.Context, actor identity
 		return err
 	})
 	return report, err
+}
+
+func (service *Service) StartDirectorySync(ctx context.Context, actor identity.Principal, sourceID uuid.UUID, mode DirectorySyncMode, expectedVersion int64, request RequestContext) (DirectorySyncJob, error) {
+	if service == nil || service.directorySync == nil {
+		return DirectorySyncJob{}, ErrDirectorySyncConfiguration
+	}
+	return service.directorySync.Start(ctx, actor, sourceID, mode, expectedVersion, request)
+}
+
+func (service *Service) GetDirectorySyncJob(ctx context.Context, actor identity.Principal, sourceID, jobID uuid.UUID) (DirectorySyncJob, error) {
+	if service == nil || service.directorySync == nil {
+		return DirectorySyncJob{}, ErrDirectorySyncConfiguration
+	}
+	return service.directorySync.GetJob(ctx, actor, sourceID, jobID)
+}
+
+func (service *Service) ListDirectorySyncConflicts(ctx context.Context, actor identity.Principal, sourceID uuid.UUID, page Page) (DirectorySyncConflictPage, error) {
+	if service == nil || service.directorySync == nil {
+		return DirectorySyncConflictPage{}, ErrDirectorySyncConfiguration
+	}
+	return service.directorySync.ListConflicts(ctx, actor, sourceID, page)
 }
 
 func (service *Service) PreviewIdentitySource(ctx context.Context, actor identity.Principal, sourceID uuid.UUID, request RequestContext) (SyncDiff, error) {
@@ -516,7 +546,7 @@ func NewService(config ServiceConfig) (*Service, error) {
 		return nil, ErrIAMConfiguration
 	}
 	return &Service{
-		repository: config.Repository, scopeCatalog: config.ScopeCatalog, breakGlass: config.BreakGlass, auditor: config.Auditor, sessions: config.Sessions, directory: config.Directory, highRisk: config.HighRisk,
+		repository: config.Repository, scopeCatalog: config.ScopeCatalog, breakGlass: config.BreakGlass, auditor: config.Auditor, sessions: config.Sessions, directory: config.Directory, directorySync: config.DirectorySync, highRisk: config.HighRisk,
 		passwords: config.Passwords, authorizer: identity.NewAuthorizer(), clock: config.Clock,
 	}, nil
 }
