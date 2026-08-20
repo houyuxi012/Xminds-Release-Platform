@@ -241,6 +241,11 @@ func TestOpenAPIDefinesPublicLocalAuthenticationWithoutSensitiveResponseFields(t
 		if item.Post.Security == nil || len(*item.Post.Security) != 0 {
 			t.Fatalf("POST %s must explicitly disable Bearer security", path)
 		}
+		if path != "/api/v1/auth/local/activate" {
+			if response := item.Post.Responses.Value("400"); response == nil {
+				t.Fatalf("POST %s must document malformed JSON as 400", path)
+			}
+		}
 	}
 	login := document.Components.Schemas["LocalLoginResponse"]
 	if login == nil || login.Value == nil {

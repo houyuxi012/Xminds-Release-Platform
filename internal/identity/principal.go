@@ -33,19 +33,21 @@ const (
 )
 
 var (
-	ErrPrincipalSubjectRequired = errors.New("principal subject is required")
-	ErrPrincipalKindInvalid     = errors.New("principal kind is invalid")
+	ErrPrincipalSubjectRequired  = errors.New("principal subject is required")
+	ErrPrincipalKindInvalid      = errors.New("principal kind is invalid")
+	ErrPrincipalAssuranceInvalid = errors.New("principal authentication assurance is invalid")
 )
 
 type Principal struct {
-	Subject    string
-	Kind       PrincipalKind
-	Roles      []Role
-	ProductIDs []string
-	TokenID    string
-	Provider   WorkloadProvider
-	Governed   bool
-	RoleScopes []RoleScope
+	Subject                 string
+	Kind                    PrincipalKind
+	Roles                   []Role
+	ProductIDs              []string
+	TokenID                 string
+	Provider                WorkloadProvider
+	Governed                bool
+	RoleScopes              []RoleScope
+	AuthenticationAssurance int
 }
 
 type RoleScope struct {
@@ -59,6 +61,9 @@ type RoleScope struct {
 func (principal Principal) Validate() error {
 	if strings.TrimSpace(principal.Subject) == "" {
 		return ErrPrincipalSubjectRequired
+	}
+	if principal.AuthenticationAssurance < 0 || principal.AuthenticationAssurance > 3 {
+		return ErrPrincipalAssuranceInvalid
 	}
 	switch principal.Kind {
 	case PrincipalKindHuman, PrincipalKindWorkload, PrincipalKindLocal:

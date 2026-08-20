@@ -19,7 +19,10 @@ import (
 	"xminds-release-platform/internal/identity"
 )
 
-const passwordHistoryDepth = 5
+const (
+	passwordHistoryDepth      = 5
+	rateLimitCleanupBatchSize = 128
+)
 
 type LocalAuthPolicy struct {
 	AccountWindow     time.Duration
@@ -30,6 +33,12 @@ type LocalAuthPolicy struct {
 	SessionIdle       time.Duration
 	EmergencyAbsolute time.Duration
 	EmergencyIdle     time.Duration
+	LockoutStages     []LockoutStage
+}
+
+type LockoutStage struct {
+	FailedAttempts int
+	Duration       time.Duration
 }
 
 func DefaultLocalAuthPolicy() LocalAuthPolicy {
@@ -38,14 +47,35 @@ func DefaultLocalAuthPolicy() LocalAuthPolicy {
 		IPWindow: 5 * time.Minute, IPLimit: 60,
 		SessionAbsolute: 12 * time.Hour, SessionIdle: 30 * time.Minute,
 		EmergencyAbsolute: 30 * time.Minute, EmergencyIdle: 10 * time.Minute,
+		LockoutStages: []LockoutStage{
+			{FailedAttempts: 5, Duration: 5 * time.Minute},
+			{FailedAttempts: 8, Duration: 30 * time.Minute},
+			{FailedAttempts: 10, Duration: 24 * time.Hour},
+		},
 	}
 }
 
 func validLocalAuthPolicy(policy LocalAuthPolicy) bool {
-	return policy.AccountWindow >= time.Minute && policy.AccountWindow <= time.Hour && policy.AccountLimit >= 5 && policy.AccountLimit <= 1000 &&
+	return validLockoutStages(policy.LockoutStages) &&
+		policy.AccountWindow >= time.Minute && policy.AccountWindow <= time.Hour && policy.AccountLimit >= 5 && policy.AccountLimit <= 1000 &&
 		policy.IPWindow >= time.Minute && policy.IPWindow <= time.Hour && policy.IPLimit >= 10 && policy.IPLimit <= 10000 &&
 		policy.SessionAbsolute >= time.Hour && policy.SessionAbsolute <= 24*time.Hour && policy.SessionIdle >= 5*time.Minute && policy.SessionIdle <= 2*time.Hour && policy.SessionIdle < policy.SessionAbsolute &&
 		policy.EmergencyAbsolute >= 15*time.Minute && policy.EmergencyAbsolute <= time.Hour && policy.EmergencyIdle >= 5*time.Minute && policy.EmergencyIdle <= 15*time.Minute && policy.EmergencyIdle < policy.EmergencyAbsolute
+}
+
+func validLockoutStages(stages []LockoutStage) bool {
+	if len(stages) < 1 || len(stages) > 5 {
+		return false
+	}
+	previousAttempts, previousDuration := 0, time.Duration(0)
+	for _, stage := range stages {
+		if stage.FailedAttempts < 3 || stage.FailedAttempts > 50 || stage.FailedAttempts <= previousAttempts ||
+			stage.Duration < time.Minute || stage.Duration > 24*time.Hour || stage.Duration <= previousDuration {
+			return false
+		}
+		previousAttempts, previousDuration = stage.FailedAttempts, stage.Duration
+	}
+	return true
 }
 
 type ActivationRepository interface {
@@ -57,27 +87,30 @@ type ActivationRepository interface {
 type LoginRepository interface {
 	FindLogin(ctx context.Context, tx pgx.Tx, canonicalUsername string) (LoginState, UserPrincipal, LocalCredential, bool, error)
 	ConsumeRateLimit(ctx context.Context, tx pgx.Tx, scope RateLimitScope, keyDigest string, windowStart time.Time, limit int, expiresAt time.Time) (bool, error)
+	CleanupExpiredRateLimits(ctx context.Context, tx pgx.Tx, before time.Time, limit int) (int64, error)
 	SaveAuthenticationFailure(ctx context.Context, tx pgx.Tx, userID uuid.UUID, failedAttempts int, lockedUntil time.Time) error
 	SaveAuthenticationSuccess(ctx context.Context, tx pgx.Tx, userID uuid.UUID, mfaCounter int64, session Session) error
 }
 
 type LocalAuthConfig struct {
-	Repository ActivationRepository
-	Auditor    AuditAppender
-	Passwords  PasswordService
-	MFA        MFAVerifier
-	Policy     LocalAuthPolicy
-	Clock      func() time.Time
+	Repository    ActivationRepository
+	Auditor       AuditAppender
+	Passwords     PasswordService
+	DummyPassword PasswordDigest
+	MFA           MFAVerifier
+	Policy        LocalAuthPolicy
+	Clock         func() time.Time
 }
 
 type LocalAuthService struct {
-	repository ActivationRepository
-	login      LoginRepository
-	auditor    AuditAppender
-	passwords  PasswordService
-	mfa        MFAVerifier
-	policy     LocalAuthPolicy
-	clock      func() time.Time
+	repository    ActivationRepository
+	login         LoginRepository
+	auditor       AuditAppender
+	passwords     PasswordService
+	dummyPassword PasswordDigest
+	mfa           MFAVerifier
+	policy        LocalAuthPolicy
+	clock         func() time.Time
 }
 
 func NewLocalAuthService(config LocalAuthConfig) (*LocalAuthService, error) {
@@ -85,10 +118,18 @@ func NewLocalAuthService(config LocalAuthConfig) (*LocalAuthService, error) {
 	if config.Repository == nil || !ok || config.Auditor == nil || config.Passwords == nil || config.MFA == nil || config.Clock == nil || !validLocalAuthPolicy(config.Policy) {
 		return nil, ErrIAMConfiguration
 	}
+	if _, _, _, _, err := parsePasswordDigest(config.DummyPassword); err != nil {
+		return nil, ErrIAMConfiguration
+	}
 	return &LocalAuthService{
 		repository: config.Repository, login: login, auditor: config.Auditor, passwords: config.Passwords,
-		mfa: config.MFA, policy: config.Policy, clock: config.Clock,
+		dummyPassword: config.DummyPassword, mfa: config.MFA, policy: cloneLocalAuthPolicy(config.Policy), clock: config.Clock,
 	}, nil
+}
+
+func cloneLocalAuthPolicy(policy LocalAuthPolicy) LocalAuthPolicy {
+	policy.LockoutStages = append([]LockoutStage(nil), policy.LockoutStages...)
+	return policy
 }
 
 func (service *LocalAuthService) LoginLocal(ctx context.Context, command LocalLoginCommand, request RequestContext) (LoginResult, error) {
@@ -102,24 +143,16 @@ func (service *LocalAuthService) LoginEmergency(ctx context.Context, command Loc
 func (service *LocalAuthService) loginWithMethod(ctx context.Context, command LocalLoginCommand, request RequestContext, method AuthenticationMethod) (LoginResult, error) {
 	username := canonicalUsername(command.Username)
 	now := service.clock().UTC().Truncate(time.Microsecond)
-	accountAllowed, err := service.consumeRateLimit(ctx, nil, RateLimitScopeAccount, username, service.policy.AccountWindow, service.policy.AccountLimit, now)
+	allowed, err := service.consumeAuthenticationAttempt(ctx, username, method, request, now)
 	if err != nil {
 		return LoginResult{}, err
 	}
-	ipAllowed := false
-	if address, parseErr := netip.ParseAddr(strings.TrimSpace(request.SourceIP)); parseErr == nil {
-		ipAllowed, err = service.consumeRateLimit(ctx, nil, RateLimitScopeIP, address.String(), service.policy.IPWindow, service.policy.IPLimit, now)
-		if err != nil {
-			return LoginResult{}, err
-		}
+	if !allowed {
+		return LoginResult{}, ErrLocalAuthenticationLimited
 	}
 	var result LoginResult
 	var outcome error
 	err = service.repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
-		if !accountAllowed || !ipAllowed {
-			outcome = ErrLocalAuthenticationLimited
-			return service.appendAuthenticationAudit(ctx, tx, UserPrincipal{}, "identity.local_user.login", audit.OutcomeDenied, "RATE_LIMITED", request)
-		}
 		state, user, credential, administrator, findErr := service.login.FindLogin(ctx, tx, username)
 		if findErr != nil && !errors.Is(findErr, ErrLocalAuthenticationFailed) {
 			return findErr
@@ -141,8 +174,14 @@ func (service *LocalAuthService) loginWithMethod(ctx context.Context, command Lo
 		if valid && credential.LockedUntil.After(now) {
 			valid, reasonCode = false, "CREDENTIAL_LOCKED"
 		}
-		if valid && service.passwords.Verify(command.Password, credential.Password) != nil {
-			valid, reasonCode = false, "CREDENTIAL_INVALID"
+		passwordDigest := service.dummyPassword
+		if valid {
+			passwordDigest = credential.Password
+		}
+		passwordErr := service.passwords.Verify(command.Password, passwordDigest)
+		credentialFailure := valid && passwordErr != nil
+		if credentialFailure {
+			valid, credentialFailure, reasonCode = false, true, "CREDENTIAL_INVALID"
 		}
 		mfaCounter := int64(0)
 		requiresMFA := user.Kind == UserKindEmergency || administrator
@@ -159,14 +198,14 @@ func (service *LocalAuthService) loginWithMethod(ctx context.Context, command Lo
 			}
 		}
 		if !valid {
-			if user.ID != uuid.Nil {
+			if credentialFailure {
 				attempts := credential.FailedAttempts + 1
-				if err := service.login.SaveAuthenticationFailure(ctx, tx, user.ID, attempts, lockUntilForAttempts(now, attempts)); err != nil {
+				if err := service.login.SaveAuthenticationFailure(ctx, tx, user.ID, attempts, lockUntilForAttempts(now, attempts, service.policy.LockoutStages)); err != nil {
 					return err
 				}
 			}
 			outcome = ErrLocalAuthenticationFailed
-			return service.appendAuthenticationAudit(ctx, tx, user, "identity.local_user.login", audit.OutcomeDenied, reasonCode, request)
+			return service.appendLoginAudit(ctx, tx, user, method, audit.OutcomeDenied, reasonCode, request)
 		}
 		token, digest, generationErr := generateSessionToken()
 		if generationErr != nil {
@@ -188,7 +227,7 @@ func (service *LocalAuthService) loginWithMethod(ctx context.Context, command Lo
 		if err := service.login.SaveAuthenticationSuccess(ctx, tx, user.ID, mfaCounter, session); err != nil {
 			return err
 		}
-		if err := service.appendAuthenticationAudit(ctx, tx, user, "identity.local_user.login", audit.OutcomeSuccess, "AUTHENTICATED", request); err != nil {
+		if err := service.appendLoginAudit(ctx, tx, user, method, audit.OutcomeSuccess, "AUTHENTICATED", request); err != nil {
 			return err
 		}
 		result = LoginResult{
@@ -206,6 +245,61 @@ func (service *LocalAuthService) loginWithMethod(ctx context.Context, command Lo
 	return result, nil
 }
 
+func (service *LocalAuthService) consumeAuthenticationAttempt(ctx context.Context, username string, method AuthenticationMethod, request RequestContext, now time.Time) (bool, error) {
+	address, parseErr := netip.ParseAddr(strings.TrimSpace(request.SourceIP))
+	allowed := false
+	err := service.repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
+		if _, err := service.login.CleanupExpiredRateLimits(ctx, tx, now, rateLimitCleanupBatchSize); err != nil {
+			return err
+		}
+		reasonCode := "SOURCE_IP_INVALID"
+		if parseErr == nil {
+			ipAllowed, err := service.consumeRateLimit(ctx, tx, RateLimitScopeIP, address.String(), service.policy.IPWindow, service.policy.IPLimit, now)
+			if err != nil {
+				return err
+			}
+			reasonCode = "IP_RATE_LIMITED"
+			if ipAllowed {
+				accountAllowed, err := service.consumeRateLimit(ctx, tx, RateLimitScopeAccount, username, service.policy.AccountWindow, service.policy.AccountLimit, now)
+				if err != nil {
+					return err
+				}
+				allowed = accountAllowed
+				if accountAllowed {
+					reasonCode = "RATE_LIMIT_ACCEPTED"
+				} else {
+					reasonCode = "ACCOUNT_RATE_LIMITED"
+				}
+			}
+		}
+		outcome := audit.OutcomeDenied
+		if allowed {
+			outcome = audit.OutcomeSuccess
+		}
+		return service.appendAuthenticationAttemptAudit(ctx, tx, method, outcome, reasonCode, request)
+	})
+	if err != nil {
+		return false, err
+	}
+	return allowed, nil
+}
+
+func (service *LocalAuthService) appendLoginAudit(ctx context.Context, tx pgx.Tx, user UserPrincipal, method AuthenticationMethod, outcome audit.Outcome, reasonCode string, request RequestContext) error {
+	action, entrypoint := "identity.local_user.login", "local"
+	if method == AuthenticationMethodEmergency {
+		action, entrypoint = "identity.emergency.login", "emergency"
+	}
+	return service.appendAuthenticationAuditWithMetadata(ctx, tx, user, action, outcome, reasonCode, request, map[string]any{"entrypoint": entrypoint})
+}
+
+func (service *LocalAuthService) appendAuthenticationAttemptAudit(ctx context.Context, tx pgx.Tx, method AuthenticationMethod, outcome audit.Outcome, reasonCode string, request RequestContext) error {
+	action, entrypoint := "identity.local_user.login.attempt", "local"
+	if method == AuthenticationMethodEmergency {
+		action, entrypoint = "identity.emergency.login.attempt", "emergency"
+	}
+	return service.appendAuthenticationAuditWithMetadata(ctx, tx, UserPrincipal{}, action, outcome, reasonCode, request, map[string]any{"entrypoint": entrypoint})
+}
+
 func (service *LocalAuthService) consumeRateLimit(ctx context.Context, tx pgx.Tx, scope RateLimitScope, value string, window time.Duration, limit int, now time.Time) (bool, error) {
 	digest := sha256.Sum256([]byte(string(scope) + "\x00" + value))
 	seconds := int64(window / time.Second)
@@ -213,17 +307,13 @@ func (service *LocalAuthService) consumeRateLimit(ctx context.Context, tx pgx.Tx
 	return service.login.ConsumeRateLimit(ctx, tx, scope, hex.EncodeToString(digest[:]), windowStart, limit, windowStart.Add(window))
 }
 
-func lockUntilForAttempts(now time.Time, attempts int) time.Time {
-	switch {
-	case attempts >= 10:
-		return now.Add(24 * time.Hour)
-	case attempts >= 8:
-		return now.Add(30 * time.Minute)
-	case attempts >= 5:
-		return now.Add(5 * time.Minute)
-	default:
-		return time.Time{}
+func lockUntilForAttempts(now time.Time, attempts int, stages []LockoutStage) time.Time {
+	for index := len(stages) - 1; index >= 0; index-- {
+		if attempts >= stages[index].FailedAttempts {
+			return now.Add(stages[index].Duration)
+		}
 	}
+	return time.Time{}
 }
 
 func generateSessionToken() (string, string, error) {
@@ -327,16 +417,24 @@ func (service *LocalAuthService) Activate(ctx context.Context, command ActivateL
 }
 
 func (service *LocalAuthService) appendAuthenticationAudit(ctx context.Context, tx pgx.Tx, user UserPrincipal, action string, outcome audit.Outcome, reasonCode string, request RequestContext) error {
+	return service.appendAuthenticationAuditWithMetadata(ctx, tx, user, action, outcome, reasonCode, request, nil)
+}
+
+func (service *LocalAuthService) appendAuthenticationAuditWithMetadata(ctx context.Context, tx pgx.Tx, user UserPrincipal, action string, outcome audit.Outcome, reasonCode string, request RequestContext, extra map[string]any) error {
 	actorSubject := "local-authentication"
 	resourceID := "unknown"
 	if user.ID != uuid.Nil {
 		actorSubject = user.Username
 		resourceID = user.ID.String()
 	}
+	metadata := map[string]any{"reason_code": reasonCode}
+	for key, value := range extra {
+		metadata[key] = value
+	}
 	_, err := service.auditor.Append(ctx, tx, audit.AppendCommand{
 		Actor:  identity.Principal{Subject: actorSubject, Kind: identity.PrincipalKindLocal},
 		Action: action, ResourceType: "user_principal", ResourceID: resourceID, Outcome: outcome,
-		RequestID: request.RequestID, SourceIP: request.SourceIP, Metadata: map[string]any{"reason_code": reasonCode},
+		RequestID: request.RequestID, SourceIP: request.SourceIP, Metadata: metadata,
 	})
 	return err
 }

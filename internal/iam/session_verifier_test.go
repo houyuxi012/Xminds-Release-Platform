@@ -23,7 +23,7 @@ func TestSessionVerifierHashesOpaqueTokenAndAtomicallyRefreshesIdleExpiry(t *tes
 		session: Session{
 			ID: uuid.MustParse("018f835d-7e4b-7abc-9f42-67a2f5f49101"), TokenDigest: hex.EncodeToString(digest[:]),
 			SubjectID: uuid.MustParse("018f835d-7e4b-7abc-9f42-67a2f5f49102"), AuthenticationMethod: AuthenticationMethodLocal,
-			AuthenticatedAt: now.Add(-time.Hour), LastUsedAt: now.Add(-time.Minute), AbsoluteExpiresAt: now.Add(time.Hour), IdleExpiresAt: now.Add(time.Minute), Version: 3,
+			MFALevel: 1, AuthenticatedAt: now.Add(-time.Hour), LastUsedAt: now.Add(-time.Minute), AbsoluteExpiresAt: now.Add(time.Hour), IdleExpiresAt: now.Add(time.Minute), Version: 3,
 		},
 		user:  UserPrincipal{ID: uuid.MustParse("018f835d-7e4b-7abc-9f42-67a2f5f49102"), Username: "release.operator", Kind: UserKindLocal, Status: UserStatusActive},
 		state: LoginState{Mode: LoginModeLocal},
@@ -36,7 +36,7 @@ func TestSessionVerifierHashesOpaqueTokenAndAtomicallyRefreshesIdleExpiry(t *tes
 	if err != nil {
 		t.Fatalf("Verify() error = %v", err)
 	}
-	if principal.Subject != "release.operator" || principal.Kind != identity.PrincipalKindLocal || principal.TokenID != repository.session.ID.String() {
+	if principal.Subject != "release.operator" || principal.Kind != identity.PrincipalKindLocal || principal.TokenID != repository.session.ID.String() || principal.AuthenticationAssurance != 1 {
 		t.Fatalf("principal = %+v", principal)
 	}
 	if repository.loadedDigest != hex.EncodeToString(digest[:]) || !repository.session.LastUsedAt.Equal(now) || !repository.session.IdleExpiresAt.Equal(now.Add(30*time.Minute)) || repository.session.Version != 4 {

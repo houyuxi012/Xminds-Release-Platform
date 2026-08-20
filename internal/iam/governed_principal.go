@@ -84,6 +84,10 @@ WHERE lower(user_record.username) = lower($1) AND user_record.user_kind IN ('loc
 	}
 	principal.Roles, principal.ProductIDs, principal.Governed, principal.RoleScopes = nil, nil, true, make([]identity.RoleScope, 0, len(bindings))
 	for _, binding := range bindings {
+		if principal.Kind == identity.PrincipalKindLocal && principal.AuthenticationAssurance < 1 &&
+			binding.Role == identity.RoleAdmin && binding.ScopeType == ScopeTypePlatform && binding.Effect == BindingEffectAllow {
+			continue
+		}
 		if bindingActive(binding, resolver.now().UTC()) {
 			principal.RoleScopes = append(principal.RoleScopes, identity.RoleScope{Role: binding.Role, Effect: string(binding.Effect), ScopeType: string(binding.ScopeType), ProductID: binding.ProductID, ChannelName: binding.ChannelName})
 		}

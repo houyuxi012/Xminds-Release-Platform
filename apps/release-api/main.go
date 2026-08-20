@@ -177,6 +177,10 @@ func run(ctx context.Context, arguments []string, environ map[string]string) err
 	if err != nil {
 		return fmt.Errorf("configure IAM password manager: %w", err)
 	}
+	dummyPassword, err := iam.NewDummyPasswordDigest(ctx, iamPasswords)
+	if err != nil {
+		return fmt.Errorf("configure IAM dummy authentication digest: %w", err)
+	}
 	secretResolver, err := iam.NewDirectorySecretResolver(runtimeConfig.LocalAuth.MFASecretDirectory)
 	if err != nil {
 		return fmt.Errorf("configure IAM secret resolver: %w", err)
@@ -188,7 +192,7 @@ func run(ctx context.Context, arguments []string, environ map[string]string) err
 	iamRepository := iam.NewPostgresRepository(pool)
 	localAuthenticator, err := iam.NewLocalAuthService(iam.LocalAuthConfig{
 		Repository: iamRepository, Auditor: auditor, Passwords: iamPasswords, MFA: mfaVerifier,
-		Policy: runtimeConfig.LocalAuth.Policy, Clock: time.Now,
+		DummyPassword: dummyPassword, Policy: runtimeConfig.LocalAuth.Policy, Clock: time.Now,
 	})
 	if err != nil {
 		return fmt.Errorf("configure local authentication service: %w", err)

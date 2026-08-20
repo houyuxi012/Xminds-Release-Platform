@@ -121,6 +121,18 @@ func TestDirectorySecretResolverConfinesReferencesToConfiguredRoot(t *testing.T)
 	}
 }
 
+func TestDirectorySecretResolverRejectsSymlinkRoot(t *testing.T) {
+	t.Parallel()
+	realRoot := t.TempDir()
+	linkedRoot := filepath.Join(t.TempDir(), "iam-secrets")
+	if err := os.Symlink(realRoot, linkedRoot); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewDirectorySecretResolver(linkedRoot); !errors.Is(err, ErrSecretReferenceInvalid) {
+		t.Fatalf("NewDirectorySecretResolver(symlink root) error = %v", err)
+	}
+}
+
 type staticSecretResolver struct {
 	reference string
 	value     []byte

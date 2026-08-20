@@ -117,16 +117,34 @@ func (service *Service) CreateRoleBinding(ctx context.Context, actor identity.Pr
 		return RoleBinding{}, fmt.Errorf("generate role binding ID: %w", err)
 	}
 	binding := RoleBinding{ID: id, SubjectType: command.SubjectType, SubjectID: command.SubjectID, Role: command.Role, ScopeType: command.ScopeType, ProductID: strings.TrimSpace(command.ProductID), ChannelName: strings.TrimSpace(command.ChannelName), Effect: command.Effect, ValidFrom: command.ValidFrom, ValidUntil: command.ValidUntil, CreatedBy: actor.Subject, Version: 1, CreatedAt: now, UpdatedAt: now}
+	administratorElevation := binding.Role == identity.RoleAdmin && binding.ScopeType == ScopeTypePlatform && binding.Effect == BindingEffectAllow
+	if administratorElevation && service.sessions == nil {
+		return RoleBinding{}, ErrIAMConfiguration
+	}
 	err = service.repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
 		if binding.SubjectType == SubjectTypeUser {
-			if _, subjectErr := service.repository.GetUser(ctx, tx, binding.SubjectID); subjectErr != nil {
+			subject, subjectErr := service.repository.GetUser(ctx, tx, binding.SubjectID)
+			if subjectErr != nil {
 				return subjectErr
+			}
+			if binding.Role == identity.RoleAdmin && binding.ScopeType == ScopeTypePlatform && binding.Effect == BindingEffectAllow &&
+				(subject.Kind == UserKindLocal || subject.Kind == UserKindEmergency) && !subject.MFAEnrolled {
+				return ErrRoleBindingInvalid
 			}
 		} else if _, subjectErr := service.repository.GetOrganization(ctx, tx, binding.SubjectID); subjectErr != nil {
 			return subjectErr
 		}
 		if insertErr := service.repository.InsertRoleBinding(ctx, tx, binding); insertErr != nil {
 			return insertErr
+		}
+		if administratorElevation {
+			if binding.SubjectType == SubjectTypeUser {
+				if err := service.sessions.RevokeSubject(ctx, tx, binding.SubjectID, "administrator role granted"); err != nil {
+					return fmt.Errorf("revoke elevated subject sessions: %w", err)
+				}
+			} else if err := service.sessions.RevokeOrganizationMembers(ctx, tx, binding.SubjectID, "administrator role granted to organization"); err != nil {
+				return fmt.Errorf("revoke elevated organization member sessions: %w", err)
+			}
 		}
 		_, appendErr := service.auditor.Append(ctx, tx, audit.AppendCommand{Actor: actor, Action: "identity.role_binding.create", ResourceType: "role_binding", ResourceID: binding.ID.String(), Outcome: audit.OutcomeSuccess, RequestID: request.RequestID, SourceIP: request.SourceIP, Metadata: map[string]any{"subject_type": binding.SubjectType, "subject_id": binding.SubjectID.String(), "role": binding.Role, "scope_type": binding.ScopeType, "effect": binding.Effect}})
 		return appendErr
@@ -157,7 +175,6 @@ func (service *Service) DeleteRoleBinding(ctx context.Context, actor identity.Pr
 	if bindingID == uuid.Nil || expectedVersion < 1 {
 		return ErrRoleBindingInvalid
 	}
-	var removed RoleBinding
 	err := service.repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
 		binding, err := service.repository.GetRoleBinding(ctx, tx, bindingID)
 		if err != nil {
@@ -169,17 +186,18 @@ func (service *Service) DeleteRoleBinding(ctx context.Context, actor identity.Pr
 		if err := service.repository.DeleteRoleBinding(ctx, tx, bindingID, expectedVersion); err != nil {
 			return err
 		}
-		removed = binding
+		if binding.SubjectType == SubjectTypeUser {
+			if err := service.sessions.RevokeSubject(ctx, tx, binding.SubjectID, "role binding removed"); err != nil {
+				return fmt.Errorf("revoke sessions after role binding removal: %w", err)
+			}
+		} else if err := service.sessions.RevokeOrganizationMembers(ctx, tx, binding.SubjectID, "organization role binding removed"); err != nil {
+			return fmt.Errorf("revoke organization member sessions after role binding removal: %w", err)
+		}
 		_, err = service.auditor.Append(ctx, tx, audit.AppendCommand{Actor: actor, Action: "identity.role_binding.delete", ResourceType: "role_binding", ResourceID: binding.ID.String(), Outcome: audit.OutcomeSuccess, RequestID: request.RequestID, SourceIP: request.SourceIP, Metadata: map[string]any{"subject_type": binding.SubjectType, "subject_id": binding.SubjectID.String(), "role": binding.Role, "scope_type": binding.ScopeType, "effect": binding.Effect, "version": binding.Version}})
 		return err
 	})
 	if err != nil {
 		return err
-	}
-	if removed.SubjectType == SubjectTypeUser {
-		if err := service.sessions.RevokeSubject(ctx, removed.SubjectID, "role binding removed"); err != nil {
-			return fmt.Errorf("revoke sessions after role binding removal: %w", err)
-		}
 	}
 	return nil
 }
@@ -372,8 +390,12 @@ func (service *Service) CreateLocalUser(ctx context.Context, actor identity.Prin
 	now := service.clock().UTC().Truncate(time.Microsecond)
 	activationExpires := now.Add(localActivationLifetime)
 	activationDigest := sha256.Sum256([]byte(activationToken))
+	userID, err := uuid.NewV7()
+	if err != nil {
+		return LocalUserProvisioning{}, fmt.Errorf("generate local user ID: %w", err)
+	}
 	user := UserPrincipal{
-		ID: uuid.New(), Username: username, DisplayName: displayName, Email: emailAddress,
+		ID: userID, Username: username, DisplayName: displayName, Email: emailAddress,
 		Kind: UserKindLocal, Status: UserStatusPending, Version: 1, CreatedAt: now, UpdatedAt: now,
 	}
 	credential := LocalCredential{
@@ -479,6 +501,9 @@ func validateRoleBindingCommand(command CreateRoleBindingCommand) error {
 }
 
 func (service *Service) EnableSSO(ctx context.Context, actor identity.Principal, sourceID uuid.UUID, proof HighRiskProof, request RequestContext) error {
+	if service.sessions == nil {
+		return ErrIAMConfiguration
+	}
 	if err := service.requireHighRisk(ctx, actor, "identity.sso.enable", proof); err != nil {
 		return err
 	}
@@ -524,6 +549,9 @@ func (service *Service) EnableSSO(ctx context.Context, actor identity.Principal,
 		if err := service.repository.SaveIdentitySource(ctx, tx, source, sourceVersion); err != nil {
 			return err
 		}
+		if err := service.sessions.RevokeRegularLocalSessions(ctx, tx, "login mode changed to sso"); err != nil {
+			return fmt.Errorf("revoke regular local sessions for SSO: %w", err)
+		}
 		_, err = service.auditor.Append(ctx, tx, audit.AppendCommand{
 			Actor: actor, Action: "identity.sso.enable", ResourceType: "identity_source", ResourceID: source.ID.String(),
 			Outcome: audit.OutcomeSuccess, RequestID: request.RequestID, SourceIP: request.SourceIP,
@@ -534,6 +562,9 @@ func (service *Service) EnableSSO(ctx context.Context, actor identity.Principal,
 }
 
 func (service *Service) MarkIdentitySourceFault(ctx context.Context, actor identity.Principal, sourceID uuid.UUID, code string, request RequestContext) error {
+	if service.sessions == nil {
+		return ErrIAMConfiguration
+	}
 	if err := service.authorizer.Require(actor, identity.ActionIdentityManage, ""); err != nil {
 		return err
 	}
@@ -569,6 +600,9 @@ func (service *Service) MarkIdentitySourceFault(ctx context.Context, actor ident
 		source.UpdatedAt = now
 		if err := service.repository.SaveIdentitySource(ctx, tx, source, sourceVersion); err != nil {
 			return err
+		}
+		if err := service.sessions.RevokeRegularLocalSessions(ctx, tx, "login mode changed to fault"); err != nil {
+			return fmt.Errorf("revoke regular local sessions for identity fault: %w", err)
 		}
 		_, err = service.auditor.Append(ctx, tx, audit.AppendCommand{
 			Actor: actor, Action: "identity.sso.fault", ResourceType: "identity_source", ResourceID: source.ID.String(),
@@ -663,6 +697,9 @@ func (service *Service) DisableUser(ctx context.Context, actor identity.Principa
 		if err := service.repository.SaveUser(ctx, tx, user, previousVersion); err != nil {
 			return err
 		}
+		if err := service.sessions.RevokeSubject(ctx, tx, userID, reason); err != nil {
+			return fmt.Errorf("revoke disabled user sessions: %w", err)
+		}
 		_, err = service.auditor.Append(ctx, tx, audit.AppendCommand{
 			Actor: actor, Action: "identity.user.disable", ResourceType: "user_principal", ResourceID: user.ID.String(),
 			Outcome: audit.OutcomeSuccess, RequestID: request.RequestID, SourceIP: request.SourceIP,
@@ -672,9 +709,6 @@ func (service *Service) DisableUser(ctx context.Context, actor identity.Principa
 	})
 	if err != nil {
 		return err
-	}
-	if err := service.sessions.RevokeSubject(ctx, userID, reason); err != nil {
-		return fmt.Errorf("revoke disabled user sessions: %w", err)
 	}
 	return nil
 }

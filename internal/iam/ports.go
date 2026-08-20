@@ -40,7 +40,9 @@ type AuditAppender interface {
 }
 
 type SessionRevoker interface {
-	RevokeSubject(ctx context.Context, subjectID uuid.UUID, reason string) error
+	RevokeSubject(ctx context.Context, tx pgx.Tx, subjectID uuid.UUID, reason string) error
+	RevokeOrganizationMembers(ctx context.Context, tx pgx.Tx, organizationID uuid.UUID, reason string) error
+	RevokeRegularLocalSessions(ctx context.Context, tx pgx.Tx, reason string) error
 }
 
 type PasswordVerifier interface {

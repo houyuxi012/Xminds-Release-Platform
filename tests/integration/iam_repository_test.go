@@ -3,13 +3,17 @@ package integration_test
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"xminds-release-platform/internal/audit"
 	"xminds-release-platform/internal/iam"
@@ -17,6 +21,346 @@ import (
 	"xminds-release-platform/internal/platform/database"
 	"xminds-release-platform/migrations"
 )
+
+func TestIAMPostgresLocalAuthenticationConcurrencyAndRollback(t *testing.T) {
+	databaseURL := integrationDatabaseURL(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	pool, err := database.Open(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if err := database.ApplyMigrations(ctx, pool, migrations.FS); err != nil {
+		t.Fatalf("ApplyMigrations() error = %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+TRUNCATE TABLE local_sessions, local_auth_rate_limits, emergency_access_events, directory_sync_conflicts,
+directory_sync_jobs, role_bindings, organization_memberships, organization_units, local_password_history,
+local_credentials, user_principals, iam_login_state, identity_sources CASCADE;
+INSERT INTO iam_login_state (singleton, login_mode, version, updated_by, updated_at)
+VALUES (TRUE, 'local', 1, 'test:bootstrap', clock_timestamp())`); err != nil {
+		t.Fatalf("reset IAM tables: %v", err)
+	}
+	now := time.Date(2026, 8, 20, 15, 0, 0, 0, time.UTC)
+	passwords, err := iam.NewPasswordManager(iam.PasswordPolicyConfig{
+		MinimumLength: 16, MemoryKiB: 19 * 1024, Iterations: 1, Parallelism: 1, SaltBytes: 16, DerivedKeyBytes: 32,
+	}, integrationBreachChecker{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dummy, err := iam.NewDummyPasswordDigest(ctx, passwords)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository := iam.NewPostgresRepository(pool)
+	mfa := &controlledMFAVerifier{}
+	authenticator, err := iam.NewLocalAuthService(iam.LocalAuthConfig{
+		Repository: repository, Auditor: audit.NewService(audit.NewPostgresRepository(pool)), Passwords: passwords,
+		DummyPassword: dummy, MFA: mfa, Policy: iam.DefaultLocalAuthPolicy(), Clock: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	seedPending := func(username, token string) uuid.UUID {
+		t.Helper()
+		userID := uuid.New()
+		digest := sha256.Sum256([]byte(token))
+		if _, seedErr := pool.Exec(ctx, `
+INSERT INTO user_principals (id, username, display_name, user_kind, status, version, created_at, updated_at)
+VALUES ($1, $2, $2, 'local', 'pending', 1, $3, $3)`, userID, username, now.Add(-time.Hour)); seedErr != nil {
+			t.Fatal(seedErr)
+		}
+		if _, seedErr := pool.Exec(ctx, `
+INSERT INTO local_credentials (user_id, failed_attempts, activation_digest, activation_expires_at)
+VALUES ($1, 0, $2, $3)`, userID, hex.EncodeToString(digest[:]), now.Add(time.Hour)); seedErr != nil {
+			t.Fatal(seedErr)
+		}
+		return userID
+	}
+
+	activationToken := "concurrent-activation-token-with-sufficient-entropy"
+	activationUserID := seedPending("concurrent.activation", activationToken)
+	activationErrors := make(chan error, 2)
+	var activationGroup sync.WaitGroup
+	for index := 0; index < 2; index++ {
+		activationGroup.Add(1)
+		go func() {
+			defer activationGroup.Done()
+			activationErrors <- authenticator.Activate(ctx, iam.ActivateLocalAccountCommand{
+				ActivationToken: activationToken, NewPassword: "Concurrent-Strong-Password!",
+			}, iam.RequestContext{RequestID: uuid.NewString(), SourceIP: "192.0.2.41"})
+		}()
+	}
+	activationGroup.Wait()
+	close(activationErrors)
+	activationSuccess, activationDenied := 0, 0
+	for activationErr := range activationErrors {
+		if activationErr == nil {
+			activationSuccess++
+		} else if errors.Is(activationErr, iam.ErrLocalAuthenticationFailed) {
+			activationDenied++
+		} else {
+			t.Fatalf("concurrent Activate() error = %v", activationErr)
+		}
+	}
+	var activationHistory int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM local_password_history WHERE user_id=$1`, activationUserID).Scan(&activationHistory); err != nil {
+		t.Fatal(err)
+	}
+	if activationSuccess != 1 || activationDenied != 1 || activationHistory != 1 {
+		t.Fatalf("activation results: success=%d denied=%d history=%d", activationSuccess, activationDenied, activationHistory)
+	}
+	if _, err := authenticator.LoginLocal(ctx, iam.LocalLoginCommand{
+		Username: "concurrent.activation", Password: "Concurrent-Strong-Password!",
+	}, iam.RequestContext{RequestID: uuid.NewString(), SourceIP: "192.0.2.43"}); err != nil {
+		t.Fatalf("create rollback session fixture: %v", err)
+	}
+
+	mfaToken := "concurrent-mfa-activation-token-with-sufficient-entropy"
+	mfaUserID := seedPending("concurrent.mfa", mfaToken)
+	mfa.counter.Store(100)
+	if err := authenticator.Activate(ctx, iam.ActivateLocalAccountCommand{
+		ActivationToken: mfaToken, NewPassword: "Concurrent-MFA-Password!",
+		MFASecretReference: "secret://iam/concurrent-mfa", MFAProof: "123456",
+	}, iam.RequestContext{RequestID: uuid.NewString(), SourceIP: "192.0.2.42"}); err != nil {
+		t.Fatalf("activate MFA fixture: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+INSERT INTO role_bindings (
+    id, subject_type, subject_id, role_name, scope_type, effect, valid_from,
+    created_by, version, created_at, updated_at
+) VALUES ($1, 'user', $2, 'admin', 'platform', 'allow', $3, 'test:bootstrap', 1, $3, $3)`, uuid.New(), mfaUserID, time.Now().UTC().Add(-time.Hour)); err != nil {
+		t.Fatalf("seed MFA administrator binding: %v", err)
+	}
+	mfa.counter.Store(101)
+	loginErrors := make(chan error, 2)
+	var loginGroup sync.WaitGroup
+	for index := 0; index < 2; index++ {
+		loginGroup.Add(1)
+		go func(index int) {
+			defer loginGroup.Done()
+			_, loginErr := authenticator.LoginLocal(ctx, iam.LocalLoginCommand{
+				Username: "concurrent.mfa", Password: "Concurrent-MFA-Password!", MFAProof: "123456",
+			}, iam.RequestContext{RequestID: uuid.NewString(), SourceIP: "192.0.2." + string(rune('5'+index))})
+			loginErrors <- loginErr
+		}(index)
+	}
+	loginGroup.Wait()
+	close(loginErrors)
+	loginSuccess, replayDenied := 0, 0
+	for loginErr := range loginErrors {
+		if loginErr == nil {
+			loginSuccess++
+		} else if errors.Is(loginErr, iam.ErrLocalAuthenticationFailed) {
+			replayDenied++
+		} else {
+			t.Fatalf("concurrent LoginLocal() error = %v", loginErr)
+		}
+	}
+	if loginSuccess != 1 || replayDenied != 1 {
+		t.Fatalf("TOTP replay results: success=%d denied=%d", loginSuccess, replayDenied)
+	}
+
+	if _, err := pool.Exec(ctx, `TRUNCATE TABLE local_auth_rate_limits`); err != nil {
+		t.Fatal(err)
+	}
+	const attempts, limit = 40, 20
+	allowedCount := atomic.Int64{}
+	var rateGroup sync.WaitGroup
+	for range attempts {
+		rateGroup.Add(1)
+		go func() {
+			defer rateGroup.Done()
+			rateErr := repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
+				allowed, consumeErr := repository.ConsumeRateLimit(ctx, tx, iam.RateLimitScopeIP, strings.Repeat("a", 64), now, limit, now.Add(time.Minute))
+				if allowed {
+					allowedCount.Add(1)
+				}
+				return consumeErr
+			})
+			if rateErr != nil {
+				t.Errorf("ConsumeRateLimit() error = %v", rateErr)
+			}
+		}()
+	}
+	rateGroup.Wait()
+	var storedAttempts int
+	if err := pool.QueryRow(ctx, `SELECT attempt_count FROM local_auth_rate_limits WHERE scope='ip'`).Scan(&storedAttempts); err != nil {
+		t.Fatal(err)
+	}
+	if allowedCount.Load() != limit || storedAttempts != attempts {
+		t.Fatalf("rate-limit concurrency: allowed=%d stored=%d", allowedCount.Load(), storedAttempts)
+	}
+
+	if _, err := pool.Exec(ctx, `TRUNCATE TABLE local_auth_rate_limits`); err != nil {
+		t.Fatal(err)
+	}
+	failingAuthenticator, err := iam.NewLocalAuthService(iam.LocalAuthConfig{
+		Repository: repository, Auditor: failingIAMAuditAppender{}, Passwords: passwords, DummyPassword: dummy,
+		MFA: mfa, Policy: iam.DefaultLocalAuthPolicy(), Clock: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := failingAuthenticator.LoginLocal(ctx, iam.LocalLoginCommand{
+		Username: "unknown.audit", Password: "Wrong-Password-Value!",
+	}, iam.RequestContext{RequestID: uuid.NewString(), SourceIP: "192.0.2.61"}); !errors.Is(err, errIntegrationAuditFailure) {
+		t.Fatalf("LoginLocal(audit failure) error = %v", err)
+	}
+	var rateRows int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM local_auth_rate_limits`).Scan(&rateRows); err != nil || rateRows != 0 {
+		t.Fatalf("audit rollback rate rows=%d error=%v", rateRows, err)
+	}
+
+	failingService, err := iam.NewService(iam.ServiceConfig{
+		Repository: repository, Auditor: failingIAMAuditAppender{}, Sessions: repository, Passwords: passwords,
+		HighRisk: integrationHighRiskAuthorizer{}, Clock: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := failingService.DisableUser(ctx,
+		identity.Principal{Subject: "admin", Kind: identity.PrincipalKindHuman, Roles: []identity.Role{identity.RoleAdmin}},
+		activationUserID, "rollback validation", iam.HighRiskProof{Confirmed: true, ChallengeID: "rollback", Evidence: "rollback"},
+		iam.RequestContext{RequestID: uuid.NewString(), SourceIP: "127.0.0.1"}); !errors.Is(err, errIntegrationAuditFailure) {
+		t.Fatalf("DisableUser(audit failure) error = %v", err)
+	}
+	var status iam.UserStatus
+	var revokedSessions int
+	if err := pool.QueryRow(ctx, `SELECT status FROM user_principals WHERE id=$1`, activationUserID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM local_sessions WHERE subject_id=$1 AND revoked_at IS NOT NULL`, activationUserID).Scan(&revokedSessions); err != nil {
+		t.Fatal(err)
+	}
+	if status != iam.UserStatusActive || revokedSessions != 0 {
+		t.Fatalf("disable rollback: status=%s revoked_sessions=%d", status, revokedSessions)
+	}
+
+	if _, err := pool.Exec(ctx, `TRUNCATE TABLE local_auth_rate_limits`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO local_auth_rate_limits (scope, key_digest, window_started_at, attempt_count, expires_at)
+SELECT 'account', repeat(md5(value::text), 2), $1, 1, $2 FROM generate_series(1, 200) value`, now.Add(-2*time.Hour), now.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	var cleaned int64
+	if err := repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
+		var cleanupErr error
+		cleaned, cleanupErr = repository.CleanupExpiredRateLimits(ctx, tx, now, 64)
+		return cleanupErr
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if cleaned != 64 {
+		t.Fatalf("bounded cleanup removed %d rows", cleaned)
+	}
+}
+
+func TestIAMSessionTouchAndModeSwitchUsePostgresLoginStateBarrier(t *testing.T) {
+	databaseURL := integrationDatabaseURL(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	pool, err := database.Open(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if err := database.ApplyMigrations(ctx, pool, migrations.FS); err != nil {
+		t.Fatalf("ApplyMigrations() error = %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+TRUNCATE TABLE local_sessions, local_auth_rate_limits, emergency_access_events, directory_sync_conflicts,
+directory_sync_jobs, role_bindings, organization_memberships, organization_units, local_password_history,
+local_credentials, user_principals, iam_login_state, identity_sources CASCADE;
+INSERT INTO iam_login_state (singleton, login_mode, version, updated_by, updated_at)
+VALUES (TRUE, 'local', 1, 'test:bootstrap', clock_timestamp())`); err != nil {
+		t.Fatalf("reset IAM tables: %v", err)
+	}
+
+	now := time.Date(2026, 8, 20, 14, 0, 0, 0, time.UTC)
+	sourceID, emergencyID := uuid.New(), uuid.New()
+	secret := make([]byte, 32)
+	for index := range secret {
+		secret[index] = byte(index + 1)
+	}
+	rawToken := "xms_" + base64.RawURLEncoding.EncodeToString(secret)
+	tokenDigest := sha256.Sum256([]byte(rawToken))
+	if _, err := pool.Exec(ctx, `
+INSERT INTO identity_sources (
+    id, name, source_kind, status, required_mappings_complete, verified_at, previewed_at,
+    version, created_at, updated_at
+) VALUES ($1, 'Barrier OIDC', 'oidc', 'verified', TRUE, $2, $2, 1, $2, $2)`, sourceID, now.Add(-time.Hour)); err != nil {
+		t.Fatalf("seed barrier source: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+INSERT INTO user_principals (
+    id, username, display_name, user_kind, status, mfa_enrolled, credential_rotated_at,
+    version, created_at, updated_at
+) VALUES ($1, 'barrier-emergency', 'Barrier Emergency', 'emergency', 'active', TRUE, $2, 1, $2, $2)`, emergencyID, now.Add(-time.Hour)); err != nil {
+		t.Fatalf("seed barrier emergency account: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+INSERT INTO local_sessions (
+    id, token_digest, subject_id, authentication_method, mfa_level, authenticated_at,
+    last_used_at, absolute_expires_at, idle_expires_at, version
+) VALUES ($1, $2, $3, 'emergency_password', 1, $4, $4, $5, $6, 1)`,
+		uuid.New(), hex.EncodeToString(tokenDigest[:]), emergencyID, now.Add(-time.Hour), now.Add(2*time.Hour), now.Add(15*time.Minute)); err != nil {
+		t.Fatalf("seed barrier fixtures: %v", err)
+	}
+
+	repository := iam.NewPostgresRepository(pool)
+	blocking := &blockingIAMSessionRepository{PostgresRepository: repository, found: make(chan struct{}), release: make(chan struct{})}
+	verifier, err := iam.NewSessionVerifier(blocking, iam.DefaultLocalAuthPolicy(), func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifyDone := make(chan error, 1)
+	go func() {
+		_, verifyErr := verifier.Verify(ctx, rawToken)
+		verifyDone <- verifyErr
+	}()
+	select {
+	case <-blocking.found:
+	case <-ctx.Done():
+		t.Fatal("session verification did not reach the controlled transaction boundary")
+	}
+
+	passwords, err := iam.NewPasswordManager(iam.PasswordPolicyConfig{
+		MinimumLength: 16, MemoryKiB: 19 * 1024, Iterations: 1, Parallelism: 1, SaltBytes: 16, DerivedKeyBytes: 32,
+	}, integrationBreachChecker{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := iam.NewService(iam.ServiceConfig{
+		Repository: repository, Auditor: audit.NewService(audit.NewPostgresRepository(pool)), Sessions: repository,
+		Passwords: passwords, HighRisk: integrationHighRiskAuthorizer{}, Clock: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	switchDone := make(chan error, 1)
+	go func() {
+		switchDone <- service.EnableSSO(ctx,
+			identity.Principal{Subject: "admin", Kind: identity.PrincipalKindHuman, Roles: []identity.Role{identity.RoleAdmin}, TokenID: "barrier-admin"},
+			sourceID, iam.HighRiskProof{Confirmed: true, ChallengeID: "barrier", Evidence: "barrier"},
+			iam.RequestContext{RequestID: uuid.NewString(), SourceIP: "127.0.0.1"})
+	}()
+	select {
+	case switchErr := <-switchDone:
+		t.Fatalf("mode switch crossed an in-flight session verification: %v", switchErr)
+	case <-time.After(250 * time.Millisecond):
+	}
+	close(blocking.release)
+	if verifyErr := <-verifyDone; verifyErr != nil {
+		t.Fatalf("session verification that started before the switch error = %v", verifyErr)
+	}
+	if switchErr := <-switchDone; switchErr != nil {
+		t.Fatalf("EnableSSO() error = %v", switchErr)
+	}
+}
 
 func TestIAMLocalAuthenticationPostgresLifecycle(t *testing.T) {
 	databaseURL := integrationDatabaseURL(t)
@@ -83,9 +427,13 @@ INSERT INTO role_bindings (
 	if err != nil {
 		t.Fatal(err)
 	}
+	dummyPassword, err := iam.NewDummyPasswordDigest(ctx, passwords)
+	if err != nil {
+		t.Fatal(err)
+	}
 	authenticator, err := iam.NewLocalAuthService(iam.LocalAuthConfig{
 		Repository: repository, Auditor: audit.NewService(audit.NewPostgresRepository(pool)), Passwords: passwords,
-		MFA: &integrationMFAVerifier{}, Policy: iam.DefaultLocalAuthPolicy(), Clock: func() time.Time { return now },
+		DummyPassword: dummyPassword, MFA: &integrationMFAVerifier{}, Policy: iam.DefaultLocalAuthPolicy(), Clock: func() time.Time { return now },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -136,7 +484,9 @@ WHERE user_record.id=$1`, userID).Scan(&status, &activation, &historyCount); err
 	if _, err := verifier.Verify(ctx, login.AccessToken); err != nil {
 		t.Fatalf("Verify(active session) error = %v", err)
 	}
-	if err := repository.RevokeSubject(ctx, userID, "integration-test"); err != nil {
+	if err := repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
+		return repository.RevokeSubject(ctx, tx, userID, "integration-test")
+	}); err != nil {
 		t.Fatalf("RevokeSubject() error = %v", err)
 	}
 	if _, err := verifier.Verify(ctx, login.AccessToken); !errors.Is(err, identity.ErrAuthenticationFailed) {
@@ -472,7 +822,7 @@ VALUES ($1, 'audit.reader', '审计阅读者', 'local', 'active', 1, $2, $2)`, u
 		t.Fatal(err)
 	}
 	actor := identity.Principal{Subject: "admin", Kind: identity.PrincipalKindHuman, Roles: []identity.Role{identity.RoleAdmin}}
-	request := iam.RequestContext{RequestID: "018f835d-7e4b-7abc-9f42-67a2f5f48e92", SourceIP: "127.0.0.1"}
+	request := iam.RequestContext{RequestID: uuid.NewString(), SourceIP: "127.0.0.1"}
 	organization, err := service.CreateOrganization(ctx, actor, iam.CreateOrganizationCommand{Name: "Release Engineering"}, request)
 	if err != nil {
 		t.Fatalf("CreateOrganization() error = %v", err)
@@ -507,7 +857,7 @@ VALUES ($1, 'audit.reader', '审计阅读者', 'local', 'active', 1, $2, $2)`, u
 		t.Fatalf("stored secret reference = %q", storedReference)
 	}
 	var auditCount int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM audit_events WHERE action IN ('identity.organization.create', 'identity.role_binding.create', 'identity.source.create')`).Scan(&auditCount); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM audit_events WHERE request_id=$1 AND action IN ('identity.organization.create', 'identity.role_binding.create', 'identity.source.create')`, request.RequestID).Scan(&auditCount); err != nil {
 		t.Fatal(err)
 	}
 	if auditCount != 3 {
@@ -519,6 +869,37 @@ type integrationBreachChecker struct{}
 
 func (integrationBreachChecker) IsBreached(context.Context, string) (bool, error) { return false, nil }
 
+var errIntegrationAuditFailure = errors.New("integration audit failure")
+
+type failingIAMAuditAppender struct{}
+
+func (failingIAMAuditAppender) Append(context.Context, pgx.Tx, audit.AppendCommand) (audit.Event, error) {
+	return audit.Event{}, errIntegrationAuditFailure
+}
+
+type controlledMFAVerifier struct{ counter atomic.Int64 }
+
+func (verifier *controlledMFAVerifier) Verify(context.Context, string, string) (iam.MFAAssertion, error) {
+	return iam.MFAAssertion{Counter: verifier.counter.Load()}, nil
+}
+
+type blockingIAMSessionRepository struct {
+	*iam.PostgresRepository
+	found   chan struct{}
+	release chan struct{}
+}
+
+func (repository *blockingIAMSessionRepository) FindSession(ctx context.Context, tx pgx.Tx, tokenDigest string) (iam.Session, iam.UserPrincipal, iam.LoginState, error) {
+	session, user, state, err := repository.PostgresRepository.FindSession(ctx, tx, tokenDigest)
+	close(repository.found)
+	select {
+	case <-repository.release:
+	case <-ctx.Done():
+		return iam.Session{}, iam.UserPrincipal{}, iam.LoginState{}, ctx.Err()
+	}
+	return session, user, state, err
+}
+
 type integrationMFAVerifier struct{ counter atomic.Int64 }
 
 func (verifier *integrationMFAVerifier) Verify(context.Context, string, string) (iam.MFAAssertion, error) {
@@ -527,7 +908,17 @@ func (verifier *integrationMFAVerifier) Verify(context.Context, string, string) 
 
 type integrationSessionRevoker struct{}
 
-func (integrationSessionRevoker) RevokeSubject(context.Context, uuid.UUID, string) error { return nil }
+func (integrationSessionRevoker) RevokeSubject(context.Context, pgx.Tx, uuid.UUID, string) error {
+	return nil
+}
+
+func (integrationSessionRevoker) RevokeOrganizationMembers(context.Context, pgx.Tx, uuid.UUID, string) error {
+	return nil
+}
+
+func (integrationSessionRevoker) RevokeRegularLocalSessions(context.Context, pgx.Tx, string) error {
+	return nil
+}
 
 type integrationHighRiskAuthorizer struct{}
 

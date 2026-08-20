@@ -84,6 +84,9 @@ func (authorizer *Authorizer) Require(principal Principal, action Action, produc
 		}
 	}
 	for _, role := range principal.Roles {
+		if principal.Kind == PrincipalKindLocal && principal.AuthenticationAssurance < 1 && role == RoleAdmin {
+			continue
+		}
 		if authorizer.rolePermitsAction(role, action) {
 			return nil
 		}
@@ -97,7 +100,7 @@ func (authorizer *Authorizer) requireGoverned(principal Principal, action Action
 	}
 	allowed := false
 	for _, scope := range principal.RoleScopes {
-		if !authorizer.rolePermitsAction(scope.Role, action) || !scopeMatches(scope, productID, channel, isProductScoped(action)) {
+		if !scopeAllowedByAuthenticationAssurance(principal, scope) || !authorizer.rolePermitsAction(scope.Role, action) || !scopeMatches(scope, productID, channel, isProductScoped(action)) {
 			continue
 		}
 		if scope.Effect == "deny" {
@@ -149,7 +152,7 @@ func (authorizer *Authorizer) RequireProductActionCandidate(principal Principal,
 	}
 	allowed := false
 	for _, scope := range principal.RoleScopes {
-		if !authorizer.rolePermitsAction(scope.Role, action) {
+		if !scopeAllowedByAuthenticationAssurance(principal, scope) || !authorizer.rolePermitsAction(scope.Role, action) {
 			continue
 		}
 		switch scope.ScopeType {
@@ -176,6 +179,11 @@ func (authorizer *Authorizer) RequireProductActionCandidate(principal Principal,
 		return ErrActionDenied
 	}
 	return nil
+}
+
+func scopeAllowedByAuthenticationAssurance(principal Principal, scope RoleScope) bool {
+	return principal.Kind != PrincipalKindLocal || principal.AuthenticationAssurance >= 1 ||
+		scope.Role != RoleAdmin || scope.ScopeType != "platform" || scope.Effect != "allow"
 }
 
 func (authorizer *Authorizer) RequireInChannel(principal Principal, action Action, productID, channel string) error {

@@ -13,11 +13,14 @@ import (
 	"errors"
 	"fmt"
 	"hash"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 const maximumBreachCorpusBytes = 128 << 20
@@ -124,10 +127,11 @@ func NewDirectorySecretResolver(root string) (*DirectorySecretResolver, error) {
 		return nil, ErrSecretReferenceInvalid
 	}
 	clean := filepath.Clean(root)
-	info, err := os.Stat(clean)
-	if err != nil || !info.IsDir() {
+	directory, err := openNoFollow(clean, true)
+	if err != nil {
 		return nil, ErrSecretReferenceInvalid
 	}
+	_ = directory.Close()
 	return &DirectorySecretResolver{root: clean}, nil
 }
 
@@ -140,16 +144,52 @@ func (resolver *DirectorySecretResolver) Resolve(_ context.Context, reference st
 	if !found || name == "" || name != filepath.Base(name) || strings.ContainsAny(name, `/\\`) {
 		return nil, ErrSecretReferenceInvalid
 	}
-	path := filepath.Join(resolver.root, name)
-	info, err := os.Lstat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Mode()&0o077 != 0 {
+	root, err := openNoFollow(resolver.root, true)
+	if err != nil {
 		return nil, ErrSecretReferenceInvalid
 	}
-	contents, err := os.ReadFile(path)
+	defer root.Close()
+	fd, err := unix.Openat(int(root.Fd()), name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, ErrSecretReferenceInvalid
+	}
+	secret := os.NewFile(uintptr(fd), name)
+	if secret == nil {
+		_ = unix.Close(fd)
+		return nil, ErrSecretReferenceInvalid
+	}
+	defer secret.Close()
+	info, err := secret.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&0o077 != 0 || info.Size() <= 0 || info.Size() > 4096 {
+		return nil, ErrSecretReferenceInvalid
+	}
+	contents, err := io.ReadAll(io.LimitReader(secret, 4097))
 	if err != nil || len(contents) == 0 || len(contents) > 4096 {
 		return nil, ErrSecretReferenceInvalid
 	}
 	return []byte(strings.TrimSpace(string(contents))), nil
+}
+
+func openNoFollow(path string, directory bool) (*os.File, error) {
+	flags := unix.O_RDONLY | unix.O_CLOEXEC | unix.O_NOFOLLOW
+	if directory {
+		flags |= unix.O_DIRECTORY
+	}
+	fd, err := unix.Open(path, flags, 0)
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(fd), path)
+	if file == nil {
+		_ = unix.Close(fd)
+		return nil, ErrSecretReferenceInvalid
+	}
+	info, err := file.Stat()
+	if err != nil || directory && !info.IsDir() || !directory && !info.Mode().IsRegular() {
+		_ = file.Close()
+		return nil, ErrSecretReferenceInvalid
+	}
+	return file, nil
 }
 
 type TOTPConfig struct {

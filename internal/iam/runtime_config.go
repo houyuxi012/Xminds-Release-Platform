@@ -30,11 +30,17 @@ func LoadLocalAuthRuntimeConfig(environ map[string]string, environment string) (
 		Policy: DefaultLocalAuthPolicy(),
 	}
 	environment = strings.ToLower(strings.TrimSpace(environment))
+	developmentCorpus := strings.ToLower(strings.TrimSpace(environ["XMINDS_RELEASE_IAM_USE_DEVELOPMENT_BREACH_CORPUS"]))
+	if developmentCorpus != "" && developmentCorpus != "true" && developmentCorpus != "false" {
+		return LocalAuthRuntimeConfig{}, ErrLocalAuthRuntimeConfiguration
+	}
 	if configuration.BreachCorpusPath == "" {
-		if environment != "development" {
+		if environment != "development" || developmentCorpus != "true" {
 			return LocalAuthRuntimeConfig{}, ErrLocalAuthRuntimeConfiguration
 		}
 		configuration.UseDevelopmentBreachCorpus = true
+	} else if developmentCorpus == "true" {
+		return LocalAuthRuntimeConfig{}, ErrLocalAuthRuntimeConfiguration
 	} else if !filepath.IsAbs(configuration.BreachCorpusPath) {
 		return LocalAuthRuntimeConfig{}, ErrLocalAuthRuntimeConfiguration
 	} else {
@@ -107,6 +113,10 @@ func LoadLocalAuthRuntimeConfig(environ map[string]string, environment string) (
 	if err != nil {
 		return LocalAuthRuntimeConfig{}, err
 	}
+	configuration.Policy.LockoutStages, err = parseLockoutStages(environ["XMINDS_RELEASE_IAM_LOCKOUT_STAGES"], configuration.Policy.LockoutStages)
+	if err != nil {
+		return LocalAuthRuntimeConfig{}, err
+	}
 
 	configuration.TOTP.Digits, err = optionalInt(environ, "XMINDS_RELEASE_IAM_TOTP_DIGITS", configuration.TOTP.Digits)
 	if err != nil {
@@ -130,6 +140,34 @@ func LoadLocalAuthRuntimeConfig(environ map[string]string, environment string) (
 		return LocalAuthRuntimeConfig{}, ErrLocalAuthRuntimeConfiguration
 	}
 	return configuration, nil
+}
+
+func parseLockoutStages(raw string, fallback []LockoutStage) ([]LockoutStage, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return append([]LockoutStage(nil), fallback...), nil
+	}
+	parts := strings.Split(raw, ",")
+	stages := make([]LockoutStage, 0, len(parts))
+	for _, part := range parts {
+		fields := strings.Split(strings.TrimSpace(part), ":")
+		if len(fields) != 2 {
+			return nil, ErrLocalAuthRuntimeConfiguration
+		}
+		attempts, err := strconv.Atoi(strings.TrimSpace(fields[0]))
+		if err != nil {
+			return nil, ErrLocalAuthRuntimeConfiguration
+		}
+		duration, err := time.ParseDuration(strings.TrimSpace(fields[1]))
+		if err != nil {
+			return nil, ErrLocalAuthRuntimeConfiguration
+		}
+		stages = append(stages, LockoutStage{FailedAttempts: attempts, Duration: duration})
+	}
+	if !validLockoutStages(stages) {
+		return nil, ErrLocalAuthRuntimeConfiguration
+	}
+	return stages, nil
 }
 
 func optionalInt(environ map[string]string, key string, fallback int) (int, error) {

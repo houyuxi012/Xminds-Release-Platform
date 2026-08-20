@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"strings"
@@ -34,6 +35,24 @@ type PasswordPolicyConfig struct {
 type PasswordManager struct {
 	policy   PasswordPolicyConfig
 	breaches BreachChecker
+}
+
+func NewDummyPasswordDigest(ctx context.Context, passwords PasswordService) (PasswordDigest, error) {
+	if passwords == nil {
+		return PasswordDigest{}, ErrPasswordPolicyInvalid
+	}
+	secret := make([]byte, 32)
+	if _, err := rand.Read(secret); err != nil {
+		return PasswordDigest{}, fmt.Errorf("generate dummy authentication password: %w", err)
+	}
+	digest, err := passwords.Hash(ctx, "dummy-"+base64.RawURLEncoding.EncodeToString(secret))
+	if err != nil {
+		return PasswordDigest{}, fmt.Errorf("hash dummy authentication password: %w", err)
+	}
+	if _, _, _, _, err := parsePasswordDigest(digest); err != nil {
+		return PasswordDigest{}, ErrPasswordPolicyInvalid
+	}
+	return digest, nil
 }
 
 func NewPasswordManager(policy PasswordPolicyConfig, breaches BreachChecker) (*PasswordManager, error) {

@@ -167,6 +167,30 @@ RETURNING attempt_count <= $5`, scope, keyDigest, windowStart.UTC(), expiresAt.U
 	return allowed, nil
 }
 
+func (repository *PostgresRepository) CleanupExpiredRateLimits(ctx context.Context, tx pgx.Tx, before time.Time, limit int) (int64, error) {
+	if repository == nil || repository.pool == nil || tx == nil || limit < 1 || limit > 1000 {
+		return 0, ErrIAMConfiguration
+	}
+	result, err := tx.Exec(ctx, `
+WITH expired AS (
+    SELECT scope, key_digest, window_started_at
+    FROM local_auth_rate_limits
+    WHERE expires_at <= $1
+    ORDER BY expires_at, scope, key_digest, window_started_at
+    LIMIT $2
+    FOR UPDATE SKIP LOCKED
+)
+DELETE FROM local_auth_rate_limits target
+USING expired
+WHERE target.scope=expired.scope
+  AND target.key_digest=expired.key_digest
+  AND target.window_started_at=expired.window_started_at`, before.UTC(), limit)
+	if err != nil {
+		return 0, fmt.Errorf("cleanup expired local authentication rate limits: %w", err)
+	}
+	return result.RowsAffected(), nil
+}
+
 func (repository *PostgresRepository) SaveAuthenticationFailure(ctx context.Context, tx pgx.Tx, userID uuid.UUID, failedAttempts int, lockedUntil time.Time) error {
 	if tx == nil || userID == uuid.Nil {
 		return ErrIAMConfiguration
@@ -207,22 +231,26 @@ func (repository *PostgresRepository) FindSession(ctx context.Context, tx pgx.Tx
 	var state LoginState
 	var revokedAt *time.Time
 	err := tx.QueryRow(ctx, `
+SELECT login_mode, COALESCE(active_source_id, '00000000-0000-0000-0000-000000000000'::uuid),
+       fault_code, version, updated_by, updated_at
+FROM iam_login_state WHERE singleton=TRUE
+FOR SHARE`).Scan(&state.Mode, &state.ActiveSourceID, &state.FaultCode, &state.Version, &state.UpdatedBy, &state.UpdatedAt)
+	if err != nil {
+		return Session{}, UserPrincipal{}, LoginState{}, fmt.Errorf("lock IAM login state for session verification: %w", err)
+	}
+	err = tx.QueryRow(ctx, `
 SELECT session.id, session.token_digest, session.subject_id, session.authentication_method,
        session.mfa_level, session.authenticated_at, session.last_used_at, session.absolute_expires_at,
        session.idle_expires_at, session.revoked_at, session.revocation_reason, session.version,
-       user_record.id, user_record.username, user_record.display_name, user_record.user_kind, user_record.status,
-       login.login_mode, COALESCE(login.active_source_id, '00000000-0000-0000-0000-000000000000'::uuid),
-       login.fault_code, login.version, login.updated_by, login.updated_at
+       user_record.id, user_record.username, user_record.display_name, user_record.user_kind, user_record.status
 FROM local_sessions session
 JOIN user_principals user_record ON user_record.id=session.subject_id
-CROSS JOIN iam_login_state login
 WHERE session.token_digest=$1
 FOR UPDATE OF session`, tokenDigest).Scan(
 		&session.ID, &session.TokenDigest, &session.SubjectID, &session.AuthenticationMethod,
 		&session.MFALevel, &session.AuthenticatedAt, &session.LastUsedAt, &session.AbsoluteExpiresAt,
 		&session.IdleExpiresAt, &revokedAt, &session.RevocationReason, &session.Version,
 		&user.ID, &user.Username, &user.DisplayName, &user.Kind, &user.Status,
-		&state.Mode, &state.ActiveSourceID, &state.FaultCode, &state.Version, &state.UpdatedBy, &state.UpdatedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Session{}, UserPrincipal{}, LoginState{}, ErrLocalAuthenticationFailed
@@ -252,16 +280,49 @@ WHERE id=$1 AND version=$4 AND revoked_at IS NULL`, sessionID, lastUsedAt.UTC(),
 	return nil
 }
 
-func (repository *PostgresRepository) RevokeSubject(ctx context.Context, subjectID uuid.UUID, reason string) error {
+func (repository *PostgresRepository) RevokeSubject(ctx context.Context, tx pgx.Tx, subjectID uuid.UUID, reason string) error {
 	reason = strings.TrimSpace(reason)
-	if repository == nil || repository.pool == nil || subjectID == uuid.Nil || reason == "" || len(reason) > 256 {
+	if repository == nil || repository.pool == nil || tx == nil || subjectID == uuid.Nil || reason == "" || len(reason) > 256 {
 		return ErrIAMConfiguration
 	}
-	_, err := repository.pool.Exec(ctx, `
+	_, err := tx.Exec(ctx, `
 UPDATE local_sessions SET revoked_at=clock_timestamp(), revocation_reason=$2, version=version+1
 WHERE subject_id=$1 AND revoked_at IS NULL`, subjectID, reason)
 	if err != nil {
 		return fmt.Errorf("revoke subject sessions: %w", err)
+	}
+	return nil
+}
+
+func (repository *PostgresRepository) RevokeOrganizationMembers(ctx context.Context, tx pgx.Tx, organizationID uuid.UUID, reason string) error {
+	reason = strings.TrimSpace(reason)
+	if repository == nil || repository.pool == nil || tx == nil || organizationID == uuid.Nil || reason == "" || len(reason) > 256 {
+		return ErrIAMConfiguration
+	}
+	_, err := tx.Exec(ctx, `
+UPDATE local_sessions session
+SET revoked_at=clock_timestamp(), revocation_reason=$2, version=version+1
+WHERE session.subject_id IN (
+    SELECT membership.user_id FROM organization_memberships membership
+    WHERE membership.organization_id=$1
+)
+  AND session.revoked_at IS NULL`, organizationID, reason)
+	if err != nil {
+		return fmt.Errorf("revoke organization member sessions: %w", err)
+	}
+	return nil
+}
+
+func (repository *PostgresRepository) RevokeRegularLocalSessions(ctx context.Context, tx pgx.Tx, reason string) error {
+	reason = strings.TrimSpace(reason)
+	if repository == nil || repository.pool == nil || tx == nil || reason == "" || len(reason) > 256 {
+		return ErrIAMConfiguration
+	}
+	_, err := tx.Exec(ctx, `
+UPDATE local_sessions SET revoked_at=clock_timestamp(), revocation_reason=$1, version=version+1
+WHERE authentication_method='local_password' AND revoked_at IS NULL`, reason)
+	if err != nil {
+		return fmt.Errorf("revoke regular local sessions: %w", err)
 	}
 	return nil
 }

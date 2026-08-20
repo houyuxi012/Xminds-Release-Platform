@@ -134,6 +134,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/LocalLoginResponse'
+        '400':
+          $ref: '#/components/responses/UnprocessableEntity'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '429':
@@ -163,6 +165,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/LocalLoginResponse'
+        '400':
+          $ref: '#/components/responses/UnprocessableEntity'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '429':

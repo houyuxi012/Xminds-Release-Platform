@@ -77,7 +77,10 @@ func (verifier *SessionVerifier) Verify(ctx context.Context, rawToken string) (i
 		if err := verifier.repository.TouchSession(ctx, tx, session.ID, now, idleExpiresAt, session.Version); err != nil {
 			return identity.ErrAuthenticationFailed
 		}
-		principal = identity.Principal{Subject: user.Username, Kind: identity.PrincipalKindLocal, TokenID: session.ID.String()}
+		principal = identity.Principal{
+			Subject: user.Username, Kind: identity.PrincipalKindLocal, TokenID: session.ID.String(),
+			AuthenticationAssurance: session.MFALevel,
+		}
 		return nil
 	})
 	if err != nil {

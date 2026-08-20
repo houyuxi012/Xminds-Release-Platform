@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -69,9 +70,13 @@ func TestLocalLoginReturnsOpaquePersistedSessionWithBoundedLifetime(t *testing.T
 }
 
 func TestLocalLoginUsesUnifiedFailureAndProgressivePersistentLockout(t *testing.T) {
-	t.Parallel()
 	harness := newActiveLocalAuthHarness(t, UserKindLocal, false, LoginModeLocal)
-	for attempt := 1; attempt <= 10; attempt++ {
+	harness.service.policy.LockoutStages = []LockoutStage{
+		{FailedAttempts: 3, Duration: 2 * time.Minute},
+		{FailedAttempts: 5, Duration: 15 * time.Minute},
+		{FailedAttempts: 7, Duration: 2 * time.Hour},
+	}
+	for attempt := 1; attempt <= 7; attempt++ {
 		_, err := harness.service.LoginLocal(context.Background(), LocalLoginCommand{Username: "release.operator", Password: "Wrong-Password-Value!"}, harness.request)
 		if !errors.Is(err, ErrLocalAuthenticationFailed) {
 			t.Fatalf("attempt %d error = %v", attempt, err)
@@ -81,22 +86,54 @@ func TestLocalLoginUsesUnifiedFailureAndProgressivePersistentLockout(t *testing.
 			t.Fatalf("attempt %d persisted count = %d", attempt, credential.FailedAttempts)
 		}
 		switch attempt {
+		case 3:
+			if !credential.LockedUntil.Equal(harness.now.Add(2 * time.Minute)) {
+				t.Fatalf("three-attempt lock = %s", credential.LockedUntil)
+			}
 		case 5:
-			if !credential.LockedUntil.Equal(harness.now.Add(5 * time.Minute)) {
+			if !credential.LockedUntil.Equal(harness.now.Add(15 * time.Minute)) {
 				t.Fatalf("five-attempt lock = %s", credential.LockedUntil)
 			}
-		case 8:
-			if !credential.LockedUntil.Equal(harness.now.Add(30 * time.Minute)) {
-				t.Fatalf("eight-attempt lock = %s", credential.LockedUntil)
-			}
-		case 10:
-			if !credential.LockedUntil.Equal(harness.now.Add(24 * time.Hour)) {
-				t.Fatalf("ten-attempt lock = %s", credential.LockedUntil)
+		case 7:
+			if !credential.LockedUntil.Equal(harness.now.Add(2 * time.Hour)) {
+				t.Fatalf("seven-attempt lock = %s", credential.LockedUntil)
 			}
 		}
+		if credential.LockedUntil.After(harness.now) {
+			*harness.clock = credential.LockedUntil.Add(time.Second)
+			harness.now = *harness.clock
+		}
 	}
-	if len(harness.auditor.commands) != 10 {
+	if len(harness.auditor.commands) != 14 {
 		t.Fatalf("failed login audit count = %d", len(harness.auditor.commands))
+	}
+}
+
+func TestLocalAuthPolicyRejectsUnsafeLockoutStageOrderingAndBounds(t *testing.T) {
+	valid := DefaultLocalAuthPolicy()
+	if !validLocalAuthPolicy(valid) {
+		t.Fatal("default local authentication policy is invalid")
+	}
+	for name, stages := range map[string][]LockoutStage{
+		"too few attempts":        {{FailedAttempts: 2, Duration: time.Minute}},
+		"too many attempts":       {{FailedAttempts: 51, Duration: time.Minute}},
+		"duration too short":      {{FailedAttempts: 3, Duration: 30 * time.Second}},
+		"duration too long":       {{FailedAttempts: 3, Duration: 25 * time.Hour}},
+		"duplicate threshold":     {{FailedAttempts: 3, Duration: time.Minute}, {FailedAttempts: 3, Duration: 2 * time.Minute}},
+		"non increasing duration": {{FailedAttempts: 3, Duration: 5 * time.Minute}, {FailedAttempts: 5, Duration: 5 * time.Minute}},
+		"too many stages": {
+			{FailedAttempts: 3, Duration: time.Minute}, {FailedAttempts: 4, Duration: 2 * time.Minute},
+			{FailedAttempts: 5, Duration: 3 * time.Minute}, {FailedAttempts: 6, Duration: 4 * time.Minute},
+			{FailedAttempts: 7, Duration: 5 * time.Minute}, {FailedAttempts: 8, Duration: 6 * time.Minute},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			policy := DefaultLocalAuthPolicy()
+			policy.LockoutStages = stages
+			if validLocalAuthPolicy(policy) {
+				t.Fatalf("unsafe lockout stages accepted: %+v", stages)
+			}
+		})
 	}
 }
 
@@ -131,6 +168,83 @@ func TestLocalLoginRejectsEveryAccountStateWithOneExternalFailure(t *testing.T) 
 	}
 }
 
+func TestIneligibleLocalLoginCannotIncreasePersistentFailureState(t *testing.T) {
+	for name, testCase := range map[string]struct {
+		setup func(*localAuthHarness)
+		login func(*localAuthHarness) error
+	}{
+		"wrong entry": {
+			setup: func(harness *localAuthHarness) {
+				user := harness.repository.users[harness.userID]
+				user.Kind = UserKindEmergency
+				harness.repository.users[harness.userID] = user
+			},
+			login: func(harness *localAuthHarness) error {
+				_, err := harness.service.LoginLocal(context.Background(), LocalLoginCommand{Username: "release.operator", Password: "Wrong-Password-Value!"}, harness.request)
+				return err
+			},
+		},
+		"SSO mode": {
+			setup: func(harness *localAuthHarness) { harness.repository.login.Mode = LoginModeSSO },
+			login: func(harness *localAuthHarness) error {
+				_, err := harness.service.LoginLocal(context.Background(), LocalLoginCommand{Username: "release.operator", Password: "Wrong-Password-Value!"}, harness.request)
+				return err
+			},
+		},
+		"pending": {
+			setup: func(harness *localAuthHarness) {
+				user := harness.repository.users[harness.userID]
+				user.Status = UserStatusPending
+				harness.repository.users[harness.userID] = user
+			},
+			login: func(harness *localAuthHarness) error {
+				_, err := harness.service.LoginLocal(context.Background(), LocalLoginCommand{Username: "release.operator", Password: "Wrong-Password-Value!"}, harness.request)
+				return err
+			},
+		},
+		"disabled": {
+			setup: func(harness *localAuthHarness) {
+				user := harness.repository.users[harness.userID]
+				user.Status = UserStatusDisabled
+				harness.repository.users[harness.userID] = user
+			},
+			login: func(harness *localAuthHarness) error {
+				_, err := harness.service.LoginLocal(context.Background(), LocalLoginCommand{Username: "release.operator", Password: "Wrong-Password-Value!"}, harness.request)
+				return err
+			},
+		},
+		"already locked": {
+			setup: func(harness *localAuthHarness) {
+				credential := harness.repository.credentials[harness.userID]
+				credential.FailedAttempts = 5
+				credential.LockedUntil = harness.now.Add(5 * time.Minute)
+				harness.repository.credentials[harness.userID] = credential
+			},
+			login: func(harness *localAuthHarness) error {
+				for range 10 {
+					if _, err := harness.service.LoginLocal(context.Background(), LocalLoginCommand{Username: "release.operator", Password: "Wrong-Password-Value!"}, harness.request); !errors.Is(err, ErrLocalAuthenticationFailed) {
+						return err
+					}
+				}
+				return ErrLocalAuthenticationFailed
+			},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			harness := newActiveLocalAuthHarness(t, UserKindLocal, false, LoginModeLocal)
+			testCase.setup(harness)
+			before := harness.repository.credentials[harness.userID]
+			if err := testCase.login(harness); !errors.Is(err, ErrLocalAuthenticationFailed) {
+				t.Fatalf("login error = %v", err)
+			}
+			after := harness.repository.credentials[harness.userID]
+			if after.FailedAttempts != before.FailedAttempts || !after.LockedUntil.Equal(before.LockedUntil) {
+				t.Fatalf("ineligible login changed failure state: before=%+v after=%+v", before, after)
+			}
+		})
+	}
+}
+
 func TestLocalLoginEnforcesPersistentAccountAndIPLimitsWithoutSkippingAudit(t *testing.T) {
 	t.Parallel()
 	account := newActiveLocalAuthHarness(t, UserKindLocal, false, LoginModeLocal)
@@ -143,7 +257,7 @@ func TestLocalLoginEnforcesPersistentAccountAndIPLimitsWithoutSkippingAudit(t *t
 			t.Fatalf("account limit error = %v", err)
 		}
 	}
-	if len(account.auditor.commands) != 16 {
+	if len(account.auditor.commands) != 31 {
 		t.Fatalf("account limit audit count = %d", len(account.auditor.commands))
 	}
 	ip := newActiveLocalAuthHarness(t, UserKindLocal, false, LoginModeLocal)
@@ -154,8 +268,73 @@ func TestLocalLoginEnforcesPersistentAccountAndIPLimitsWithoutSkippingAudit(t *t
 			t.Fatalf("IP limit error = %v", err)
 		}
 	}
-	if len(ip.auditor.commands) != 61 {
+	if len(ip.auditor.commands) != 121 {
 		t.Fatalf("IP limit audit count = %d", len(ip.auditor.commands))
+	}
+}
+
+func TestIPLimitBoundsAnonymousAccountKeyCardinality(t *testing.T) {
+	harness := newActiveLocalAuthHarness(t, UserKindLocal, false, LoginModeLocal)
+	harness.service.policy.IPLimit = 10
+	harness.service.policy.AccountLimit = 1000
+	for attempt := 1; attempt <= 50; attempt++ {
+		username := fmt.Sprintf("anonymous-%03d", attempt)
+		_, _ = harness.service.LoginLocal(context.Background(), LocalLoginCommand{Username: username, Password: "Wrong-Password-Value!"}, harness.request)
+	}
+	accountKeys, ipKeys := 0, 0
+	for key := range harness.repository.rateLimits {
+		if strings.HasPrefix(key, string(RateLimitScopeAccount)+":") {
+			accountKeys++
+		}
+		if strings.HasPrefix(key, string(RateLimitScopeIP)+":") {
+			ipKeys++
+		}
+	}
+	if accountKeys != 10 || ipKeys != 1 {
+		t.Fatalf("rate-limit keys: account=%d ip=%d", accountKeys, ipKeys)
+	}
+}
+
+func TestAuthenticationAttemptAuditFailureRollsBackRateLimitState(t *testing.T) {
+	harness := newActiveLocalAuthHarness(t, UserKindLocal, false, LoginModeLocal)
+	auditFailure := errors.New("audit unavailable")
+	harness.auditor.err = auditFailure
+	_, err := harness.service.LoginLocal(context.Background(), LocalLoginCommand{
+		Username: "release.operator", Password: "Wrong-Password-Value!",
+	}, harness.request)
+	if !errors.Is(err, auditFailure) {
+		t.Fatalf("LoginLocal() error = %v", err)
+	}
+	if len(harness.repository.rateLimits) != 0 {
+		t.Fatalf("audit failure committed rate-limit state: %+v", harness.repository.rateLimits)
+	}
+}
+
+func TestAuthenticationAttemptPerformsBoundedExpiredRateLimitCleanup(t *testing.T) {
+	harness := newActiveLocalAuthHarness(t, UserKindLocal, false, LoginModeLocal)
+	for index := range 1000 {
+		harness.repository.rateLimits[fmt.Sprintf("expired:%04d", index)] = memoryRateWindow{
+			startedAt: harness.now.Add(-2 * time.Hour), expiresAt: harness.now.Add(-time.Hour), count: 1,
+		}
+	}
+	for index := range 20 {
+		harness.repository.rateLimits[fmt.Sprintf("current:%04d", index)] = memoryRateWindow{
+			startedAt: harness.now, expiresAt: harness.now.Add(time.Hour), count: 1,
+		}
+	}
+	_, _ = harness.service.LoginLocal(context.Background(), LocalLoginCommand{
+		Username: "unknown.operator", Password: "Wrong-Password-Value!",
+	}, harness.request)
+	expired, current := 0, 0
+	for _, window := range harness.repository.rateLimits {
+		if !window.expiresAt.After(harness.now) {
+			expired++
+		} else {
+			current++
+		}
+	}
+	if expired <= 0 || expired >= 1000 || current != 22 {
+		t.Fatalf("bounded cleanup result: expired=%d current=%d", expired, current)
 	}
 }
 
@@ -168,6 +347,24 @@ func TestAdministratorLoginRejectsReplayedMFAProof(t *testing.T) {
 	}
 	if _, err := harness.service.LoginLocal(context.Background(), command, harness.request); !errors.Is(err, ErrLocalAuthenticationFailed) {
 		t.Fatalf("LoginLocal(replayed MFA) error = %v", err)
+	}
+}
+
+func TestEmergencyLoginUsesDistinctNonSensitiveAuditIdentity(t *testing.T) {
+	harness := newActiveLocalAuthHarness(t, UserKindEmergency, false, LoginModeFault)
+	if _, err := harness.service.LoginEmergency(context.Background(), LocalLoginCommand{
+		Username: "release.operator", Password: "Current-Strong-Password!", MFAProof: "123456",
+	}, harness.request); err != nil {
+		t.Fatalf("LoginEmergency() error = %v", err)
+	}
+	command := harness.auditor.commands[len(harness.auditor.commands)-1]
+	if command.Action != "identity.emergency.login" || command.Metadata["entrypoint"] != "emergency" {
+		t.Fatalf("emergency audit = %+v", command)
+	}
+	for _, sensitive := range []string{"password", "mfa_proof", "mfa_secret_reference"} {
+		if _, exists := command.Metadata[sensitive]; exists {
+			t.Fatalf("emergency audit exposed %s: %+v", sensitive, command.Metadata)
+		}
 	}
 }
 
@@ -327,12 +524,52 @@ func TestLocalAuthenticationDoesNotMaskRepositoryFailuresAsCredentials(t *testin
 	}
 }
 
+func TestUnknownAndIneligibleAuthenticationUsesComparableArgon2Cost(t *testing.T) {
+	manager, err := NewPasswordManager(PasswordPolicyConfig{
+		MinimumLength: 16, MemoryKiB: 19 * 1024, Iterations: 1, Parallelism: 1, SaltBytes: 16, DerivedKeyBytes: 32,
+	}, staticBreachChecker(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual, err := manager.Hash(context.Background(), "Current-Strong-Password!")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dummy, err := NewDummyPasswordDigest(context.Background(), manager)
+	if err != nil {
+		t.Fatal(err)
+	}
+	elapsed := func(username string, mode LoginMode) time.Duration {
+		harness := newActiveLocalAuthHarness(t, UserKindLocal, false, mode)
+		harness.service.passwords = manager
+		harness.service.dummyPassword = dummy
+		credential := harness.repository.credentials[harness.userID]
+		credential.Password = actual
+		harness.repository.credentials[harness.userID] = credential
+		started := time.Now()
+		for range 3 {
+			_, _ = harness.service.LoginLocal(context.Background(), LocalLoginCommand{Username: username, Password: "Wrong-Password-Value!"}, harness.request)
+		}
+		return time.Since(started)
+	}
+	credentialFailure := elapsed("release.operator", LoginModeLocal)
+	for name, duration := range map[string]time.Duration{
+		"unknown account": elapsed("unknown.operator", LoginModeLocal),
+		"SSO rejected":    elapsed("release.operator", LoginModeSSO),
+	} {
+		if duration*4 < credentialFailure || credentialFailure*4 < duration {
+			t.Fatalf("%s Argon2 cost = %s, credential failure = %s", name, duration, credentialFailure)
+		}
+	}
+}
+
 type localAuthHarness struct {
 	service         *LocalAuthService
 	repository      *memoryLocalAuthRepository
 	passwords       *testPasswordManager
 	auditor         *lockedAuditRecorder
 	now             time.Time
+	clock           *time.Time
 	userID          uuid.UUID
 	activationToken string
 	request         RequestContext
@@ -341,6 +578,7 @@ type localAuthHarness struct {
 func newLocalAuthHarness(t *testing.T, kind UserKind, admin bool) *localAuthHarness {
 	t.Helper()
 	now := time.Date(2026, 8, 20, 10, 0, 0, 0, time.UTC)
+	clock := now
 	userID := uuid.MustParse("018f835d-7e4b-7abc-9f42-67a2f5f49001")
 	activationToken := "activation-token-with-at-least-256-bits-of-test-entropy"
 	digest := sha256.Sum256([]byte(activationToken))
@@ -359,20 +597,25 @@ func newLocalAuthHarness(t *testing.T, kind UserKind, admin bool) *localAuthHarn
 		sessions:   map[uuid.UUID]Session{},
 	}
 	passwords := &testPasswordManager{}
+	dummyPassword, err := passwords.Hash(context.Background(), "Dummy-Authentication-Password!")
+	if err != nil {
+		t.Fatal(err)
+	}
 	auditor := &lockedAuditRecorder{}
 	service, err := NewLocalAuthService(LocalAuthConfig{
-		Repository: repository,
-		Auditor:    auditor,
-		Passwords:  passwords,
-		MFA:        fixedMFAVerifier{proof: "123456", counter: 42},
-		Policy:     DefaultLocalAuthPolicy(),
-		Clock:      func() time.Time { return now },
+		Repository:    repository,
+		Auditor:       auditor,
+		Passwords:     passwords,
+		DummyPassword: dummyPassword,
+		MFA:           fixedMFAVerifier{proof: "123456", counter: 42},
+		Policy:        DefaultLocalAuthPolicy(),
+		Clock:         func() time.Time { return clock },
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return &localAuthHarness{
-		service: service, repository: repository, passwords: passwords, auditor: auditor, now: now,
+		service: service, repository: repository, passwords: passwords, auditor: auditor, now: now, clock: &clock,
 		userID: userID, activationToken: activationToken,
 		request: RequestContext{RequestID: "018f835d-7e4b-7abc-9f42-67a2f5f49002", SourceIP: "192.0.2.10"},
 	}
@@ -423,6 +666,7 @@ type memoryLocalAuthRepository struct {
 
 type memoryRateWindow struct {
 	startedAt time.Time
+	expiresAt time.Time
 	count     int
 }
 
@@ -432,13 +676,23 @@ func (repository *memoryLocalAuthRepository) WithinTransaction(_ context.Context
 	users := cloneUsers(repository.users)
 	credentials := cloneCredentials(repository.credentials)
 	history := cloneHistory(repository.history)
+	rateLimits := cloneRateLimits(repository.rateLimits)
 	err := function(nil)
 	if err != nil {
 		repository.users = users
 		repository.credentials = credentials
 		repository.history = history
+		repository.rateLimits = rateLimits
 	}
 	return err
+}
+
+func cloneRateLimits(source map[string]memoryRateWindow) map[string]memoryRateWindow {
+	result := make(map[string]memoryRateWindow, len(source))
+	for key, value := range source {
+		result[key] = value
+	}
+	return result
 }
 
 func (repository *memoryLocalAuthRepository) FindActivation(_ context.Context, _ pgx.Tx, digest string) (UserPrincipal, LocalCredential, []PasswordDigest, bool, error) {
@@ -504,15 +758,29 @@ func (repository *memoryLocalAuthRepository) FindLogin(_ context.Context, _ pgx.
 	return repository.login, UserPrincipal{}, LocalCredential{}, false, ErrLocalAuthenticationFailed
 }
 
-func (repository *memoryLocalAuthRepository) ConsumeRateLimit(_ context.Context, _ pgx.Tx, scope RateLimitScope, keyDigest string, windowStart time.Time, limit int, _ time.Time) (bool, error) {
+func (repository *memoryLocalAuthRepository) ConsumeRateLimit(_ context.Context, _ pgx.Tx, scope RateLimitScope, keyDigest string, windowStart time.Time, limit int, expiresAt time.Time) (bool, error) {
 	key := string(scope) + ":" + keyDigest
 	window := repository.rateLimits[key]
 	if !window.startedAt.Equal(windowStart) {
-		window = memoryRateWindow{startedAt: windowStart}
+		window = memoryRateWindow{startedAt: windowStart, expiresAt: expiresAt}
 	}
 	window.count++
 	repository.rateLimits[key] = window
 	return window.count <= limit, nil
+}
+
+func (repository *memoryLocalAuthRepository) CleanupExpiredRateLimits(_ context.Context, _ pgx.Tx, before time.Time, limit int) (int64, error) {
+	var removed int64
+	for key, window := range repository.rateLimits {
+		if removed >= int64(limit) {
+			break
+		}
+		if !window.expiresAt.After(before) {
+			delete(repository.rateLimits, key)
+			removed++
+		}
+	}
+	return removed, nil
 }
 
 func (repository *memoryLocalAuthRepository) SaveAuthenticationFailure(_ context.Context, _ pgx.Tx, userID uuid.UUID, failedAttempts int, lockedUntil time.Time) error {
@@ -565,11 +833,15 @@ func (verifier fixedMFAVerifier) Verify(_ context.Context, _ string, proof strin
 type lockedAuditRecorder struct {
 	mu       sync.Mutex
 	commands []audit.AppendCommand
+	err      error
 }
 
 func (recorder *lockedAuditRecorder) Append(_ context.Context, _ pgx.Tx, command audit.AppendCommand) (audit.Event, error) {
 	recorder.mu.Lock()
 	defer recorder.mu.Unlock()
+	if recorder.err != nil {
+		return audit.Event{}, recorder.err
+	}
 	recorder.commands = append(recorder.commands, command)
 	return audit.Event{}, nil
 }

@@ -53,6 +53,9 @@ func TestFaultDoesNotEnableRegularLocalLogin(t *testing.T) {
 	if harness.repository.login.Mode != LoginModeFault {
 		t.Fatalf("login mode = %q", harness.repository.login.Mode)
 	}
+	if harness.sessions.regularRevocations != 2 {
+		t.Fatalf("regular local session revocations = %d", harness.sessions.regularRevocations)
+	}
 }
 
 func TestCannotDisableLastUsableEmergencyAdministrator(t *testing.T) {
@@ -107,6 +110,9 @@ func TestCreateLocalUserStoresOnlyActivationDigestAndAuditsProvisioning(t *testi
 	}
 	if provisioning.ActivationToken == "" || provisioning.User.Status != UserStatusPending || provisioning.User.Username != "release.operator" {
 		t.Fatalf("provisioning = %+v", provisioning)
+	}
+	if provisioning.User.ID.Version() != 7 {
+		t.Fatalf("local user ID version = %d, want UUIDv7", provisioning.User.ID.Version())
 	}
 	credential := harness.repository.credentials[provisioning.User.ID]
 	wantDigest := sha256.Sum256([]byte(provisioning.ActivationToken))
@@ -192,7 +198,7 @@ func TestRoleBindingCreateAndDeleteAreAuditedAndOptimistic(t *testing.T) {
 	if len(harness.auditor.commands) != 2 || harness.auditor.commands[1].Action != "identity.role_binding.delete" {
 		t.Fatalf("audit commands = %+v", harness.auditor.commands)
 	}
-	if len(harness.sessions.subjects) != 1 || harness.sessions.subjects[0] != harness.emergencyAdminID {
+	if len(harness.sessions.subjects) != 2 || harness.sessions.subjects[0] != harness.emergencyAdminID || harness.sessions.subjects[1] != harness.emergencyAdminID {
 		t.Fatalf("revoked session subjects = %+v", harness.sessions.subjects)
 	}
 }
@@ -206,6 +212,115 @@ func TestHighRiskWritesFailClosedWithoutServerSideAuthority(t *testing.T) {
 	}, harness.proof(), harness.request)
 	if !errors.Is(err, ErrIAMConfiguration) {
 		t.Fatalf("CreateRoleBinding() error = %v", err)
+	}
+}
+
+func TestUserDisableAndRoleRemovalRollBackWhenSessionRevocationFails(t *testing.T) {
+	revocationFailure := errors.New("session store unavailable")
+	t.Run("disable user", func(t *testing.T) {
+		harness := newIAMHarness(t)
+		backupID := uuid.MustParse("018f835d-7e4b-7abc-9f42-67a2f5f48e15")
+		harness.repository.users[backupID] = UserPrincipal{ID: backupID, Username: "backup-break-glass", Kind: UserKindEmergency, Status: UserStatusActive, MFAEnrolled: true}
+		harness.sessions.err = revocationFailure
+		err := harness.service.DisableUser(context.Background(), harness.admin, harness.emergencyAdminID, "security response", harness.proof(), harness.request)
+		if !errors.Is(err, revocationFailure) {
+			t.Fatalf("DisableUser() error = %v", err)
+		}
+		if harness.repository.users[harness.emergencyAdminID].Status != UserStatusActive {
+			t.Fatalf("revocation failure committed disabled user: %+v", harness.repository.users[harness.emergencyAdminID])
+		}
+	})
+	t.Run("delete role binding", func(t *testing.T) {
+		harness := newIAMHarness(t)
+		binding, err := harness.service.CreateRoleBinding(context.Background(), harness.admin, CreateRoleBindingCommand{
+			SubjectType: SubjectTypeUser, SubjectID: harness.emergencyAdminID, Role: identity.RoleAdmin,
+			ScopeType: ScopeTypePlatform, Effect: BindingEffectAllow,
+		}, harness.proof(), harness.request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		harness.sessions.err = revocationFailure
+		err = harness.service.DeleteRoleBinding(context.Background(), harness.admin, binding.ID, binding.Version, harness.proof(), harness.request)
+		if !errors.Is(err, revocationFailure) {
+			t.Fatalf("DeleteRoleBinding() error = %v", err)
+		}
+		if _, exists := harness.repository.roleBindings[binding.ID]; !exists {
+			t.Fatal("revocation failure committed role-binding deletion")
+		}
+	})
+}
+
+func TestSessionRevocationDependentWritesFailClosedWithoutRevoker(t *testing.T) {
+	harness := newIAMHarness(t)
+	harness.service.sessions = nil
+	localUserID := uuid.MustParse("018f835d-7e4b-7abc-9f42-67a2f5f48e18")
+	harness.repository.users[localUserID] = UserPrincipal{ID: localUserID, Username: "local.user", Kind: UserKindLocal, Status: UserStatusActive, Version: 1}
+	if err := harness.service.DisableUser(context.Background(), harness.admin, localUserID, "security response", harness.proof(), harness.request); !errors.Is(err, ErrIAMConfiguration) {
+		t.Fatalf("DisableUser() error = %v", err)
+	}
+	bindingID := uuid.MustParse("018f835d-7e4b-7abc-9f42-67a2f5f48e19")
+	harness.repository.roleBindings[bindingID] = RoleBinding{
+		ID: bindingID, SubjectType: SubjectTypeUser, SubjectID: localUserID, Role: identity.RoleViewer,
+		ScopeType: ScopeTypePlatform, Effect: BindingEffectAllow, Version: 1,
+	}
+	if err := harness.service.DeleteRoleBinding(context.Background(), harness.admin, bindingID, 1, harness.proof(), harness.request); !errors.Is(err, ErrIAMConfiguration) {
+		t.Fatalf("DeleteRoleBinding() error = %v", err)
+	}
+}
+
+func TestOrganizationRoleRemovalRevokesCurrentMemberSessions(t *testing.T) {
+	harness := newIAMHarness(t)
+	organization, err := harness.service.CreateOrganization(context.Background(), harness.admin, CreateOrganizationCommand{Name: "Release Administrators"}, harness.request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding, err := harness.service.CreateRoleBinding(context.Background(), harness.admin, CreateRoleBindingCommand{
+		SubjectType: SubjectTypeOrganization, SubjectID: organization.ID, Role: identity.RoleAdmin,
+		ScopeType: ScopeTypePlatform, Effect: BindingEffectAllow,
+	}, harness.proof(), harness.request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := harness.service.DeleteRoleBinding(context.Background(), harness.admin, binding.ID, binding.Version, harness.proof(), harness.request); err != nil {
+		t.Fatalf("DeleteRoleBinding() error = %v", err)
+	}
+	if len(harness.sessions.organizations) != 2 || harness.sessions.organizations[0] != organization.ID || harness.sessions.organizations[1] != organization.ID {
+		t.Fatalf("revoked organizations = %+v", harness.sessions.organizations)
+	}
+}
+
+func TestDirectLocalAdministratorGrantRequiresMFAEnrollment(t *testing.T) {
+	harness := newIAMHarness(t)
+	localID := uuid.MustParse("018f835d-7e4b-7abc-9f42-67a2f5f48e16")
+	harness.repository.users[localID] = UserPrincipal{
+		ID: localID, Username: "local.operator", Kind: UserKindLocal, Status: UserStatusActive, MFAEnrolled: false,
+	}
+	_, err := harness.service.CreateRoleBinding(context.Background(), harness.admin, CreateRoleBindingCommand{
+		SubjectType: SubjectTypeUser, SubjectID: localID, Role: identity.RoleAdmin,
+		ScopeType: ScopeTypePlatform, Effect: BindingEffectAllow,
+	}, harness.proof(), harness.request)
+	if !errors.Is(err, ErrRoleBindingInvalid) {
+		t.Fatalf("CreateRoleBinding(local admin without MFA) error = %v", err)
+	}
+	if len(harness.repository.roleBindings) != 0 {
+		t.Fatalf("unsafe administrator binding persisted: %+v", harness.repository.roleBindings)
+	}
+}
+
+func TestAdministratorElevationRevokesExistingSubjectSessions(t *testing.T) {
+	harness := newIAMHarness(t)
+	localID := uuid.MustParse("018f835d-7e4b-7abc-9f42-67a2f5f48e17")
+	harness.repository.users[localID] = UserPrincipal{
+		ID: localID, Username: "local.mfa.operator", Kind: UserKindLocal, Status: UserStatusActive, MFAEnrolled: true,
+	}
+	if _, err := harness.service.CreateRoleBinding(context.Background(), harness.admin, CreateRoleBindingCommand{
+		SubjectType: SubjectTypeUser, SubjectID: localID, Role: identity.RoleAdmin,
+		ScopeType: ScopeTypePlatform, Effect: BindingEffectAllow,
+	}, harness.proof(), harness.request); err != nil {
+		t.Fatalf("CreateRoleBinding() error = %v", err)
+	}
+	if len(harness.sessions.subjects) != 1 || harness.sessions.subjects[0] != localID {
+		t.Fatalf("elevated subject session revocations = %+v", harness.sessions.subjects)
 	}
 }
 
@@ -303,7 +418,42 @@ type memoryIAMRepository struct {
 }
 
 func (repository *memoryIAMRepository) WithinTransaction(_ context.Context, function func(pgx.Tx) error) error {
-	return function(nil)
+	login := repository.login
+	users := cloneIAMUsers(repository.users)
+	sources := cloneIAMSources(repository.sources)
+	bindings := cloneIAMRoleBindings(repository.roleBindings)
+	err := function(nil)
+	if err != nil {
+		repository.login = login
+		repository.users = users
+		repository.sources = sources
+		repository.roleBindings = bindings
+	}
+	return err
+}
+
+func cloneIAMUsers(source map[uuid.UUID]UserPrincipal) map[uuid.UUID]UserPrincipal {
+	result := make(map[uuid.UUID]UserPrincipal, len(source))
+	for key, value := range source {
+		result[key] = value
+	}
+	return result
+}
+
+func cloneIAMSources(source map[uuid.UUID]IdentitySource) map[uuid.UUID]IdentitySource {
+	result := make(map[uuid.UUID]IdentitySource, len(source))
+	for key, value := range source {
+		result[key] = value
+	}
+	return result
+}
+
+func cloneIAMRoleBindings(source map[uuid.UUID]RoleBinding) map[uuid.UUID]RoleBinding {
+	result := make(map[uuid.UUID]RoleBinding, len(source))
+	for key, value := range source {
+		result[key] = value
+	}
+	return result
 }
 
 func (repository *memoryIAMRepository) GetLoginState(context.Context, pgx.Tx) (LoginState, error) {
@@ -475,11 +625,33 @@ func (recorder *iamAuditRecorder) Append(_ context.Context, _ pgx.Tx, command au
 }
 
 type iamSessionRecorder struct {
-	subjects []uuid.UUID
+	subjects           []uuid.UUID
+	organizations      []uuid.UUID
+	err                error
+	regularRevocations int
 }
 
-func (recorder *iamSessionRecorder) RevokeSubject(_ context.Context, subject uuid.UUID, _ string) error {
+func (recorder *iamSessionRecorder) RevokeRegularLocalSessions(_ context.Context, _ pgx.Tx, _ string) error {
+	if recorder.err != nil {
+		return recorder.err
+	}
+	recorder.regularRevocations++
+	return nil
+}
+
+func (recorder *iamSessionRecorder) RevokeSubject(_ context.Context, _ pgx.Tx, subject uuid.UUID, _ string) error {
+	if recorder.err != nil {
+		return recorder.err
+	}
 	recorder.subjects = append(recorder.subjects, subject)
+	return nil
+}
+
+func (recorder *iamSessionRecorder) RevokeOrganizationMembers(_ context.Context, _ pgx.Tx, organization uuid.UUID, _ string) error {
+	if recorder.err != nil {
+		return recorder.err
+	}
+	recorder.organizations = append(recorder.organizations, organization)
 	return nil
 }
 

@@ -103,3 +103,30 @@ func TestLocalAdminIsDevelopmentOnly(t *testing.T) {
 		t.Fatalf("NewLocalAdminVerifier() error = %v, want %v", err, ErrLocalAdminForbidden)
 	}
 }
+
+func TestGovernedLocalAdministratorRequiresMFAAssurance(t *testing.T) {
+	t.Parallel()
+	principal := Principal{
+		Subject: "local.operator", Kind: PrincipalKindLocal, Governed: true,
+		RoleScopes: []RoleScope{{Role: RoleAdmin, Effect: "allow", ScopeType: "platform"}},
+	}
+	if err := NewAuthorizer().Require(principal, ActionIdentityManage, ""); !errors.Is(err, ErrActionDenied) {
+		t.Fatalf("MFA=0 local administrator authorization error = %v", err)
+	}
+	principal.AuthenticationAssurance = 1
+	if err := NewAuthorizer().Require(principal, ActionIdentityManage, ""); err != nil {
+		t.Fatalf("MFA=1 local administrator authorization error = %v", err)
+	}
+}
+
+func TestUngovernedLocalAdministratorRequiresMFAAssurance(t *testing.T) {
+	authorizer := NewAuthorizer()
+	principal := Principal{Subject: "local.admin", Kind: PrincipalKindLocal, Roles: []Role{RoleAdmin}}
+	if err := authorizer.Require(principal, ActionIdentityManage, ""); !errors.Is(err, ErrActionDenied) {
+		t.Fatalf("MFA=0 local administrator error = %v", err)
+	}
+	principal.AuthenticationAssurance = 1
+	if err := authorizer.Require(principal, ActionIdentityManage, ""); err != nil {
+		t.Fatalf("MFA=1 local administrator error = %v", err)
+	}
+}
