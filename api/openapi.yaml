@@ -1516,6 +1516,127 @@ paths:
                 $ref: '#/components/schemas/IdentitySource'
         '409':
           $ref: '#/components/responses/Conflict'
+  /api/v1/identity-sources/{source_id}/verify:
+    post:
+      operationId: verifyIdentitySource
+      summary: 使用受信任 Secret 配置验证身份源连接与能力
+      description: 读取 OIDC discovery/JWKS 或 SCIM ServiceProviderConfig/ResourceTypes；响应不返回 Secret、Token、CA 或上游正文。
+      tags: [Identity Governance]
+      x-required-action: identity.manage
+      parameters: [{$ref: '#/components/parameters/IdentitySourceIDPath'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/IdentitySourceVersionRequest'}
+      responses:
+        '200':
+          description: 连接与映射能力已验证
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DirectoryCapabilityReport'}
+        '400': {$ref: '#/components/responses/UnprocessableEntity'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/UnprocessableEntity'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '502': {$ref: '#/components/responses/BadGateway'}
+  /api/v1/identity-sources/{source_id}/sync-preview:
+    post:
+      operationId: previewIdentitySourceSynchronization
+      summary: 创建耐久目录同步预览作业
+      description: 作业经持久 Outbox 由 worker 执行；响应不暴露 worker 游标或运行标记。
+      tags: [Identity Governance]
+      x-required-action: identity.manage
+      parameters: [{$ref: '#/components/parameters/IdentitySourceIDPath'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/IdentitySourceVersionRequest'}
+      responses:
+        '202':
+          description: 预览作业已创建；Location 指向来源范围内的作业查询端点。
+          headers:
+            Location:
+              schema: {type: string}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DirectorySyncJob'}
+        '400': {$ref: '#/components/responses/UnprocessableEntity'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /api/v1/identity-sources/{source_id}/sync:
+    post:
+      operationId: applyIdentitySourceSynchronization
+      summary: 创建耐久 SCIM 目录同步应用作业
+      description: OIDC 来源不支持应用；SCIM 应用保持本地字段所有权并为冲突对象保留最后安全状态。
+      tags: [Identity Governance]
+      x-required-action: identity.manage
+      parameters: [{$ref: '#/components/parameters/IdentitySourceIDPath'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/IdentitySourceVersionRequest'}
+      responses:
+        '202':
+          description: 应用作业已创建；Location 指向来源范围内的作业查询端点。
+          headers:
+            Location:
+              schema: {type: string}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DirectorySyncJob'}
+        '400': {$ref: '#/components/responses/UnprocessableEntity'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/UnprocessableEntity'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /api/v1/identity-sources/{source_id}/sync-jobs/{job_id}:
+    get:
+      operationId: getIdentitySourceSynchronizationJob
+      summary: 查询来源范围内的目录同步作业
+      tags: [Identity Governance]
+      x-required-action: identity.manage
+      parameters:
+        - $ref: '#/components/parameters/IdentitySourceIDPath'
+        - $ref: '#/components/parameters/DirectorySyncJobIDPath'
+      responses:
+        '200':
+          description: 作业状态与脱敏计数
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DirectorySyncJob'}
+        '400': {$ref: '#/components/responses/UnprocessableEntity'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /api/v1/identity-sources/{source_id}/sync-conflicts:
+    get:
+      operationId: listIdentitySourceSynchronizationConflicts
+      summary: 分页查询来源范围内的目录同步冲突
+      description: details 仅包含稳定标识、字段名、摘要与计数，不包含完整上游对象或 Secret。
+      tags: [Identity Governance]
+      x-required-action: identity.manage
+      parameters:
+        - $ref: '#/components/parameters/IdentitySourceIDPath'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: 冲突页
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DirectorySyncConflictPage'}
+        '400': {$ref: '#/components/responses/UnprocessableEntity'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/InternalError'}
   /api/v1/identity-sources/{source_id}/enable:
     post:
       operationId: enableIdentitySourceSSO
@@ -1636,6 +1757,13 @@ components:
       schema:
         type: string
         format: uuid
+    DirectorySyncJobIDPath:
+      name: job_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
     UserIDPath:
       name: user_id
       in: path
@@ -1728,6 +1856,12 @@ components:
             $ref: '#/components/schemas/ProblemDetails'
     UnprocessableEntity:
       description: 请求字段或业务规则校验失败
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    BadGateway:
+      description: 受信任目录上游拒绝请求或返回无效响应；响应不回显上游正文。
       content:
         application/problem+json:
           schema:
@@ -2833,6 +2967,95 @@ components:
           type: array
           items: {$ref: '#/components/schemas/IdentitySource'}
         next_cursor: {type: string}
+    IdentitySourceVersionRequest:
+      type: object
+      additionalProperties: false
+      required: [version]
+      properties:
+        version: {type: integer, minimum: 1}
+    DirectoryCapabilityReport:
+      type: object
+      additionalProperties: false
+      required: [reachable, required_mappings, required_mappings_complete, supports_incremental, supports_pagination]
+      properties:
+        reachable: {type: boolean}
+        required_mappings:
+          type: array
+          maxItems: 32
+          uniqueItems: true
+          items: {type: string, maxLength: 128}
+        required_mappings_complete: {type: boolean}
+        supports_incremental: {type: boolean}
+        supports_pagination: {type: boolean}
+    DirectorySyncJob:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - identity_source_id
+        - source_version
+        - mode
+        - status
+        - create_count
+        - update_count
+        - disable_count
+        - conflict_count
+        - processed_users
+        - processed_organizations
+        - processed_memberships
+        - requested_by
+        - request_id
+        - created_at
+        - updated_at
+      properties:
+        id: {type: string, format: uuid}
+        identity_source_id: {type: string, format: uuid}
+        source_version: {type: integer, minimum: 1}
+        mode: {type: string, enum: [preview, apply]}
+        status: {type: string, enum: [pending, running, completed, failed]}
+        create_count: {type: integer, minimum: 0}
+        update_count: {type: integer, minimum: 0}
+        disable_count: {type: integer, minimum: 0}
+        conflict_count: {type: integer, minimum: 0}
+        processed_users: {type: integer, minimum: 0}
+        processed_organizations: {type: integer, minimum: 0}
+        processed_memberships: {type: integer, minimum: 0}
+        error_code:
+          type: string
+          pattern: '^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$'
+          maxLength: 128
+        requested_by: {type: string, minLength: 1, maxLength: 256}
+        request_id: {type: string, format: uuid}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+        completed_at: {type: string, format: date-time}
+    DirectorySyncConflict:
+      type: object
+      additionalProperties: false
+      required: [id, sync_job_id, identity_source_id, object_type, external_id, code, details, status, created_at]
+      properties:
+        id: {type: string, format: uuid}
+        sync_job_id: {type: string, format: uuid}
+        identity_source_id: {type: string, format: uuid}
+        object_type: {type: string, enum: [user, organization, membership]}
+        external_id: {type: string, minLength: 1, maxLength: 512}
+        code: {type: string, pattern: '^[A-Z][A-Z0-9_]{2,63}$'}
+        details:
+          type: object
+          additionalProperties: true
+          maxProperties: 8
+        status: {type: string, enum: [open, resolved]}
+        created_at: {type: string, format: date-time}
+    DirectorySyncConflictPage:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          maxItems: 200
+          items: {$ref: '#/components/schemas/DirectorySyncConflict'}
+        next_cursor: {type: string, maxLength: 512}
     ActivateLocalAccountRequest:
       type: object
       additionalProperties: false

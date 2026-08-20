@@ -43,6 +43,7 @@ type apiRuntimeConfig struct {
 	DefaultProductID     string
 	DefaultChannel       string
 	LocalAuth            iam.LocalAuthRuntimeConfig
+	Directory            iam.DirectoryRuntimeConfig
 }
 
 func main() {
@@ -186,6 +187,14 @@ func run(ctx context.Context, arguments []string, environ map[string]string) err
 		return fmt.Errorf("configure IAM secret resolver: %w", err)
 	}
 	defer secretResolver.Close()
+	directoryAdapter, err := iam.NewSecretBackedDirectoryAdapter(iam.SecretBackedDirectoryAdapterConfig{
+		Secrets: secretResolver, RequestTimeout: runtimeConfig.Directory.RequestTimeout,
+		MaximumPages: runtimeConfig.Directory.MaximumPages, MaximumObjects: runtimeConfig.Directory.MaximumObjects,
+		AllowLoopbackHTTP: runtimeConfig.Directory.AllowLoopbackHTTP,
+	})
+	if err != nil {
+		return fmt.Errorf("configure IAM directory adapter: %w", err)
+	}
 	mfaVerifier, err := iam.NewTOTPVerifier(runtimeConfig.LocalAuth.TOTP, secretResolver, time.Now)
 	if err != nil {
 		return fmt.Errorf("configure IAM TOTP verifier: %w", err)
@@ -222,9 +231,15 @@ func run(ctx context.Context, arguments []string, environ map[string]string) err
 	if err != nil {
 		return fmt.Errorf("configure governed IAM principal resolver: %w", err)
 	}
+	directorySyncService, err := iam.NewDirectorySyncService(iam.DirectorySyncServiceConfig{
+		Store: iamRepository, Jobs: jobRepository, Auditor: auditor, Clock: time.Now,
+	})
+	if err != nil {
+		return fmt.Errorf("configure IAM directory sync service: %w", err)
+	}
 	iamService, err := iam.NewService(iam.ServiceConfig{
 		Repository: iamRepository, ScopeCatalog: iamRepository, BreakGlass: iam.NewBreakGlassInvariantAuthority(iamRepository), Auditor: auditor, Sessions: iamRepository, Passwords: iamPasswords,
-		HighRisk: reauthenticationService, Clock: time.Now,
+		Directory: directoryAdapter, DirectorySync: directorySyncService, HighRisk: reauthenticationService, Clock: time.Now,
 	})
 	if err != nil {
 		return fmt.Errorf("configure IAM service: %w", err)
@@ -327,6 +342,11 @@ func loadAPIRuntimeConfig(environ map[string]string, environment string) (apiRun
 		return apiRuntimeConfig{}, fmt.Errorf("local authentication settings: %w", errAPIRuntimeConfiguration)
 	}
 	result.LocalAuth = localAuth
+	directory, err := iam.LoadDirectoryRuntimeConfig(environ, environment)
+	if err != nil {
+		return apiRuntimeConfig{}, fmt.Errorf("directory settings: %w", errAPIRuntimeConfiguration)
+	}
+	result.Directory = directory
 	return result, nil
 }
 

@@ -15,6 +15,7 @@ import (
 
 	"xminds-release-platform/internal/audit"
 	"xminds-release-platform/internal/catalog"
+	"xminds-release-platform/internal/iam"
 	"xminds-release-platform/internal/platform/buildinfo"
 	"xminds-release-platform/internal/platform/config"
 	"xminds-release-platform/internal/platform/database"
@@ -45,6 +46,7 @@ type workerRuntimeConfig struct {
 	KeyRefs              catalog.RoleKeyRefs
 	AuditExportTempDir   string
 	PollInterval         time.Duration
+	Directory            iam.DirectoryRuntimeConfig
 }
 
 func main() {
@@ -126,16 +128,44 @@ func run(ctx context.Context, environ map[string]string) error {
 	if err != nil {
 		return fmt.Errorf("configure audit export handler: %w", err)
 	}
+	directorySecrets, err := iam.NewDirectorySecretResolver(runtimeConfig.Directory.SecretDirectory)
+	if err != nil {
+		return fmt.Errorf("configure IAM directory secret resolver: %w", err)
+	}
+	defer directorySecrets.Close()
+	directoryAdapter, err := iam.NewSecretBackedDirectoryAdapter(iam.SecretBackedDirectoryAdapterConfig{
+		Secrets: directorySecrets, RequestTimeout: runtimeConfig.Directory.RequestTimeout,
+		MaximumPages: runtimeConfig.Directory.MaximumPages, MaximumObjects: runtimeConfig.Directory.MaximumObjects,
+		AllowLoopbackHTTP: runtimeConfig.Directory.AllowLoopbackHTTP,
+	})
+	if err != nil {
+		return fmt.Errorf("configure IAM directory adapter: %w", err)
+	}
+	iamRepository := iam.NewPostgresRepository(pool)
+	directoryExecutor, err := iam.NewPostgresDirectorySyncExecutor(iam.PostgresDirectorySyncExecutorConfig{
+		Pool: pool, Auditor: auditor, Sessions: iamRepository, Clock: time.Now,
+	})
+	if err != nil {
+		return fmt.Errorf("configure IAM directory sync executor: %w", err)
+	}
+	directoryHandler, err := iam.NewDirectorySyncHandler(iam.DirectorySyncHandlerConfig{
+		Executor: directoryExecutor, Directory: directoryAdapter,
+	})
+	if err != nil {
+		return fmt.Errorf("configure IAM directory sync handler: %w", err)
+	}
 
 	handlers := jobs.NewHandlerRegistry(map[string]jobs.Handler{
 		catalog.JobKindCatalogPublish: publication,
 		catalog.JobKindCatalogRevoke:  publication,
 		audit.JobKindAuditExport:      exportHandler,
+		iam.JobKindDirectorySync:      directoryHandler,
 	})
 	deadLetters := jobs.NewDeadLetterRegistry(map[string]jobs.DeadLetterHandler{
 		catalog.JobKindCatalogPublish: publication,
 		catalog.JobKindCatalogRevoke:  publication,
 		audit.JobKindAuditExport:      exportHandler,
+		iam.JobKindDirectorySync:      directoryHandler,
 	})
 	renewInterval := configuration.JobLease / 3
 	if renewInterval > 10*time.Second {
@@ -197,6 +227,10 @@ func loadWorkerRuntimeConfig(environ map[string]string) (workerRuntimeConfig, er
 		if err != nil || result.PollInterval < minimumWorkerPollInterval || result.PollInterval > maximumWorkerPollInterval {
 			return workerRuntimeConfig{}, errWorkerRuntimeConfiguration
 		}
+	}
+	result.Directory, err = iam.LoadDirectoryRuntimeConfig(environ, environ["XMINDS_RELEASE_ENVIRONMENT"])
+	if err != nil {
+		return workerRuntimeConfig{}, errWorkerRuntimeConfiguration
 	}
 	return result, nil
 }

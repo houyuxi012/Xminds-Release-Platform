@@ -34,6 +34,7 @@ func TestLoadWorkerRuntimeConfigRequiresEverySecretAndSigningSetting(t *testing.
 		"XMINDS_RELEASE_CATALOG_SNAPSHOT_KEY_REFS",
 		"XMINDS_RELEASE_CATALOG_TIMESTAMP_KEY_REFS",
 		"XMINDS_RELEASE_CATALOG_REVOCATION_KEY_REFS",
+		"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY",
 	} {
 		key := key
 		t.Run(key, func(t *testing.T) {
@@ -62,7 +63,7 @@ func TestLoadWorkerRuntimeConfigParsesValidatedSettings(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadWorkerRuntimeConfig() error = %v", err)
 	}
-	if got.PollInterval != 750*time.Millisecond || got.Region != "cn-east-1" || got.SessionToken != "temporary-session-token" || got.AuditExportTempDir != "/var/tmp/xminds-audit" {
+	if got.PollInterval != 750*time.Millisecond || got.Region != "cn-east-1" || got.SessionToken != "temporary-session-token" || got.AuditExportTempDir != "/var/tmp/xminds-audit" || got.Directory.SecretDirectory != "/run/secrets/iam" {
 		t.Fatalf("parsed runtime config = %+v", got)
 	}
 	if !reflect.DeepEqual(got.KeyRefs.Targets, []string{"targets-1", "targets-2"}) {
@@ -103,5 +104,6 @@ func validWorkerRuntimeEnvironment() map[string]string {
 		"XMINDS_RELEASE_CATALOG_SNAPSHOT_KEY_REFS":   "snapshot-1",
 		"XMINDS_RELEASE_CATALOG_TIMESTAMP_KEY_REFS":  "timestamp-1",
 		"XMINDS_RELEASE_CATALOG_REVOCATION_KEY_REFS": "revocation-1",
+		"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY":    "/run/secrets/iam",
 	}
 }

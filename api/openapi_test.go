@@ -283,3 +283,40 @@ func TestOpenAPIDefinesPublicLocalAuthenticationWithoutSensitiveResponseFields(t
 		}
 	}
 }
+
+func TestOpenAPIDefinesDurableDirectorySynchronizationWithoutWorkerState(t *testing.T) {
+	t.Parallel()
+	loader := openapi3.NewLoader()
+	document, err := loader.LoadFromFile("openapi.yaml")
+	if err != nil {
+		t.Fatalf("load OpenAPI contract: %v", err)
+	}
+	for _, testCase := range []struct {
+		path   string
+		method string
+	}{
+		{path: "/api/v1/identity-sources/{source_id}/verify", method: "POST"},
+		{path: "/api/v1/identity-sources/{source_id}/sync-preview", method: "POST"},
+		{path: "/api/v1/identity-sources/{source_id}/sync", method: "POST"},
+		{path: "/api/v1/identity-sources/{source_id}/sync-jobs/{job_id}", method: "GET"},
+		{path: "/api/v1/identity-sources/{source_id}/sync-conflicts", method: "GET"},
+	} {
+		pathItem := document.Paths.Find(testCase.path)
+		if pathItem == nil || pathItem.GetOperation(testCase.method) == nil {
+			t.Fatalf("missing %s %s operation", testCase.method, testCase.path)
+		}
+		operation := pathItem.GetOperation(testCase.method)
+		if operation.Extensions["x-required-action"] != "identity.manage" {
+			t.Fatalf("%s %s action = %#v", testCase.method, testCase.path, operation.Extensions["x-required-action"])
+		}
+	}
+	job := document.Components.Schemas["DirectorySyncJob"]
+	if job == nil || job.Value == nil {
+		t.Fatal("DirectorySyncJob schema is missing")
+	}
+	for _, forbidden := range []string{"secret_reference", "bearer_token", "ca_reference", "cursor", "phase", "run_marker"} {
+		if _, found := job.Value.Properties[forbidden]; found {
+			t.Fatalf("DirectorySyncJob exposes %s", forbidden)
+		}
+	}
+}

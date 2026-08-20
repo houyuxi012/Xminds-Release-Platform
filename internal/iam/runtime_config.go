@@ -8,7 +8,18 @@ import (
 	"time"
 )
 
-var ErrLocalAuthRuntimeConfiguration = errors.New("local authentication runtime configuration is invalid")
+var (
+	ErrLocalAuthRuntimeConfiguration = errors.New("local authentication runtime configuration is invalid")
+	ErrDirectoryRuntimeConfiguration = errors.New("directory runtime configuration is invalid")
+)
+
+type DirectoryRuntimeConfig struct {
+	SecretDirectory   string
+	RequestTimeout    time.Duration
+	MaximumPages      int
+	MaximumObjects    int
+	AllowLoopbackHTTP bool
+}
 
 type LocalAuthRuntimeConfig struct {
 	BreachCorpusPath           string
@@ -18,6 +29,52 @@ type LocalAuthRuntimeConfig struct {
 	TOTP                       TOTPConfig
 	Policy                     LocalAuthPolicy
 	Reauthentication           ReauthenticationPolicy
+}
+
+func LoadDirectoryRuntimeConfig(environ map[string]string, environment string) (DirectoryRuntimeConfig, error) {
+	configuration := DirectoryRuntimeConfig{
+		SecretDirectory: strings.TrimSpace(environ["XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY"]),
+		RequestTimeout:  defaultDirectoryRequestTimeout,
+		MaximumPages:    defaultDirectoryMaximumPages,
+		MaximumObjects:  defaultDirectoryMaximumObjects,
+	}
+	if configuration.SecretDirectory == "" || !filepath.IsAbs(configuration.SecretDirectory) {
+		return DirectoryRuntimeConfig{}, ErrDirectoryRuntimeConfiguration
+	}
+	configuration.SecretDirectory = filepath.Clean(configuration.SecretDirectory)
+
+	var err error
+	if raw := strings.TrimSpace(environ["XMINDS_RELEASE_IAM_DIRECTORY_REQUEST_TIMEOUT"]); raw != "" {
+		configuration.RequestTimeout, err = time.ParseDuration(raw)
+		if err != nil {
+			return DirectoryRuntimeConfig{}, ErrDirectoryRuntimeConfiguration
+		}
+	}
+	if raw := strings.TrimSpace(environ["XMINDS_RELEASE_IAM_DIRECTORY_MAXIMUM_PAGES"]); raw != "" {
+		configuration.MaximumPages, err = strconv.Atoi(raw)
+		if err != nil {
+			return DirectoryRuntimeConfig{}, ErrDirectoryRuntimeConfiguration
+		}
+	}
+	if raw := strings.TrimSpace(environ["XMINDS_RELEASE_IAM_DIRECTORY_MAXIMUM_OBJECTS"]); raw != "" {
+		configuration.MaximumObjects, err = strconv.Atoi(raw)
+		if err != nil {
+			return DirectoryRuntimeConfig{}, ErrDirectoryRuntimeConfiguration
+		}
+	}
+	loopback := strings.ToLower(strings.TrimSpace(environ["XMINDS_RELEASE_IAM_DIRECTORY_ALLOW_LOOPBACK_HTTP"]))
+	if loopback != "" && loopback != "true" && loopback != "false" {
+		return DirectoryRuntimeConfig{}, ErrDirectoryRuntimeConfiguration
+	}
+	configuration.AllowLoopbackHTTP = loopback == "true"
+	environment = strings.ToLower(strings.TrimSpace(environment))
+	if configuration.RequestTimeout < minimumDirectoryRequestTimeout || configuration.RequestTimeout > maximumDirectoryRequestTimeout ||
+		configuration.MaximumPages < 1 || configuration.MaximumPages > defaultDirectoryMaximumPages ||
+		configuration.MaximumObjects < 1 || configuration.MaximumObjects > defaultDirectoryMaximumObjects ||
+		(configuration.AllowLoopbackHTTP && environment != "development" && environment != "test") {
+		return DirectoryRuntimeConfig{}, ErrDirectoryRuntimeConfiguration
+	}
+	return configuration, nil
 }
 
 func LoadLocalAuthRuntimeConfig(environ map[string]string, environment string) (LocalAuthRuntimeConfig, error) {

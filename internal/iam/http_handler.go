@@ -41,6 +41,13 @@ type IAMApplication interface {
 	DisableSSO(ctx context.Context, actor identity.Principal, sourceID uuid.UUID, expectedVersion int64, proof HighRiskProof, request RequestContext) error
 }
 
+type DirectorySyncApplication interface {
+	VerifyIdentitySourceVersioned(ctx context.Context, actor identity.Principal, sourceID uuid.UUID, expectedVersion int64, request RequestContext) (CapabilityReport, error)
+	StartDirectorySync(ctx context.Context, actor identity.Principal, sourceID uuid.UUID, mode DirectorySyncMode, expectedVersion int64, request RequestContext) (DirectorySyncJob, error)
+	GetDirectorySyncJob(ctx context.Context, actor identity.Principal, sourceID, jobID uuid.UUID) (DirectorySyncJob, error)
+	ListDirectorySyncConflicts(ctx context.Context, actor identity.Principal, sourceID uuid.UUID, page Page) (DirectorySyncConflictPage, error)
+}
+
 func NewHTTPHandler(application IAMApplication) http.Handler {
 	if application == nil {
 		return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -77,6 +84,128 @@ func RegisterRoutes(router chi.Router, application IAMApplication) {
 		router.Post("/{source_id}/enable", identitySourceLifecycleHandler(application, true))
 		router.Post("/{source_id}/disable", identitySourceLifecycleHandler(application, false))
 	})
+	if directory, ok := application.(DirectorySyncApplication); ok {
+		registerDirectorySyncRoutes(router, directory)
+	}
+}
+
+func registerDirectorySyncRoutes(router chi.Router, application DirectorySyncApplication) {
+	router.Post("/api/v1/identity-sources/{source_id}/verify", verifyIdentitySourceHandler(application))
+	router.Post("/api/v1/identity-sources/{source_id}/sync-preview", startDirectorySyncHandler(application, DirectorySyncModePreview))
+	router.Post("/api/v1/identity-sources/{source_id}/sync", startDirectorySyncHandler(application, DirectorySyncModeApply))
+	router.Get("/api/v1/identity-sources/{source_id}/sync-jobs/{job_id}", getDirectorySyncJobHandler(application))
+	router.Get("/api/v1/identity-sources/{source_id}/sync-conflicts", listDirectorySyncConflictsHandler(application))
+}
+
+func verifyIdentitySourceHandler(application DirectorySyncApplication) http.HandlerFunc {
+	type input struct {
+		Version int64 `json:"version"`
+	}
+	return func(writer http.ResponseWriter, request *http.Request) {
+		principal, ok := requireIAMPrincipal(writer, request)
+		if !ok {
+			return
+		}
+		sourceID, ok := parseDirectoryPathID(writer, request, "source_id", "IDENTITY_SOURCE_ID_INVALID")
+		if !ok {
+			return
+		}
+		var body input
+		if err := decodeIAMJSON(request, &body); err != nil || body.Version < 1 {
+			writeIAMProblem(writer, request, http.StatusBadRequest, "REQUEST_BODY_INVALID", "Request body is invalid", ErrIdentitySourceInputInvalid)
+			return
+		}
+		report, err := application.VerifyIdentitySourceVersioned(request.Context(), principal, sourceID, body.Version, iamRequestContext(request))
+		if err != nil {
+			writeIAMApplicationError(writer, request, err)
+			return
+		}
+		writeIAMJSON(writer, http.StatusOK, report)
+	}
+}
+
+func startDirectorySyncHandler(application DirectorySyncApplication, mode DirectorySyncMode) http.HandlerFunc {
+	type input struct {
+		Version int64 `json:"version"`
+	}
+	return func(writer http.ResponseWriter, request *http.Request) {
+		principal, ok := requireIAMPrincipal(writer, request)
+		if !ok {
+			return
+		}
+		sourceID, ok := parseDirectoryPathID(writer, request, "source_id", "IDENTITY_SOURCE_ID_INVALID")
+		if !ok {
+			return
+		}
+		var body input
+		if err := decodeIAMJSON(request, &body); err != nil || body.Version < 1 {
+			writeIAMProblem(writer, request, http.StatusBadRequest, "REQUEST_BODY_INVALID", "Request body is invalid", ErrIdentitySourceInputInvalid)
+			return
+		}
+		job, err := application.StartDirectorySync(request.Context(), principal, sourceID, mode, body.Version, iamRequestContext(request))
+		if err != nil {
+			writeIAMApplicationError(writer, request, err)
+			return
+		}
+		writer.Header().Set("Location", "/api/v1/identity-sources/"+sourceID.String()+"/sync-jobs/"+job.ID.String())
+		writeIAMJSON(writer, http.StatusAccepted, toDirectorySyncJobResponse(job))
+	}
+}
+
+func getDirectorySyncJobHandler(application DirectorySyncApplication) http.HandlerFunc {
+	return func(writer http.ResponseWriter, request *http.Request) {
+		principal, ok := requireIAMPrincipal(writer, request)
+		if !ok {
+			return
+		}
+		sourceID, ok := parseDirectoryPathID(writer, request, "source_id", "IDENTITY_SOURCE_ID_INVALID")
+		if !ok {
+			return
+		}
+		jobID, ok := parseDirectoryPathID(writer, request, "job_id", "DIRECTORY_SYNC_JOB_ID_INVALID")
+		if !ok {
+			return
+		}
+		job, err := application.GetDirectorySyncJob(request.Context(), principal, sourceID, jobID)
+		if err != nil {
+			writeIAMApplicationError(writer, request, err)
+			return
+		}
+		writeIAMJSON(writer, http.StatusOK, toDirectorySyncJobResponse(job))
+	}
+}
+
+func listDirectorySyncConflictsHandler(application DirectorySyncApplication) http.HandlerFunc {
+	return func(writer http.ResponseWriter, request *http.Request) {
+		principal, ok := requireIAMPrincipal(writer, request)
+		if !ok {
+			return
+		}
+		sourceID, ok := parseDirectoryPathID(writer, request, "source_id", "IDENTITY_SOURCE_ID_INVALID")
+		if !ok {
+			return
+		}
+		page, err := parseIAMPage(request)
+		if err != nil {
+			writeIAMApplicationError(writer, request, err)
+			return
+		}
+		result, err := application.ListDirectorySyncConflicts(request.Context(), principal, sourceID, page)
+		if err != nil {
+			writeIAMApplicationError(writer, request, err)
+			return
+		}
+		writeIAMJSON(writer, http.StatusOK, result)
+	}
+}
+
+func parseDirectoryPathID(writer http.ResponseWriter, request *http.Request, parameter, code string) (uuid.UUID, bool) {
+	id, err := uuid.Parse(chi.URLParam(request, parameter))
+	if err != nil || id == uuid.Nil {
+		writeIAMProblem(writer, request, http.StatusBadRequest, code, "Directory identifier is invalid", ErrIdentitySourceInputInvalid)
+		return uuid.Nil, false
+	}
+	return id, true
 }
 
 type reauthenticationProofInput struct {
@@ -537,6 +666,16 @@ func writeIAMApplicationError(writer http.ResponseWriter, request *http.Request,
 		writeIAMProblem(writer, request, http.StatusNotFound, "IDENTITY_SOURCE_NOT_FOUND", "Identity source was not found", err)
 	case errors.Is(err, ErrIAMConflict):
 		writeIAMProblem(writer, request, http.StatusConflict, "IAM_RECORD_CONFLICT", "Identity record conflicts with current state", err)
+	case errors.Is(err, ErrDirectorySyncActive):
+		writeIAMProblem(writer, request, http.StatusConflict, "DIRECTORY_SYNC_ACTIVE", "A directory synchronization is already active", err)
+	case errors.Is(err, ErrDirectoryApplyUnsupported):
+		writeIAMProblem(writer, request, http.StatusConflict, "DIRECTORY_APPLY_UNSUPPORTED", "Directory apply is not supported for this source", err)
+	case errors.Is(err, ErrDirectorySyncNotFound):
+		writeIAMProblem(writer, request, http.StatusNotFound, "DIRECTORY_SYNC_JOB_NOT_FOUND", "Directory synchronization job was not found", err)
+	case errors.Is(err, ErrDirectoryConfigurationInvalid):
+		writeIAMProblem(writer, request, http.StatusUnprocessableEntity, "IDENTITY_SOURCE_CONFIGURATION_INVALID", "Identity source configuration is invalid", err)
+	case errors.Is(err, ErrDirectoryUpstreamRejected), errors.Is(err, ErrDirectoryResponseInvalid):
+		writeIAMProblem(writer, request, http.StatusBadGateway, "IDENTITY_SOURCE_UPSTREAM_INVALID", "Identity source verification failed", err)
 	case errors.Is(err, ErrSSOPreconditionFailed), errors.Is(err, ErrLoginModeTransitionInvalid), errors.Is(err, ErrLastEmergencyAdministrator),
 		errors.Is(err, ErrUserAlreadyDisabled), errors.Is(err, ErrUserAlreadyEnabled), errors.Is(err, ErrUserCannotBeEnabled):
 		writeIAMProblem(writer, request, http.StatusConflict, "IAM_STATE_PRECONDITION_FAILED", "Identity state precondition failed", err)
@@ -663,6 +802,27 @@ type identitySourcePageResponse struct {
 	NextCursor string                   `json:"next_cursor,omitempty"`
 }
 
+type directorySyncJobResponse struct {
+	ID                     uuid.UUID           `json:"id"`
+	IdentitySourceID       uuid.UUID           `json:"identity_source_id"`
+	SourceVersion          int64               `json:"source_version"`
+	Mode                   DirectorySyncMode   `json:"mode"`
+	Status                 DirectorySyncStatus `json:"status"`
+	CreateCount            int                 `json:"create_count"`
+	UpdateCount            int                 `json:"update_count"`
+	DisableCount           int                 `json:"disable_count"`
+	ConflictCount          int                 `json:"conflict_count"`
+	ProcessedUsers         int                 `json:"processed_users"`
+	ProcessedOrganizations int                 `json:"processed_organizations"`
+	ProcessedMemberships   int                 `json:"processed_memberships"`
+	ErrorCode              string              `json:"error_code,omitempty"`
+	RequestedBy            string              `json:"requested_by"`
+	RequestID              uuid.UUID           `json:"request_id"`
+	CreatedAt              time.Time           `json:"created_at"`
+	UpdatedAt              time.Time           `json:"updated_at"`
+	CompletedAt            *time.Time          `json:"completed_at,omitempty"`
+}
+
 func toUserResponse(user UserPrincipal) userResponse {
 	result := userResponse{
 		ID: user.ID, ExternalSubject: user.ExternalSubject, Username: user.Username, DisplayName: user.DisplayName,
@@ -715,6 +875,33 @@ func toIdentitySourceResponse(source IdentitySource) identitySourceResponse {
 	if !source.PreviewedAt.IsZero() {
 		value := source.PreviewedAt
 		result.PreviewedAt = &value
+	}
+	return result
+}
+
+func toDirectorySyncJobResponse(job DirectorySyncJob) directorySyncJobResponse {
+	result := directorySyncJobResponse{
+		ID:                     job.ID,
+		IdentitySourceID:       job.IdentitySourceID,
+		SourceVersion:          job.SourceVersion,
+		Mode:                   job.Mode,
+		Status:                 job.Status,
+		CreateCount:            job.CreateCount,
+		UpdateCount:            job.UpdateCount,
+		DisableCount:           job.DisableCount,
+		ConflictCount:          job.ConflictCount,
+		ProcessedUsers:         job.ProcessedUsers,
+		ProcessedOrganizations: job.ProcessedOrganizations,
+		ProcessedMemberships:   job.ProcessedMemberships,
+		ErrorCode:              job.ErrorCode,
+		RequestedBy:            job.RequestedBy,
+		RequestID:              job.RequestID,
+		CreatedAt:              job.CreatedAt,
+		UpdatedAt:              job.UpdatedAt,
+	}
+	if !job.CompletedAt.IsZero() {
+		value := job.CompletedAt
+		result.CompletedAt = &value
 	}
 	return result
 }
