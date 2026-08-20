@@ -527,17 +527,7 @@ INSERT INTO local_sessions (
 	auditRequests := make([]string, 0, 7)
 	proofFor := func(operation iam.ReauthenticationOperation) (iam.HighRiskProof, iam.RequestContext) {
 		t.Helper()
-		challengeRequest := iam.RequestContext{RequestID: uuid.NewString(), SourceIP: "192.0.2.100"}
-		created, createErr := reauthentication.CreateChallenge(ctx, creator, operation, challengeRequest)
-		if createErr != nil {
-			t.Fatalf("CreateChallenge(%s) error = %v", operation, createErr)
-		}
-		completed, completeErr := reauthentication.CompleteChallenge(ctx, actor, created.ID, iam.CompleteReauthenticationCommand{}, iam.RequestContext{RequestID: uuid.NewString(), SourceIP: "192.0.2.101"})
-		if completeErr != nil {
-			t.Fatalf("CompleteChallenge(%s) error = %v", operation, completeErr)
-		}
-		mutationRequest := iam.RequestContext{RequestID: uuid.NewString(), SourceIP: "192.0.2.102"}
-		return iam.HighRiskProof{ChallengeID: created.ID.String(), Evidence: completed.Evidence, Confirmed: true}, mutationRequest
+		return completeIntegrationReauthenticationProof(t, ctx, reauthentication, creator, actor, operation)
 	}
 
 	proof, request := proofFor(iam.ReauthenticationOperationRoleBindingCreate)
@@ -902,8 +892,12 @@ func TestIAMPostgresBreakGlassScheduledPermissionContinuity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	actor := identity.Principal{Subject: "scheduled.admin", Kind: identity.PrincipalKindHuman, Roles: []identity.Role{identity.RoleAdmin}, TokenID: "scheduled-admin-token"}
-	proof := iam.HighRiskProof{Confirmed: true, ChallengeID: "scheduled", Evidence: "scheduled"}
+	creator := identity.Principal{Subject: "scheduled.admin", Kind: identity.PrincipalKindHuman, Roles: []identity.Role{identity.RoleAdmin}, TokenID: "scheduled-old-token"}
+	actor := creator
+	actor.TokenID = "scheduled-fresh-token"
+	actor.AuthenticatedAt = now.Add(-time.Minute)
+	actor.AuthenticationAssurance = 1
+	fakeProof := iam.HighRiskProof{Confirmed: true, ChallengeID: "scheduled", Evidence: "scheduled"}
 	request := func() iam.RequestContext {
 		return iam.RequestContext{RequestID: uuid.NewString(), SourceIP: "192.0.2.123"}
 	}
@@ -955,24 +949,33 @@ INSERT INTO identity_sources (
 		return service
 	}
 	realAuditor := audit.NewService(audit.NewPostgresRepository(pool))
+	reauthenticationRepository := iam.NewPostgresRepository(pool)
+	reauthentication, err := iam.NewReauthenticationService(iam.ReauthenticationConfig{
+		Repository: reauthenticationRepository, Auditor: realAuditor, Local: integrationLocalReauthenticator{},
+		Clock: func() time.Time { return now }, Policy: iam.DefaultReauthenticationPolicy(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	proofFor := func(t *testing.T, operation iam.ReauthenticationOperation) (iam.HighRiskProof, iam.RequestContext) {
+		t.Helper()
+		return completeIntegrationReauthenticationProof(t, ctx, reauthentication, creator, actor, operation)
+	}
 
 	t.Run("future deny cannot remove the only emergency administrator", func(t *testing.T) {
 		reset(t)
 		emergencyID, _ := seedEmergency(t, "scheduled.future.deny")
-		authorizer := &countingIntegrationHighRiskAuthorizer{}
-		service := newService(t, authorizer, realAuditor)
+		proof, mutationRequest := proofFor(t, iam.ReauthenticationOperationRoleBindingCreate)
+		service := newService(t, reauthentication, realAuditor)
 
 		_, createErr := service.CreateRoleBinding(ctx, actor, iam.CreateRoleBindingCommand{
 			SubjectType: iam.SubjectTypeUser, SubjectID: emergencyID, SubjectVersion: 1,
 			Role: identity.RoleAdmin, ScopeType: iam.ScopeTypePlatform, Effect: iam.BindingEffectDeny,
 			ValidFrom: now.Add(time.Hour),
-		}, proof, request())
+		}, proof, mutationRequest)
 
 		if !errors.Is(createErr, iam.ErrLastEmergencyAdministrator) {
 			t.Fatalf("CreateRoleBinding(future deny) error = %v", createErr)
-		}
-		if authorizer.calls.Load() != 1 {
-			t.Fatalf("proof consumption calls = %d", authorizer.calls.Load())
 		}
 		var denyCount int
 		if err := pool.QueryRow(ctx, `SELECT count(*) FROM role_bindings WHERE subject_id=$1 AND effect='deny'`, emergencyID).Scan(&denyCount); err != nil {
@@ -981,6 +984,9 @@ INSERT INTO identity_sources (
 		if denyCount != 0 {
 			t.Fatalf("scheduled gap deny bindings = %d", denyCount)
 		}
+		requireIntegrationProofConsumedAndUnreplayable(
+			t, ctx, pool, reauthentication, actor, iam.ReauthenticationOperationRoleBindingCreate, proof,
+		)
 	})
 
 	t.Run("permanent allow cannot be deleted when only expiring access remains", func(t *testing.T) {
@@ -994,16 +1000,13 @@ INSERT INTO role_bindings (
           'test:bootstrap', 1, $3, $3)`, uuid.New(), emergencyID, now.Add(-time.Hour), now.Add(time.Hour)); seedErr != nil {
 			t.Fatal(seedErr)
 		}
-		authorizer := &countingIntegrationHighRiskAuthorizer{}
-		service := newService(t, authorizer, realAuditor)
+		proof, mutationRequest := proofFor(t, iam.ReauthenticationOperationRoleBindingDelete)
+		service := newService(t, reauthentication, realAuditor)
 
-		deleteErr := service.DeleteRoleBinding(ctx, actor, permanentBindingID, 1, proof, request())
+		deleteErr := service.DeleteRoleBinding(ctx, actor, permanentBindingID, 1, proof, mutationRequest)
 
 		if !errors.Is(deleteErr, iam.ErrLastEmergencyAdministrator) {
 			t.Fatalf("DeleteRoleBinding(permanent allow) error = %v", deleteErr)
-		}
-		if authorizer.calls.Load() != 1 {
-			t.Fatalf("proof consumption calls = %d", authorizer.calls.Load())
 		}
 		var permanentCount int
 		if err := pool.QueryRow(ctx, `SELECT count(*) FROM role_bindings WHERE id=$1`, permanentBindingID).Scan(&permanentCount); err != nil {
@@ -1012,6 +1015,9 @@ INSERT INTO role_bindings (
 		if permanentCount != 1 {
 			t.Fatal("permanent allow deletion was committed")
 		}
+		requireIntegrationProofConsumedAndUnreplayable(
+			t, ctx, pool, reauthentication, actor, iam.ReauthenticationOperationRoleBindingDelete, proof,
+		)
 	})
 
 	t.Run("future deny is allowed when a backup remains at the boundary", func(t *testing.T) {
@@ -1025,7 +1031,7 @@ INSERT INTO role_bindings (
 			SubjectType: iam.SubjectTypeUser, SubjectID: firstID, SubjectVersion: 1,
 			Role: identity.RoleAdmin, ScopeType: iam.ScopeTypePlatform, Effect: iam.BindingEffectDeny,
 			ValidFrom: now.Add(365 * 24 * time.Hour),
-		}, proof, request())
+		}, fakeProof, request())
 
 		if createErr != nil {
 			t.Fatalf("CreateRoleBinding(future deny with backup) error = %v", createErr)
@@ -1081,7 +1087,7 @@ INSERT INTO role_bindings (
 				SubjectType: test.futureDeny, SubjectID: denySubjectID, SubjectVersion: 1,
 				Role: identity.RoleAdmin, ScopeType: iam.ScopeTypePlatform, Effect: iam.BindingEffectDeny,
 				ValidFrom: now.Add(time.Hour),
-			}, proof, request())
+			}, fakeProof, request())
 
 			if !errors.Is(createErr, iam.ErrLastEmergencyAdministrator) {
 				t.Fatalf("CreateRoleBinding(future deny) error = %v", createErr)
@@ -1111,7 +1117,7 @@ INSERT INTO role_bindings (
 		authorizer := &countingIntegrationHighRiskAuthorizer{}
 		service := newService(t, authorizer, realAuditor)
 
-		if enableErr := service.EnableSSO(ctx, actor, sourceID, 1, proof, request()); enableErr != nil {
+		if enableErr := service.EnableSSO(ctx, actor, sourceID, 1, fakeProof, request()); enableErr != nil {
 			t.Fatalf("EnableSSO(adjacent bindings) error = %v", enableErr)
 		}
 	})
@@ -1123,16 +1129,13 @@ INSERT INTO role_bindings (
 			t.Fatal(seedErr)
 		}
 		sourceID := seedSource(t)
-		authorizer := &countingIntegrationHighRiskAuthorizer{}
-		service := newService(t, authorizer, realAuditor)
+		proof, mutationRequest := proofFor(t, iam.ReauthenticationOperationSSOEnable)
+		service := newService(t, reauthentication, realAuditor)
 
-		enableErr := service.EnableSSO(ctx, actor, sourceID, 1, proof, request())
+		enableErr := service.EnableSSO(ctx, actor, sourceID, 1, proof, mutationRequest)
 
 		if !errors.Is(enableErr, iam.ErrSSOPreconditionFailed) {
 			t.Fatalf("EnableSSO(scheduled gap) error = %v", enableErr)
-		}
-		if authorizer.calls.Load() != 1 {
-			t.Fatalf("proof consumption calls = %d", authorizer.calls.Load())
 		}
 		var loginMode iam.LoginMode
 		if err := pool.QueryRow(ctx, `SELECT login_mode FROM iam_login_state WHERE singleton=TRUE`).Scan(&loginMode); err != nil {
@@ -1141,6 +1144,9 @@ INSERT INTO role_bindings (
 		if loginMode != iam.LoginModeLocal {
 			t.Fatalf("login mode = %s", loginMode)
 		}
+		requireIntegrationProofConsumedAndUnreplayable(
+			t, ctx, pool, reauthentication, actor, iam.ReauthenticationOperationSSOEnable, proof,
+		)
 	})
 
 	t.Run("user disable fails closed on an existing scheduled gap", func(t *testing.T) {
@@ -1150,16 +1156,13 @@ INSERT INTO role_bindings (
 		if _, seedErr := pool.Exec(ctx, `UPDATE role_bindings SET valid_until=$2 WHERE id=$1`, expiringAllowID, now.Add(time.Hour)); seedErr != nil {
 			t.Fatal(seedErr)
 		}
-		authorizer := &countingIntegrationHighRiskAuthorizer{}
-		service := newService(t, authorizer, realAuditor)
+		proof, mutationRequest := proofFor(t, iam.ReauthenticationOperationUserDisable)
+		service := newService(t, reauthentication, realAuditor)
 
-		disableErr := service.DisableUser(ctx, actor, firstID, 1, "scheduled continuity", proof, request())
+		disableErr := service.DisableUser(ctx, actor, firstID, 1, "scheduled continuity", proof, mutationRequest)
 
 		if !errors.Is(disableErr, iam.ErrLastEmergencyAdministrator) {
 			t.Fatalf("DisableUser(scheduled gap) error = %v", disableErr)
-		}
-		if authorizer.calls.Load() != 1 {
-			t.Fatalf("proof consumption calls = %d", authorizer.calls.Load())
 		}
 		var status iam.UserStatus
 		if err := pool.QueryRow(ctx, `SELECT status FROM user_principals WHERE id=$1`, firstID).Scan(&status); err != nil {
@@ -1168,6 +1171,9 @@ INSERT INTO role_bindings (
 		if status != iam.UserStatusActive {
 			t.Fatalf("emergency user status = %s", status)
 		}
+		requireIntegrationProofConsumedAndUnreplayable(
+			t, ctx, pool, reauthentication, actor, iam.ReauthenticationOperationUserDisable, proof,
+		)
 	})
 
 	t.Run("audit failure rolls back a continuity-safe scheduled mutation", func(t *testing.T) {
@@ -1181,7 +1187,7 @@ INSERT INTO role_bindings (
 			SubjectType: iam.SubjectTypeUser, SubjectID: firstID, SubjectVersion: 1,
 			Role: identity.RoleAdmin, ScopeType: iam.ScopeTypePlatform, Effect: iam.BindingEffectDeny,
 			ValidFrom: now.Add(time.Hour),
-		}, proof, request())
+		}, fakeProof, request())
 
 		if !errors.Is(createErr, errIntegrationAuditFailure) {
 			t.Fatalf("CreateRoleBinding(audit failure) error = %v", createErr)
@@ -2162,4 +2168,95 @@ INSERT INTO role_bindings (
 		t.Fatalf("seed usable emergency administrator binding: %v", err)
 	}
 	return bindingID
+}
+
+func completeIntegrationReauthenticationProof(
+	t *testing.T,
+	ctx context.Context,
+	reauthentication *iam.ReauthenticationService,
+	creator identity.Principal,
+	completer identity.Principal,
+	operation iam.ReauthenticationOperation,
+) (iam.HighRiskProof, iam.RequestContext) {
+	t.Helper()
+	created, err := reauthentication.CreateChallenge(
+		ctx,
+		creator,
+		operation,
+		iam.RequestContext{RequestID: uuid.NewString(), SourceIP: "192.0.2.100"},
+	)
+	if err != nil {
+		t.Fatalf("CreateChallenge(%s) error = %v", operation, err)
+	}
+	completed, err := reauthentication.CompleteChallenge(
+		ctx,
+		completer,
+		created.ID,
+		iam.CompleteReauthenticationCommand{},
+		iam.RequestContext{RequestID: uuid.NewString(), SourceIP: "192.0.2.101"},
+	)
+	if err != nil {
+		t.Fatalf("CompleteChallenge(%s) error = %v", operation, err)
+	}
+	return iam.HighRiskProof{
+		ChallengeID: created.ID.String(),
+		Evidence:    completed.Evidence,
+		Confirmed:   true,
+	}, iam.RequestContext{RequestID: uuid.NewString(), SourceIP: "192.0.2.102"}
+}
+
+func requireIntegrationProofConsumedAndUnreplayable(
+	t *testing.T,
+	ctx context.Context,
+	queryer interface {
+		QueryRow(context.Context, string, ...any) pgx.Row
+	},
+	reauthentication *iam.ReauthenticationService,
+	actor identity.Principal,
+	operation iam.ReauthenticationOperation,
+	proof iam.HighRiskProof,
+) {
+	t.Helper()
+	challengeID, err := uuid.Parse(proof.ChallengeID)
+	if err != nil || challengeID.Version() != 7 {
+		t.Fatalf("proof challenge ID is not a production UUIDv7: %v", err)
+	}
+	var status iam.ReauthenticationStatus
+	var consumedAt *time.Time
+	var actorBound, operationBound, tokenBound bool
+	if err := queryer.QueryRow(ctx, `
+SELECT status,
+       consumed_at,
+       actor_subject=$2 AND actor_kind=$3,
+       operation=$4,
+       verified_token_digest=$5
+FROM iam_reauthentication_challenges
+WHERE id=$1`, challengeID, actor.Subject, actor.Kind, operation, integrationSHA256Hex(actor.TokenID)).Scan(
+		&status,
+		&consumedAt,
+		&actorBound,
+		&operationBound,
+		&tokenBound,
+	); err != nil {
+		t.Fatalf("load consumed reauthentication challenge: %v", err)
+	}
+	if status != iam.ReauthenticationStatusConsumed || consumedAt == nil || !actorBound || !operationBound || !tokenBound {
+		t.Fatalf(
+			"reauthentication challenge terminal state: status=%s consumed=%t actor_bound=%t operation_bound=%t token_bound=%t",
+			status,
+			consumedAt != nil,
+			actorBound,
+			operationBound,
+			tokenBound,
+		)
+	}
+	if err := reauthentication.Authorize(
+		ctx,
+		actor,
+		string(operation),
+		proof,
+		iam.RequestContext{RequestID: uuid.NewString(), SourceIP: "192.0.2.124"},
+	); !errors.Is(err, iam.ErrHighRiskConfirmationRequired) {
+		t.Fatalf("replayed production proof error = %v", err)
+	}
 }
