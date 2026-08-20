@@ -883,6 +883,322 @@ INSERT INTO role_bindings (
 	}
 }
 
+func TestIAMPostgresBreakGlassScheduledPermissionContinuity(t *testing.T) {
+	databaseURL := integrationDatabaseURL(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	pool, err := database.Open(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if err := database.ApplyMigrations(ctx, pool, migrations.FS); err != nil {
+		t.Fatalf("ApplyMigrations() error = %v", err)
+	}
+	now := time.Date(2026, 8, 20, 21, 30, 0, 0, time.UTC)
+	passwords, err := iam.NewPasswordManager(iam.PasswordPolicyConfig{
+		MinimumLength: 16, MemoryKiB: 19 * 1024, Iterations: 1, Parallelism: 1, SaltBytes: 16, DerivedKeyBytes: 32,
+	}, integrationBreachChecker{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actor := identity.Principal{Subject: "scheduled.admin", Kind: identity.PrincipalKindHuman, Roles: []identity.Role{identity.RoleAdmin}, TokenID: "scheduled-admin-token"}
+	proof := iam.HighRiskProof{Confirmed: true, ChallengeID: "scheduled", Evidence: "scheduled"}
+	request := func() iam.RequestContext {
+		return iam.RequestContext{RequestID: uuid.NewString(), SourceIP: "192.0.2.123"}
+	}
+	reset := func(t *testing.T) {
+		t.Helper()
+		if _, resetErr := pool.Exec(ctx, `
+TRUNCATE TABLE iam_reauthentication_challenges, local_sessions, local_auth_rate_limits, emergency_access_events,
+directory_sync_conflicts, directory_sync_jobs, role_bindings, organization_memberships, organization_units,
+local_password_history, local_credentials, user_principals, iam_login_state, identity_sources CASCADE;
+INSERT INTO iam_login_state (singleton, login_mode, version, updated_by, updated_at)
+VALUES (TRUE, 'local', 1, 'test:bootstrap', clock_timestamp())`); resetErr != nil {
+			t.Fatal(resetErr)
+		}
+	}
+	seedEmergency := func(t *testing.T, username string) (uuid.UUID, uuid.UUID) {
+		t.Helper()
+		userID := uuid.New()
+		if _, seedErr := pool.Exec(ctx, `
+INSERT INTO user_principals (
+    id, username, display_name, user_kind, status, mfa_enrolled, credential_rotated_at,
+    version, created_at, updated_at
+) VALUES ($1, $2, $2, 'emergency', 'active', TRUE, $3, 1, $3, $3)`, userID, username, now.Add(-time.Hour)); seedErr != nil {
+			t.Fatal(seedErr)
+		}
+		return userID, seedIntegrationUsableEmergencyAdministrator(t, ctx, pool, userID, now)
+	}
+	seedSource := func(t *testing.T) uuid.UUID {
+		t.Helper()
+		sourceID := uuid.New()
+		if _, seedErr := pool.Exec(ctx, `
+INSERT INTO identity_sources (
+    id, name, source_kind, status, required_mappings_complete, verified_at, previewed_at,
+    version, created_at, updated_at
+) VALUES ($1, 'Scheduled OIDC', 'oidc', 'verified', TRUE, $2, $2, 1, $2, $2)`, sourceID, now.Add(-time.Hour)); seedErr != nil {
+			t.Fatal(seedErr)
+		}
+		return sourceID
+	}
+	newService := func(t *testing.T, authorizer iam.HighRiskAuthorizer, auditor iam.AuditAppender) *iam.Service {
+		t.Helper()
+		repository := iam.NewPostgresRepository(pool)
+		service, serviceErr := iam.NewService(iam.ServiceConfig{
+			Repository: repository, ScopeCatalog: repository, BreakGlass: iam.NewBreakGlassInvariantAuthority(repository), Auditor: auditor,
+			Sessions: integrationSessionRevoker{}, Passwords: passwords, HighRisk: authorizer, Clock: func() time.Time { return now },
+		})
+		if serviceErr != nil {
+			t.Fatal(serviceErr)
+		}
+		return service
+	}
+	realAuditor := audit.NewService(audit.NewPostgresRepository(pool))
+
+	t.Run("future deny cannot remove the only emergency administrator", func(t *testing.T) {
+		reset(t)
+		emergencyID, _ := seedEmergency(t, "scheduled.future.deny")
+		authorizer := &countingIntegrationHighRiskAuthorizer{}
+		service := newService(t, authorizer, realAuditor)
+
+		_, createErr := service.CreateRoleBinding(ctx, actor, iam.CreateRoleBindingCommand{
+			SubjectType: iam.SubjectTypeUser, SubjectID: emergencyID, SubjectVersion: 1,
+			Role: identity.RoleAdmin, ScopeType: iam.ScopeTypePlatform, Effect: iam.BindingEffectDeny,
+			ValidFrom: now.Add(time.Hour),
+		}, proof, request())
+
+		if !errors.Is(createErr, iam.ErrLastEmergencyAdministrator) {
+			t.Fatalf("CreateRoleBinding(future deny) error = %v", createErr)
+		}
+		if authorizer.calls.Load() != 1 {
+			t.Fatalf("proof consumption calls = %d", authorizer.calls.Load())
+		}
+		var denyCount int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM role_bindings WHERE subject_id=$1 AND effect='deny'`, emergencyID).Scan(&denyCount); err != nil {
+			t.Fatal(err)
+		}
+		if denyCount != 0 {
+			t.Fatalf("scheduled gap deny bindings = %d", denyCount)
+		}
+	})
+
+	t.Run("permanent allow cannot be deleted when only expiring access remains", func(t *testing.T) {
+		reset(t)
+		emergencyID, permanentBindingID := seedEmergency(t, "scheduled.expiring.allow")
+		if _, seedErr := pool.Exec(ctx, `
+INSERT INTO role_bindings (
+    id, subject_type, subject_id, role_name, scope_type, effect, valid_from, valid_until,
+    created_by, version, created_at, updated_at
+) VALUES ($1, 'user', $2, 'admin', 'platform', 'allow', $3, $4,
+          'test:bootstrap', 1, $3, $3)`, uuid.New(), emergencyID, now.Add(-time.Hour), now.Add(time.Hour)); seedErr != nil {
+			t.Fatal(seedErr)
+		}
+		authorizer := &countingIntegrationHighRiskAuthorizer{}
+		service := newService(t, authorizer, realAuditor)
+
+		deleteErr := service.DeleteRoleBinding(ctx, actor, permanentBindingID, 1, proof, request())
+
+		if !errors.Is(deleteErr, iam.ErrLastEmergencyAdministrator) {
+			t.Fatalf("DeleteRoleBinding(permanent allow) error = %v", deleteErr)
+		}
+		if authorizer.calls.Load() != 1 {
+			t.Fatalf("proof consumption calls = %d", authorizer.calls.Load())
+		}
+		var permanentCount int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM role_bindings WHERE id=$1`, permanentBindingID).Scan(&permanentCount); err != nil {
+			t.Fatal(err)
+		}
+		if permanentCount != 1 {
+			t.Fatal("permanent allow deletion was committed")
+		}
+	})
+
+	t.Run("future deny is allowed when a backup remains at the boundary", func(t *testing.T) {
+		reset(t)
+		firstID, _ := seedEmergency(t, "scheduled.safe.one")
+		_, _ = seedEmergency(t, "scheduled.safe.two")
+		authorizer := &countingIntegrationHighRiskAuthorizer{}
+		service := newService(t, authorizer, realAuditor)
+
+		binding, createErr := service.CreateRoleBinding(ctx, actor, iam.CreateRoleBindingCommand{
+			SubjectType: iam.SubjectTypeUser, SubjectID: firstID, SubjectVersion: 1,
+			Role: identity.RoleAdmin, ScopeType: iam.ScopeTypePlatform, Effect: iam.BindingEffectDeny,
+			ValidFrom: now.Add(365 * 24 * time.Hour),
+		}, proof, request())
+
+		if createErr != nil {
+			t.Fatalf("CreateRoleBinding(future deny with backup) error = %v", createErr)
+		}
+		if authorizer.calls.Load() != 1 || binding.ID == uuid.Nil {
+			t.Fatalf("safe scheduled mutation result: calls=%d binding=%s", authorizer.calls.Load(), binding.ID)
+		}
+	})
+
+	for _, test := range []struct {
+		name       string
+		allow      iam.SubjectType
+		futureDeny iam.SubjectType
+	}{
+		{name: "organization allow direct deny", allow: iam.SubjectTypeOrganization, futureDeny: iam.SubjectTypeUser},
+		{name: "direct allow organization deny", allow: iam.SubjectTypeUser, futureDeny: iam.SubjectTypeOrganization},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			reset(t)
+			emergencyID, directAllowID := seedEmergency(t, "scheduled.organization")
+			organizationID := uuid.New()
+			if _, seedErr := pool.Exec(ctx, `
+INSERT INTO organization_units (id, external_id, name, source_owned, status, version, created_at, updated_at)
+VALUES ($1, '', 'Scheduled Emergency Administrators', FALSE, 'active', 1, $2, $2)`, organizationID, now.Add(-time.Hour)); seedErr != nil {
+				t.Fatal(seedErr)
+			}
+			if _, seedErr := pool.Exec(ctx, `
+INSERT INTO organization_memberships (organization_id, user_id, source_owned, created_at)
+VALUES ($1, $3, FALSE, $2)`, organizationID, now.Add(-time.Hour), emergencyID); seedErr != nil {
+				t.Fatal(seedErr)
+			}
+			if test.allow == iam.SubjectTypeOrganization {
+				if _, seedErr := pool.Exec(ctx, `DELETE FROM role_bindings WHERE id=$1`, directAllowID); seedErr != nil {
+					t.Fatal(seedErr)
+				}
+				if _, seedErr := pool.Exec(ctx, `
+INSERT INTO role_bindings (
+    id, subject_type, subject_id, role_name, scope_type, effect, valid_from,
+    created_by, version, created_at, updated_at
+) VALUES ($1, 'organization', $2, 'admin', 'platform', 'allow', $3,
+          'test:bootstrap', 1, $3, $3)`, uuid.New(), organizationID, now.Add(-time.Hour)); seedErr != nil {
+					t.Fatal(seedErr)
+				}
+			}
+			denySubjectID := emergencyID
+			if test.futureDeny == iam.SubjectTypeOrganization {
+				denySubjectID = organizationID
+			}
+			authorizer := &countingIntegrationHighRiskAuthorizer{}
+			service := newService(t, authorizer, realAuditor)
+
+			_, createErr := service.CreateRoleBinding(ctx, actor, iam.CreateRoleBindingCommand{
+				SubjectType: test.futureDeny, SubjectID: denySubjectID, SubjectVersion: 1,
+				Role: identity.RoleAdmin, ScopeType: iam.ScopeTypePlatform, Effect: iam.BindingEffectDeny,
+				ValidFrom: now.Add(time.Hour),
+			}, proof, request())
+
+			if !errors.Is(createErr, iam.ErrLastEmergencyAdministrator) {
+				t.Fatalf("CreateRoleBinding(future deny) error = %v", createErr)
+			}
+			if authorizer.calls.Load() != 1 {
+				t.Fatalf("proof consumption calls = %d", authorizer.calls.Load())
+			}
+		})
+	}
+
+	t.Run("allow ending when successor starts has no gap", func(t *testing.T) {
+		reset(t)
+		emergencyID, currentAllowID := seedEmergency(t, "scheduled.adjacent")
+		boundary := now.Add(time.Hour)
+		if _, seedErr := pool.Exec(ctx, `UPDATE role_bindings SET valid_until=$2 WHERE id=$1`, currentAllowID, boundary); seedErr != nil {
+			t.Fatal(seedErr)
+		}
+		if _, seedErr := pool.Exec(ctx, `
+INSERT INTO role_bindings (
+    id, subject_type, subject_id, role_name, scope_type, effect, valid_from,
+    created_by, version, created_at, updated_at
+) VALUES ($2, 'user', $3, 'admin', 'platform', 'allow', $1,
+          'test:bootstrap', 1, $4, $4)`, boundary, uuid.New(), emergencyID, now.Add(-time.Hour)); seedErr != nil {
+			t.Fatal(seedErr)
+		}
+		sourceID := seedSource(t)
+		authorizer := &countingIntegrationHighRiskAuthorizer{}
+		service := newService(t, authorizer, realAuditor)
+
+		if enableErr := service.EnableSSO(ctx, actor, sourceID, 1, proof, request()); enableErr != nil {
+			t.Fatalf("EnableSSO(adjacent bindings) error = %v", enableErr)
+		}
+	})
+
+	t.Run("SSO enable fails closed on an existing scheduled gap", func(t *testing.T) {
+		reset(t)
+		_, currentAllowID := seedEmergency(t, "scheduled.sso.gap")
+		if _, seedErr := pool.Exec(ctx, `UPDATE role_bindings SET valid_until=$2 WHERE id=$1`, currentAllowID, now.Add(time.Hour)); seedErr != nil {
+			t.Fatal(seedErr)
+		}
+		sourceID := seedSource(t)
+		authorizer := &countingIntegrationHighRiskAuthorizer{}
+		service := newService(t, authorizer, realAuditor)
+
+		enableErr := service.EnableSSO(ctx, actor, sourceID, 1, proof, request())
+
+		if !errors.Is(enableErr, iam.ErrSSOPreconditionFailed) {
+			t.Fatalf("EnableSSO(scheduled gap) error = %v", enableErr)
+		}
+		if authorizer.calls.Load() != 1 {
+			t.Fatalf("proof consumption calls = %d", authorizer.calls.Load())
+		}
+		var loginMode iam.LoginMode
+		if err := pool.QueryRow(ctx, `SELECT login_mode FROM iam_login_state WHERE singleton=TRUE`).Scan(&loginMode); err != nil {
+			t.Fatal(err)
+		}
+		if loginMode != iam.LoginModeLocal {
+			t.Fatalf("login mode = %s", loginMode)
+		}
+	})
+
+	t.Run("user disable fails closed on an existing scheduled gap", func(t *testing.T) {
+		reset(t)
+		firstID, _ := seedEmergency(t, "scheduled.disable.one")
+		_, expiringAllowID := seedEmergency(t, "scheduled.disable.two")
+		if _, seedErr := pool.Exec(ctx, `UPDATE role_bindings SET valid_until=$2 WHERE id=$1`, expiringAllowID, now.Add(time.Hour)); seedErr != nil {
+			t.Fatal(seedErr)
+		}
+		authorizer := &countingIntegrationHighRiskAuthorizer{}
+		service := newService(t, authorizer, realAuditor)
+
+		disableErr := service.DisableUser(ctx, actor, firstID, 1, "scheduled continuity", proof, request())
+
+		if !errors.Is(disableErr, iam.ErrLastEmergencyAdministrator) {
+			t.Fatalf("DisableUser(scheduled gap) error = %v", disableErr)
+		}
+		if authorizer.calls.Load() != 1 {
+			t.Fatalf("proof consumption calls = %d", authorizer.calls.Load())
+		}
+		var status iam.UserStatus
+		if err := pool.QueryRow(ctx, `SELECT status FROM user_principals WHERE id=$1`, firstID).Scan(&status); err != nil {
+			t.Fatal(err)
+		}
+		if status != iam.UserStatusActive {
+			t.Fatalf("emergency user status = %s", status)
+		}
+	})
+
+	t.Run("audit failure rolls back a continuity-safe scheduled mutation", func(t *testing.T) {
+		reset(t)
+		firstID, _ := seedEmergency(t, "scheduled.audit.one")
+		_, _ = seedEmergency(t, "scheduled.audit.two")
+		authorizer := &countingIntegrationHighRiskAuthorizer{}
+		service := newService(t, authorizer, failingIAMAuditAppender{})
+
+		_, createErr := service.CreateRoleBinding(ctx, actor, iam.CreateRoleBindingCommand{
+			SubjectType: iam.SubjectTypeUser, SubjectID: firstID, SubjectVersion: 1,
+			Role: identity.RoleAdmin, ScopeType: iam.ScopeTypePlatform, Effect: iam.BindingEffectDeny,
+			ValidFrom: now.Add(time.Hour),
+		}, proof, request())
+
+		if !errors.Is(createErr, errIntegrationAuditFailure) {
+			t.Fatalf("CreateRoleBinding(audit failure) error = %v", createErr)
+		}
+		if authorizer.calls.Load() != 1 {
+			t.Fatalf("proof consumption calls = %d", authorizer.calls.Load())
+		}
+		var denyCount int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM role_bindings WHERE subject_id=$1 AND effect='deny'`, firstID).Scan(&denyCount); err != nil {
+			t.Fatal(err)
+		}
+		if denyCount != 0 {
+			t.Fatalf("audit failure committed scheduled deny count = %d", denyCount)
+		}
+	})
+}
+
 func TestIAMPostgresBreakGlassInvariantSerializesConcurrentReductionsAndRollsBackAuditFailure(t *testing.T) {
 	databaseURL := integrationDatabaseURL(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -1786,6 +2102,13 @@ func (integrationSessionRevoker) RevokeRegularLocalSessions(context.Context, pgx
 type integrationHighRiskAuthorizer struct{}
 
 func (integrationHighRiskAuthorizer) Authorize(context.Context, identity.Principal, string, iam.HighRiskProof, iam.RequestContext) error {
+	return nil
+}
+
+type countingIntegrationHighRiskAuthorizer struct{ calls atomic.Int64 }
+
+func (authorizer *countingIntegrationHighRiskAuthorizer) Authorize(context.Context, identity.Principal, string, iam.HighRiskProof, iam.RequestContext) error {
+	authorizer.calls.Add(1)
 	return nil
 }
 

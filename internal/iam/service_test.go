@@ -283,6 +283,193 @@ func TestDeleteLastEffectiveEmergencyAdministratorBindingRollsBack(t *testing.T)
 	}
 }
 
+func TestCreateFutureDenyCannotScheduleBreakGlassGap(t *testing.T) {
+	t.Parallel()
+
+	harness := newIAMHarness(t)
+	initialBindings := len(harness.repository.roleBindings)
+	_, err := harness.service.CreateRoleBinding(context.Background(), harness.admin, CreateRoleBindingCommand{
+		SubjectType: SubjectTypeUser, SubjectID: harness.emergencyAdminID, SubjectVersion: 1,
+		Role: identity.RoleAdmin, ScopeType: ScopeTypePlatform, Effect: BindingEffectDeny,
+		ValidFrom: harness.now.Add(time.Hour),
+	}, harness.proof(), harness.request)
+
+	if !errors.Is(err, ErrLastEmergencyAdministrator) {
+		t.Fatalf("CreateRoleBinding(future deny) error = %v", err)
+	}
+	if len(harness.repository.roleBindings) != initialBindings {
+		t.Fatalf("scheduled break-glass gap committed: %+v", harness.repository.roleBindings)
+	}
+	if len(harness.highRisk.operations) != 1 || harness.highRisk.operations[0] != string(ReauthenticationOperationRoleBindingCreate) {
+		t.Fatalf("scheduled invariant did not consume proof: %+v", harness.highRisk.operations)
+	}
+}
+
+func TestDeletePermanentAllowCannotLeaveOnlyExpiringBreakGlassAccess(t *testing.T) {
+	t.Parallel()
+
+	harness := newIAMHarness(t)
+	var permanentBindingID uuid.UUID
+	for id := range harness.repository.roleBindings {
+		permanentBindingID = id
+	}
+	expiringBindingID := uuid.New()
+	harness.repository.roleBindings[expiringBindingID] = RoleBinding{
+		ID: expiringBindingID, SubjectType: SubjectTypeUser, SubjectID: harness.emergencyAdminID,
+		Role: identity.RoleAdmin, ScopeType: ScopeTypePlatform, Effect: BindingEffectAllow,
+		ValidFrom: harness.now.Add(-time.Hour), ValidUntil: harness.now.Add(time.Hour), Version: 1,
+	}
+
+	err := harness.service.DeleteRoleBinding(context.Background(), harness.admin, permanentBindingID, 1, harness.proof(), harness.request)
+
+	if !errors.Is(err, ErrLastEmergencyAdministrator) {
+		t.Fatalf("DeleteRoleBinding(permanent allow) error = %v", err)
+	}
+	if _, exists := harness.repository.roleBindings[permanentBindingID]; !exists {
+		t.Fatal("permanent break-glass allow was deleted")
+	}
+	if len(harness.highRisk.operations) != 1 || harness.highRisk.operations[0] != string(ReauthenticationOperationRoleBindingDelete) {
+		t.Fatalf("scheduled invariant did not consume proof: %+v", harness.highRisk.operations)
+	}
+}
+
+func TestFutureDenyAllowsContinuousBackupEmergencyAdministrator(t *testing.T) {
+	t.Parallel()
+
+	harness := newIAMHarness(t)
+	backupID := uuid.New()
+	harness.repository.seedUsableEmergencyAdministrator(backupID, "future-deny-backup")
+
+	binding, err := harness.service.CreateRoleBinding(context.Background(), harness.admin, CreateRoleBindingCommand{
+		SubjectType: SubjectTypeUser, SubjectID: harness.emergencyAdminID, SubjectVersion: 1,
+		Role: identity.RoleAdmin, ScopeType: ScopeTypePlatform, Effect: BindingEffectDeny,
+		ValidFrom: harness.now.Add(365 * 24 * time.Hour),
+	}, harness.proof(), harness.request)
+
+	if err != nil {
+		t.Fatalf("CreateRoleBinding(future deny with backup) error = %v", err)
+	}
+	if _, exists := harness.repository.roleBindings[binding.ID]; !exists {
+		t.Fatal("safe future deny was not committed")
+	}
+}
+
+func TestOrganizationAdministratorContinuityHonorsFutureDenyPrecedence(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		allow      SubjectType
+		futureDeny SubjectType
+	}{
+		{name: "organization allow direct deny", allow: SubjectTypeOrganization, futureDeny: SubjectTypeUser},
+		{name: "direct allow organization deny", allow: SubjectTypeUser, futureDeny: SubjectTypeOrganization},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			harness := newIAMHarness(t)
+			organizationID := uuid.New()
+			allowBindingID := uuid.New()
+			harness.repository.organizations[organizationID] = OrganizationUnit{
+				ID: organizationID, Name: "Emergency Administrators", Status: OrganizationStatusActive, Version: 1,
+			}
+			harness.repository.memberships[harness.emergencyAdminID] = []uuid.UUID{organizationID}
+			allowSubjectID := harness.emergencyAdminID
+			if test.allow == SubjectTypeOrganization {
+				allowSubjectID = organizationID
+			}
+			harness.repository.roleBindings = map[uuid.UUID]RoleBinding{allowBindingID: {
+				ID: allowBindingID, SubjectType: test.allow, SubjectID: allowSubjectID,
+				Role: identity.RoleAdmin, ScopeType: ScopeTypePlatform, Effect: BindingEffectAllow,
+				ValidFrom: harness.now.Add(-time.Hour), Version: 1,
+			}}
+			denySubjectID, denySubjectVersion := harness.emergencyAdminID, int64(1)
+			if test.futureDeny == SubjectTypeOrganization {
+				denySubjectID = organizationID
+			}
+
+			_, err := harness.service.CreateRoleBinding(context.Background(), harness.admin, CreateRoleBindingCommand{
+				SubjectType: test.futureDeny, SubjectID: denySubjectID, SubjectVersion: denySubjectVersion,
+				Role: identity.RoleAdmin, ScopeType: ScopeTypePlatform, Effect: BindingEffectDeny,
+				ValidFrom: harness.now.Add(time.Hour),
+			}, harness.proof(), harness.request)
+
+			if !errors.Is(err, ErrLastEmergencyAdministrator) {
+				t.Fatalf("CreateRoleBinding(future deny) error = %v", err)
+			}
+			if len(harness.highRisk.operations) != 1 {
+				t.Fatalf("scheduled invariant did not consume proof: %+v", harness.highRisk.operations)
+			}
+		})
+	}
+}
+
+func TestBreakGlassContinuityAllowsAdjacentBindingsAtSameTimestamp(t *testing.T) {
+	t.Parallel()
+
+	harness := newIAMHarness(t)
+	boundary := harness.now.Add(time.Hour)
+	for id, binding := range harness.repository.roleBindings {
+		binding.ValidUntil = boundary
+		harness.repository.roleBindings[id] = binding
+	}
+	successorID := uuid.New()
+	harness.repository.roleBindings[successorID] = RoleBinding{
+		ID: successorID, SubjectType: SubjectTypeUser, SubjectID: harness.emergencyAdminID,
+		Role: identity.RoleAdmin, ScopeType: ScopeTypePlatform, Effect: BindingEffectAllow,
+		ValidFrom: boundary, Version: 1,
+	}
+
+	if err := harness.service.EnableSSO(context.Background(), harness.admin, harness.sourceID, 1, harness.proof(), harness.request); err != nil {
+		t.Fatalf("EnableSSO(adjacent break-glass bindings) error = %v", err)
+	}
+}
+
+func TestEnableSSOFailsClosedOnExistingScheduledBreakGlassGap(t *testing.T) {
+	t.Parallel()
+
+	harness := newIAMHarness(t)
+	for id, binding := range harness.repository.roleBindings {
+		binding.ValidUntil = harness.now.Add(time.Hour)
+		harness.repository.roleBindings[id] = binding
+	}
+
+	err := harness.service.EnableSSO(context.Background(), harness.admin, harness.sourceID, 1, harness.proof(), harness.request)
+
+	if !errors.Is(err, ErrSSOPreconditionFailed) {
+		t.Fatalf("EnableSSO(scheduled break-glass gap) error = %v", err)
+	}
+	if harness.repository.login.Mode != LoginModeLocal {
+		t.Fatalf("login mode = %s", harness.repository.login.Mode)
+	}
+	if len(harness.highRisk.operations) != 1 {
+		t.Fatalf("scheduled invariant did not consume proof: %+v", harness.highRisk.operations)
+	}
+}
+
+func TestDisableUserFailsClosedOnExistingScheduledBreakGlassGap(t *testing.T) {
+	t.Parallel()
+
+	harness := newIAMHarness(t)
+	backupID := uuid.New()
+	harness.repository.seedUsableEmergencyAdministrator(backupID, "expiring-backup")
+	for id, binding := range harness.repository.roleBindings {
+		if binding.SubjectID == backupID {
+			binding.ValidUntil = harness.now.Add(time.Hour)
+			harness.repository.roleBindings[id] = binding
+		}
+	}
+
+	err := harness.service.DisableUser(context.Background(), harness.admin, harness.emergencyAdminID, 1, "scheduled continuity", harness.proof(), harness.request)
+
+	if !errors.Is(err, ErrLastEmergencyAdministrator) {
+		t.Fatalf("DisableUser(scheduled break-glass gap) error = %v", err)
+	}
+	if harness.repository.users[harness.emergencyAdminID].Status != UserStatusActive {
+		t.Fatal("emergency administrator was disabled despite scheduled gap")
+	}
+	if len(harness.highRisk.operations) != 1 {
+		t.Fatalf("scheduled invariant did not consume proof: %+v", harness.highRisk.operations)
+	}
+}
+
 func TestHighRiskWritesFailClosedWithoutServerSideAuthority(t *testing.T) {
 	t.Parallel()
 	harness := newIAMHarness(t)
@@ -820,28 +1007,53 @@ func (repository *memoryIAMRepository) LockBreakGlassInvariant(context.Context, 
 	return nil
 }
 
-func (repository *memoryIAMRepository) CountUsableEmergencyAdministrators(_ context.Context, _ pgx.Tx, at time.Time) (int, error) {
-	count := 0
+func (repository *memoryIAMRepository) EvaluateBreakGlassInvariant(_ context.Context, _ pgx.Tx, at time.Time) (BreakGlassInvariantEvaluation, error) {
+	at = at.UTC()
+	evaluation := BreakGlassInvariantEvaluation{}
 	bindings := make([]RoleBinding, 0, len(repository.roleBindings))
+	boundaries := make(map[time.Time]struct{})
 	for _, binding := range repository.roleBindings {
 		bindings = append(bindings, binding)
+		if binding.Role != identity.RoleAdmin || binding.ScopeType != ScopeTypePlatform {
+			continue
+		}
+		if binding.ValidFrom.After(at) {
+			boundaries[binding.ValidFrom.UTC()] = struct{}{}
+		}
+		if !binding.ValidUntil.IsZero() && binding.ValidUntil.After(at) {
+			boundaries[binding.ValidUntil.UTC()] = struct{}{}
+		}
 	}
+	structuralCandidates := make([]UserPrincipal, 0, len(repository.users))
 	for id, user := range repository.users {
 		credential, exists := repository.credentials[id]
 		if !exists || user.Kind != UserKindEmergency || user.Status != UserStatusActive || !user.MFAEnrolled ||
-			user.CredentialRotatedAt.IsZero() || user.CredentialRotatedAt.Before(at.Add(-emergencyCredentialMaximumAge)) ||
-			credential.PasswordChangedAt.IsZero() || credential.ActivationDigest != "" || credential.MFASecretReference == "" ||
-			(!credential.LockedUntil.IsZero() && credential.LockedUntil.After(at)) {
+			credential.PasswordChangedAt.IsZero() || credential.ActivationDigest != "" || credential.MFASecretReference == "" {
 			continue
 		}
 		if _, _, _, _, err := parsePasswordDigest(credential.Password); err != nil {
 			continue
 		}
-		if ResolveAccess(user, repository.memberships[id], bindings, at).Allowed(identity.RoleAdmin, "", "") {
-			count++
+		structuralCandidates = append(structuralCandidates, user)
+		if !user.CredentialRotatedAt.IsZero() && !user.CredentialRotatedAt.Before(at.Add(-emergencyCredentialMaximumAge)) &&
+			(credential.LockedUntil.IsZero() || !credential.LockedUntil.After(at)) &&
+			ResolveAccess(user, repository.memberships[id], bindings, at).Allowed(identity.RoleAdmin, "", "") {
+			evaluation.CurrentUsableAdministrators++
 		}
 	}
-	return count, nil
+	for boundary := range boundaries {
+		available := false
+		for _, user := range structuralCandidates {
+			if ResolveAccess(user, repository.memberships[user.ID], bindings, boundary).Allowed(identity.RoleAdmin, "", "") {
+				available = true
+				break
+			}
+		}
+		if !available && (evaluation.FirstScheduledPermissionGap.IsZero() || boundary.Before(evaluation.FirstScheduledPermissionGap)) {
+			evaluation.FirstScheduledPermissionGap = boundary
+		}
+	}
+	return evaluation, nil
 }
 
 func (repository *memoryIAMRepository) seedUsableEmergencyAdministrator(id uuid.UUID, username string) {

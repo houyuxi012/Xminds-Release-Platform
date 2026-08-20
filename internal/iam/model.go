@@ -191,6 +191,15 @@ type CatalogScope struct {
 	ChannelName string
 }
 
+// BreakGlassInvariantEvaluation separates immediate authentication health
+// from scheduled permission continuity. Credential freshness and lock state
+// apply only to CurrentUsableAdministrators; future permission boundaries use
+// structurally recoverable emergency identities.
+type BreakGlassInvariantEvaluation struct {
+	CurrentUsableAdministrators int
+	FirstScheduledPermissionGap time.Time
+}
+
 type PasswordDigest struct {
 	Algorithm  string
 	Parameters string

@@ -44,7 +44,7 @@ type ScopeCatalogValidator interface {
 
 type BreakGlassInvariantRepository interface {
 	LockBreakGlassInvariant(ctx context.Context, tx pgx.Tx) error
-	CountUsableEmergencyAdministrators(ctx context.Context, tx pgx.Tx, at time.Time) (int, error)
+	EvaluateBreakGlassInvariant(ctx context.Context, tx pgx.Tx, at time.Time) (BreakGlassInvariantEvaluation, error)
 }
 
 type BreakGlassInvariant interface {

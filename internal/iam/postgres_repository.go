@@ -142,85 +142,130 @@ func (repository *PostgresRepository) LockBreakGlassInvariant(ctx context.Contex
 	return nil
 }
 
-func (repository *PostgresRepository) CountUsableEmergencyAdministrators(ctx context.Context, tx pgx.Tx, at time.Time) (int, error) {
+func (repository *PostgresRepository) EvaluateBreakGlassInvariant(ctx context.Context, tx pgx.Tx, at time.Time) (BreakGlassInvariantEvaluation, error) {
 	if repository == nil || repository.pool == nil || tx == nil {
-		return 0, ErrIAMConfiguration
+		return BreakGlassInvariantEvaluation{}, ErrIAMConfiguration
 	}
-	var count int
+	var evaluation BreakGlassInvariantEvaluation
+	var scheduledGap *time.Time
 	err := tx.QueryRow(ctx, `
-SELECT count(*)
-FROM user_principals AS user_record
-JOIN local_credentials AS credential ON credential.user_id=user_record.id
-CROSS JOIN LATERAL regexp_match(
-    credential.parameters,
-    '^m=([0-9]{1,6}),t=([0-9]{1,2}),p=([0-9]),l=([0-9]{1,2})$'
-) AS parsed
-WHERE user_record.user_kind='emergency'
-  AND user_record.status='active'
-  AND user_record.mfa_enrolled=TRUE
-  AND user_record.credential_rotated_at IS NOT NULL
-  AND user_record.credential_rotated_at >= $2
-  AND credential.algorithm='argon2id'
-  AND credential.activation_digest IS NULL
-  AND credential.password_changed_at IS NOT NULL
-  AND (credential.locked_until IS NULL OR credential.locked_until <= $1)
-  AND credential.mfa_secret_reference <> ''
-  AND octet_length(credential.salt) BETWEEN 16 AND 64
-  AND octet_length(credential.derived_key) BETWEEN 16 AND 64
-  AND parsed[1]::integer BETWEEN 19456 AND 262144
-  AND parsed[2]::integer BETWEEN 1 AND 10
-  AND parsed[3]::integer BETWEEN 1 AND 8
-  AND parsed[4]::integer BETWEEN 16 AND 64
-  AND parsed[4]::integer = octet_length(credential.derived_key)
-  AND credential.parameters = format(
-      'm=%s,t=%s,p=%s,l=%s', parsed[1]::integer, parsed[2]::integer,
-      parsed[3]::integer, parsed[4]::integer
-  )
-  AND EXISTS (
-      SELECT 1
-      FROM role_bindings AS binding
-      WHERE binding.role_name='admin'
-        AND binding.scope_type='platform'
-        AND binding.effect='allow'
-        AND binding.valid_from <= $1
-        AND (binding.valid_until IS NULL OR binding.valid_until > $1)
-        AND (
-            (binding.subject_type='user' AND binding.subject_id=user_record.id)
-            OR (
-                binding.subject_type='organization'
-                AND EXISTS (
-                    SELECT 1 FROM organization_memberships AS membership
-                    WHERE membership.organization_id=binding.subject_id
-                      AND membership.user_id=user_record.id
-                )
-            )
-        )
-  )
-  AND NOT EXISTS (
-      SELECT 1
-      FROM role_bindings AS binding
-      WHERE binding.role_name='admin'
-        AND binding.scope_type='platform'
-        AND binding.effect='deny'
-        AND binding.valid_from <= $1
-        AND (binding.valid_until IS NULL OR binding.valid_until > $1)
-        AND (
-            (binding.subject_type='user' AND binding.subject_id=user_record.id)
-            OR (
-                binding.subject_type='organization'
-                AND EXISTS (
-                    SELECT 1 FROM organization_memberships AS membership
-                    WHERE membership.organization_id=binding.subject_id
-                      AND membership.user_id=user_record.id
-                )
-            )
-        )
-  )
-`, at.UTC(), at.UTC().Add(-emergencyCredentialMaximumAge)).Scan(&count)
+WITH structural_candidates AS (
+    SELECT user_record.id,
+           user_record.credential_rotated_at IS NOT NULL
+               AND user_record.credential_rotated_at >= $2
+               AND (credential.locked_until IS NULL OR credential.locked_until <= $1)
+               AS currently_usable
+    FROM user_principals AS user_record
+    JOIN local_credentials AS credential ON credential.user_id=user_record.id
+    CROSS JOIN LATERAL regexp_match(
+        credential.parameters,
+        '^m=([0-9]{1,6}),t=([0-9]{1,2}),p=([0-9]),l=([0-9]{1,2})$'
+    ) AS parsed
+    WHERE user_record.user_kind='emergency'
+      AND user_record.status='active'
+      AND user_record.mfa_enrolled=TRUE
+      AND credential.algorithm='argon2id'
+      AND credential.activation_digest IS NULL
+      AND credential.password_changed_at IS NOT NULL
+      AND credential.mfa_secret_reference <> ''
+      AND octet_length(credential.salt) BETWEEN 16 AND 64
+      AND octet_length(credential.derived_key) BETWEEN 16 AND 64
+      AND parsed[1]::integer BETWEEN 19456 AND 262144
+      AND parsed[2]::integer BETWEEN 1 AND 10
+      AND parsed[3]::integer BETWEEN 1 AND 8
+      AND parsed[4]::integer BETWEEN 16 AND 64
+      AND parsed[4]::integer = octet_length(credential.derived_key)
+      AND credential.parameters = format(
+          'm=%s,t=%s,p=%s,l=%s', parsed[1]::integer, parsed[2]::integer,
+          parsed[3]::integer, parsed[4]::integer
+      )
+), permission_boundaries AS (
+    SELECT binding.valid_from AS boundary_at
+    FROM role_bindings AS binding
+    WHERE binding.role_name='admin'
+      AND binding.scope_type='platform'
+      AND binding.valid_from > $1
+    UNION
+    SELECT binding.valid_until AS boundary_at
+    FROM role_bindings AS binding
+    WHERE binding.role_name='admin'
+      AND binding.scope_type='platform'
+      AND binding.valid_until IS NOT NULL
+      AND binding.valid_until > $1
+), evaluation_points AS (
+    SELECT $1::timestamptz AS evaluated_at, TRUE AS is_current
+    UNION ALL
+    SELECT boundary_at, FALSE FROM permission_boundaries
+), candidate_access AS (
+    SELECT point.evaluated_at,
+           point.is_current,
+           candidate.id,
+           candidate.currently_usable,
+           EXISTS (
+               SELECT 1
+               FROM role_bindings AS binding
+               WHERE binding.role_name='admin'
+                 AND binding.scope_type='platform'
+                 AND binding.effect='allow'
+                 AND binding.valid_from <= point.evaluated_at
+                 AND (binding.valid_until IS NULL OR binding.valid_until > point.evaluated_at)
+                 AND (
+                     (binding.subject_type='user' AND binding.subject_id=candidate.id)
+                     OR (
+                         binding.subject_type='organization'
+                         AND EXISTS (
+                             SELECT 1 FROM organization_memberships AS membership
+                             WHERE membership.organization_id=binding.subject_id
+                               AND membership.user_id=candidate.id
+                         )
+                     )
+                 )
+           ) AND NOT EXISTS (
+               SELECT 1
+               FROM role_bindings AS binding
+               WHERE binding.role_name='admin'
+                 AND binding.scope_type='platform'
+                 AND binding.effect='deny'
+                 AND binding.valid_from <= point.evaluated_at
+                 AND (binding.valid_until IS NULL OR binding.valid_until > point.evaluated_at)
+                 AND (
+                     (binding.subject_type='user' AND binding.subject_id=candidate.id)
+                     OR (
+                         binding.subject_type='organization'
+                         AND EXISTS (
+                             SELECT 1 FROM organization_memberships AS membership
+                             WHERE membership.organization_id=binding.subject_id
+                               AND membership.user_id=candidate.id
+                         )
+                     )
+                 )
+           ) AS has_access
+    FROM evaluation_points AS point
+    CROSS JOIN structural_candidates AS candidate
+), point_counts AS (
+    SELECT point.evaluated_at,
+           point.is_current,
+           count(*) FILTER (
+               WHERE access.has_access
+                 AND (NOT point.is_current OR access.currently_usable)
+           ) AS administrator_count
+    FROM evaluation_points AS point
+    LEFT JOIN candidate_access AS access
+      ON access.evaluated_at=point.evaluated_at
+     AND access.is_current=point.is_current
+    GROUP BY point.evaluated_at, point.is_current
+)
+SELECT COALESCE(max(administrator_count) FILTER (WHERE is_current), 0),
+       min(evaluated_at) FILTER (WHERE NOT is_current AND administrator_count=0)
+FROM point_counts
+`, at.UTC(), at.UTC().Add(-emergencyCredentialMaximumAge)).Scan(&evaluation.CurrentUsableAdministrators, &scheduledGap)
 	if err != nil {
-		return 0, fmt.Errorf("count usable emergency administrators: %w", err)
+		return BreakGlassInvariantEvaluation{}, fmt.Errorf("evaluate break-glass invariant: %w", err)
 	}
-	return count, nil
+	if scheduledGap != nil {
+		evaluation.FirstScheduledPermissionGap = scheduledGap.UTC()
+	}
+	return evaluation, nil
 }
 
 func (repository *PostgresRepository) GetUser(ctx context.Context, tx pgx.Tx, id uuid.UUID) (UserPrincipal, error) {

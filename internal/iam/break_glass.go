@@ -9,7 +9,9 @@ import (
 
 // BreakGlassInvariantAuthority is the single service authority for mutations
 // that can reduce emergency administrator availability. The repository lock
-// and count run in the caller's transaction, after the tentative mutation.
+// and evaluation run in the caller's transaction, after the tentative
+// mutation. Immediate authentication health and scheduled permission
+// continuity must both hold before the transaction can commit.
 type BreakGlassInvariantAuthority struct {
 	repository BreakGlassInvariantRepository
 }
@@ -25,11 +27,11 @@ func (authority *BreakGlassInvariantAuthority) LockAndRequireUsableAdministrator
 	if err := authority.repository.LockBreakGlassInvariant(ctx, tx); err != nil {
 		return err
 	}
-	count, err := authority.repository.CountUsableEmergencyAdministrators(ctx, tx, at.UTC())
+	evaluation, err := authority.repository.EvaluateBreakGlassInvariant(ctx, tx, at.UTC())
 	if err != nil {
 		return err
 	}
-	if count < 1 {
+	if evaluation.CurrentUsableAdministrators < 1 || !evaluation.FirstScheduledPermissionGap.IsZero() {
 		return ErrLastEmergencyAdministrator
 	}
 	return nil
