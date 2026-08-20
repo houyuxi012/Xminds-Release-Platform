@@ -300,18 +300,17 @@ func (service *Service) startPublication(ctx context.Context, principal identity
 	if !idempotencyPattern.MatchString(idempotencyKey) {
 		return OperationResult{}, ErrIdempotencyKeyInvalid
 	}
-	if existing, err := service.repository.FindAttempt(ctx, nil, releaseID, kind, idempotencyKey); err == nil {
-		current, getErr := service.repository.Get(ctx, productID, releaseID)
-		return OperationResult{Release: current, Attempt: existing}, getErr
-	} else if !errors.Is(err, ErrAttemptNotFound) {
-		return OperationResult{}, err
-	}
 	current, err := service.repository.Get(ctx, productID, releaseID)
 	if err != nil {
 		return OperationResult{}, err
 	}
 	if err := service.authorizer.RequireInChannel(principal, action, productID, current.Channel); err != nil {
-		return OperationResult{}, err
+		return OperationResult{}, ErrReleaseNotFound
+	}
+	if existing, findErr := service.repository.FindAttempt(ctx, nil, releaseID, kind, idempotencyKey); findErr == nil {
+		return OperationResult{Release: current, Attempt: existing}, nil
+	} else if !errors.Is(findErr, ErrAttemptNotFound) {
+		return OperationResult{}, findErr
 	}
 	if !TransitionAllowed(current.Status, StatusPublishing) {
 		return OperationResult{}, ErrInvalidTransition
@@ -402,7 +401,7 @@ func (service *Service) Get(ctx context.Context, principal identity.Principal, p
 		return Release{}, err
 	}
 	if err := service.authorizer.RequireInChannel(principal, identity.ActionProductRead, productID, current.Channel); err != nil {
-		return Release{}, err
+		return Release{}, ErrReleaseNotFound
 	}
 	return current, nil
 }
@@ -417,7 +416,7 @@ func (service *Service) transition(ctx context.Context, principal identity.Princ
 		return Release{}, err
 	}
 	if err := service.authorizer.RequireInChannel(principal, action, productID, current.Channel); err != nil {
-		return Release{}, err
+		return Release{}, ErrReleaseNotFound
 	}
 	return service.transitionAuthorized(ctx, principal, current, expectedLockVersion, target, reason, request)
 }
