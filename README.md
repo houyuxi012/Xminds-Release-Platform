@@ -162,7 +162,7 @@ SCIM 来源 Secret 只引用另一个 Bearer 文件，禁止将 Token 直接写�
 
 目录请求总超时可在 1–30 秒范围内调整，该预算从操作入口开始，覆盖 Secret 读取、DNS、全部分页和 HTTP；单次拨号、TLS 与请求仍受更短上限约束。总页数上限为 10000，用户、组织、成员和层级关系总数上限为 100000。出站连接在解析后固定 IPv4/IPv6 地址并在拨号层校验目标 host，默认仅允许可公开路由地址，拒绝 loopback、link-local/metadata、CGNAT、文档/基准测试网段、unspecified、multicast 和其他特殊用途地址。拒绝表依据 IANA IPv4/IPv6 Special-Purpose Address Registry 的 2025-10-09 快照审核，并采用更保守的安全策略：`2001::/23` 整段均被拒绝，包括 IANA 标记为 globally reachable 的更具体例外，因此该策略不等同于 IANA `Globally Reachable` 属性。只有 `development`/`test` 可通过兼容变量 `XMINDS_RELEASE_IAM_DIRECTORY_ALLOW_LOOPBACK_HTTP=true` 显式允许 loopback HTTP/HTTPS；企业 RFC1918/ULA 私网必须经审核后通过 `XMINDS_RELEASE_IAM_DIRECTORY_ALLOWED_PRIVATE_CIDRS` 仅列出规范化、无主机位且确需访问的 CIDR，例如 `10.42.7.0/24,fd12:3456:789a::/48`。每个获准网段中的任一地址都可能接收目录 Bearer，因此必须遵循最小网段并纳入配置变更审计；即便配置私网 allowlist，仍强制 TLS 1.2+、正确 ServerName、DNS 固定与受控 CA，且不能放行 metadata、CGNAT、link-local 等特殊用途地址。具体变量与默认值见 [`.env.example`](.env.example)。
 
-迁移文件一经发布不得改写。`*.pre.sql` companion 仅用于让历史数据满足对应不可变迁移的前置条件：迁移框架在同一 PostgreSQL 事务中执行 companion 与目标 migration，并分别记录稳定名称和 SHA-256；目标失败时 companion 变更与两条记录全部回滚。已经记录目标 migration 的数据库不会补跑该 companion，后续修正必须使用新的顺序迁移。
+迁移文件一经发布不得改写。`*.pre.sql` companion 仅用于让历史数据满足对应不可变迁移的前置条件：迁移框架在同一 PostgreSQL 事务中执行 companion 与目标 migration，并分别记录稳定名称和 SHA-256；目标失败时 companion 变更与两条记录全部回滚。已经记录目标 migration 的数据库不会补跑该 companion，后续修正必须使用新的顺序迁移。回滚目录同步迁移前必须停止 API/Worker 并由单一迁移领导者执行；`000015` down 会在同一事务中将仍含 v15 self-cycle staging 的非终态作业及其 active Outbox 收敛为带稳定回滚错误码的 `failed`/`dead_letter`，清理仅属 staging 的自循环关系后再恢复 v14 约束。原有 completed/dead-letter 终态与既有 failed 证据保持不变，迁移 ledger 与稳定错误码用于运维核查和重新发起同步。
 
 默认 Public API 监听 `127.0.0.1:8081`，只提供：
 

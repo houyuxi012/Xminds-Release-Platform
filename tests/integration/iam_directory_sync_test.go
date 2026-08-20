@@ -215,15 +215,139 @@ FROM directory_sync_jobs WHERE identity_source_id=$1`, sourceID).Scan(&failed, &
 	if _, err := pool.Exec(ctx, `INSERT INTO directory_sync_stage_parents (sync_job_id, organization_external_id, parent_external_id) VALUES ($1, 'self-cycle', 'self-cycle')`, stagedJobID); err != nil {
 		t.Fatalf("migration 15 rejected self relation before cycle detection: %v", err)
 	}
-	if _, err := pool.Exec(ctx, `DELETE FROM directory_sync_stage_parents WHERE sync_job_id=$1`, stagedJobID); err != nil {
+	rollbackJobID, rollbackOutboxID, failedActiveOutboxID, terminalOutboxID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	if _, err := pool.Exec(ctx, `
+INSERT INTO directory_sync_jobs (
+    id, identity_source_id, mode, status, cursor, requested_by, request_id,
+    source_version, run_marker, phase, created_at, updated_at
+) VALUES ($1, $2, 'apply', 'pending', '', 'migration:rollback-test', $3, 3, $1, 'fetch', $4, $4)`,
+		rollbackJobID, sourceID, uuid.New(), now.Add(10*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+INSERT INTO outbox_jobs (
+    id, kind, aggregate_id, payload, status, attempts, available_at,
+    lease_owner, lease_expires_at, created_at, updated_at
+) VALUES ($1, 'iam.directory.sync.v1', $2, '{}'::jsonb, 'leased', 2, $3::timestamptz,
+          'rollback-test-worker', $3::timestamptz + interval '1 minute', $3::timestamptz, $3::timestamptz)`, rollbackOutboxID, rollbackJobID, now.Add(10*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+INSERT INTO outbox_jobs (
+    id, kind, aggregate_id, payload, status, attempts, available_at,
+    lease_owner, lease_expires_at, created_at, updated_at
+) VALUES ($1, 'iam.directory.sync.v1', $2, '{}'::jsonb, 'leased', 2, $3::timestamptz,
+          'rollback-test-worker', $3::timestamptz + interval '1 minute', $3::timestamptz, $3::timestamptz)`, failedActiveOutboxID, stagedJobID, now.Add(10*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+INSERT INTO outbox_jobs (
+    id, kind, aggregate_id, payload, status, attempts, available_at,
+    last_error_code, created_at, updated_at
+) VALUES ($1, 'iam.directory.sync.v1', $2, '{}'::jsonb, 'completed', 1, $3,
+          'existing_terminal_evidence', $3, $3)`, terminalOutboxID, stagedJobID, now.Add(10*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+INSERT INTO directory_sync_stage_organizations (sync_job_id, external_id, name)
+VALUES ($1, 'self-cycle', 'Self Cycle'), ($1, 'child', 'Child'), ($1, 'parent', 'Parent')`, rollbackJobID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+INSERT INTO directory_sync_stage_parents (sync_job_id, organization_external_id, parent_external_id)
+VALUES ($1, 'self-cycle', 'self-cycle'), ($1, 'child', 'parent')`, rollbackJobID); err != nil {
 		t.Fatal(err)
 	}
 	downSQL, err := fs.ReadFile(migrations.FS, "000015_directory_sync_invariants.down.sql")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, string(downSQL)); err != nil {
+	downTx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = downTx.Rollback(context.Background()) }()
+	if _, err := downTx.Exec(ctx, string(downSQL)); err != nil {
 		t.Fatalf("apply migration 15 down: %v", err)
+	}
+	if _, err := downTx.Exec(ctx, `DELETE FROM schema_migration_preflights WHERE migration_version=15`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := downTx.Exec(ctx, `DELETE FROM schema_migrations WHERE version=15`); err != nil {
+		t.Fatal(err)
+	}
+	if err := downTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var maximumVersion int
+	if err := pool.QueryRow(ctx, `SELECT max(version) FROM schema_migrations`).Scan(&maximumVersion); err != nil {
+		t.Fatal(err)
+	}
+	if maximumVersion != 14 {
+		t.Fatalf("maximum migration version=%d, want 14 after down", maximumVersion)
+	}
+	var version15Preflights int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM schema_migration_preflights WHERE migration_version=15`).Scan(&version15Preflights); err != nil {
+		t.Fatal(err)
+	}
+	if version15Preflights != 0 {
+		t.Fatalf("migration 15 preflight ledger rows=%d after down", version15Preflights)
+	}
+	if err := pool.QueryRow(ctx, `SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid='directory_sync_jobs'::regclass AND conname='directory_sync_jobs_status_check'`).Scan(&statusConstraint); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(statusConstraint, "partial") {
+		t.Fatalf("migration 15 down did not restore v14 status constraint: %s", statusConstraint)
+	}
+	var rollbackStatus, rollbackCode, outboxStatus, outboxCode string
+	var rollbackCompleted bool
+	if err := pool.QueryRow(ctx, `
+SELECT status, error_code, completed_at IS NOT NULL
+FROM directory_sync_jobs WHERE id=$1`, rollbackJobID).Scan(&rollbackStatus, &rollbackCode, &rollbackCompleted); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `
+SELECT status, COALESCE(last_error_code, '')
+FROM outbox_jobs WHERE id=$1 AND lease_owner IS NULL AND lease_expires_at IS NULL`, rollbackOutboxID).Scan(&outboxStatus, &outboxCode); err != nil {
+		t.Fatal(err)
+	}
+	if rollbackStatus != "failed" || rollbackCode != "directory_migration_rollback_restart_required" || !rollbackCompleted ||
+		outboxStatus != "dead_letter" || outboxCode != "directory_migration_rollback_restart_required" {
+		t.Fatalf("rollback job=%q/%q completed=%t outbox=%q/%q", rollbackStatus, rollbackCode, rollbackCompleted, outboxStatus, outboxCode)
+	}
+	var terminalOutboxStatus, terminalOutboxCode string
+	if err := pool.QueryRow(ctx, `SELECT status, COALESCE(last_error_code, '') FROM outbox_jobs WHERE id=$1`, terminalOutboxID).Scan(&terminalOutboxStatus, &terminalOutboxCode); err != nil {
+		t.Fatal(err)
+	}
+	if terminalOutboxStatus != "completed" || terminalOutboxCode != "existing_terminal_evidence" {
+		t.Fatalf("existing terminal outbox changed to %q/%q", terminalOutboxStatus, terminalOutboxCode)
+	}
+	var failedActiveOutboxStatus, failedActiveOutboxCode string
+	if err := pool.QueryRow(ctx, `
+SELECT status, COALESCE(last_error_code, '')
+FROM outbox_jobs WHERE id=$1 AND lease_owner IS NULL AND lease_expires_at IS NULL`, failedActiveOutboxID).Scan(&failedActiveOutboxStatus, &failedActiveOutboxCode); err != nil {
+		t.Fatal(err)
+	}
+	if failedActiveOutboxStatus != "dead_letter" || failedActiveOutboxCode != "directory_migration_rollback_restart_required" {
+		t.Fatalf("failed job active outbox=%q/%q", failedActiveOutboxStatus, failedActiveOutboxCode)
+	}
+	var preservedFailedCode string
+	if err := pool.QueryRow(ctx, `SELECT error_code FROM directory_sync_jobs WHERE id=$1 AND status='failed'`, stagedJobID).Scan(&preservedFailedCode); err != nil {
+		t.Fatal(err)
+	}
+	if preservedFailedCode != "directory_migration_restart_required" {
+		t.Fatalf("existing failed evidence changed to %q", preservedFailedCode)
+	}
+	var selfRelations, nonSelfRelations int
+	if err := pool.QueryRow(ctx, `
+SELECT count(*) FILTER (WHERE organization_external_id=parent_external_id),
+       count(*) FILTER (WHERE organization_external_id<>parent_external_id)
+FROM directory_sync_stage_parents
+WHERE sync_job_id IN ($1, $2)`, stagedJobID, rollbackJobID).Scan(&selfRelations, &nonSelfRelations); err != nil {
+		t.Fatal(err)
+	}
+	if selfRelations != 0 || nonSelfRelations != 1 {
+		t.Fatalf("stage cleanup self=%d non_self=%d", selfRelations, nonSelfRelations)
 	}
 	if _, err := pool.Exec(ctx, `
 INSERT INTO directory_sync_stage_parents (sync_job_id, organization_external_id, parent_external_id)
