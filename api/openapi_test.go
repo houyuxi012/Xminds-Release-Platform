@@ -153,3 +153,38 @@ func TestOpenAPIDefinesPrivateSCMManagementAndSignedWebhookOperations(t *testing
 		t.Fatal("SCM webhook must explicitly disable Bearer security and rely on provider signature verification")
 	}
 }
+
+func TestOpenAPIDefinesEndpointManagementAndUnauthenticatedDistributionOperations(t *testing.T) {
+	t.Parallel()
+
+	loader := openapi3.NewLoader()
+	document, err := loader.LoadFromFile("openapi.yaml")
+	if err != nil {
+		t.Fatalf("load OpenAPI contract: %v", err)
+	}
+	for _, testCase := range []struct {
+		path   string
+		method string
+		public bool
+	}{
+		{path: "/api/v1/endpoints", method: "POST"},
+		{path: "/api/v1/endpoints/{endpoint_id}", method: "GET"},
+		{path: "/api/v1/endpoints/{endpoint_id}/activate", method: "POST"},
+		{path: "/metadata/{role}.json", method: "GET", public: true},
+		{path: "/v1/products/{product}/channels/{channel}/metadata/{role}.json", method: "GET", public: true},
+		{path: "/v1/products/{product}/artifacts/{sha256}", method: "GET", public: true},
+	} {
+		pathItem := document.Paths.Find(testCase.path)
+		if pathItem == nil || pathItem.GetOperation(testCase.method) == nil {
+			t.Fatalf("missing %s %s operation", testCase.method, testCase.path)
+		}
+		operation := pathItem.GetOperation(testCase.method)
+		if testCase.public {
+			if operation.Security == nil || len(*operation.Security) != 0 {
+				t.Errorf("%s %s must explicitly disable Bearer security", testCase.method, testCase.path)
+			}
+		} else if operation.Extensions["x-required-action"] != "integration.manage" {
+			t.Errorf("%s %s action = %#v", testCase.method, testCase.path, operation.Extensions["x-required-action"])
+		}
+	}
+}

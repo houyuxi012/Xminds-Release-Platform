@@ -231,6 +231,22 @@ func (repository *PostgresRepository) GetArtifact(ctx context.Context, productID
 	return item, nil
 }
 
+func (repository *PostgresRepository) GetByDigest(ctx context.Context, productID, digest string) (Artifact, error) {
+	if repository == nil || repository.pool == nil {
+		return Artifact{}, ErrRepositoryRequired
+	}
+	item, err := scanBoundArtifact(repository.pool.QueryRow(ctx, boundArtifactSelect+`
+ WHERE binding.product_id = $1 AND artifact.sha256 = $2
+`, productID, digest))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Artifact{}, ErrArtifactNotFound
+	}
+	if err != nil {
+		return Artifact{}, fmt.Errorf("get product artifact by digest: %w", err)
+	}
+	return item, nil
+}
+
 const boundArtifactSelect = `
 SELECT
     artifact.id, binding.product_id, binding.artifact_type, binding.filename,

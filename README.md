@@ -38,8 +38,11 @@ Xminds Release Platform 是面向企业软件交付场景的多产品可信发�
 - GitHub HMAC-SHA256、GitLab Standard Webhooks/旧版 Secret Token 验签、事件重放幂等和事务审计；
 - 提交查询、Check Run/Commit Status 能力回写、`scm.status.writeback.v1` 持久作业与本地私有 CA 契约测试；
 - AES-256-GCM Provider 凭据密文持久化、AAD 元数据绑定、主密钥 ID 轮换和旧凭据即时撤销。
+- origin、CDN 与私有分发端点的产品范围注册、HTTPS 摘要校验、优先级和连续失败健康状态；
+- `endpoint.sync.v1` 五角色目录与引用制品复制、目标端回读 SHA-256 校验和三次失败摘除；
+- 独立公网监听端口、默认产品兼容目录路径、产品/通道隔离目录路径和支持单段 Range 的内容寻址制品下载。
 
-当前 API 运行时只开放存活、就绪和版本端点。产品、制品和 Release HTTP 适配器已经完成并强制从请求上下文获取已验证身份；在 API 组合根完成 OIDC/工作负载身份配置前不会挂载业务路由，避免暴露未受保护的管理接口。Worker 已挂载目录发布、目录撤销和审计导出处理器，所有签名材料与对象存储凭据必须在启动时显式注入，否则拒绝运行。
+当前管理 API 运行时只开放存活、就绪和版本端点。产品、制品、Release 与分发端点 HTTP 适配器已经完成并强制从请求上下文获取已验证身份；在 API 组合根完成 OIDC/工作负载身份配置前不会挂载业务路由，避免暴露未受保护的管理接口。独立 Public API 只挂载公开目录和制品读取路由，不包含管理操作。Worker 已挂载目录发布、目录撤销和审计导出处理器；端点同步处理器已完成，待具体分发目标传输适配器在部署组合根注入。所有签名材料与对象存储凭据必须在启动时显式注入，否则拒绝运行。
 
 ## P0 能力范围
 
@@ -101,6 +104,14 @@ go run ./apps/release-worker
 - `GET /health/live`：进程存活检查；
 - `GET /health/ready`：PostgreSQL 就绪检查；
 - `GET /version`：构建版本信息。
+
+默认 Public API 监听 `127.0.0.1:8081`，只提供：
+
+- `GET /metadata/{role}.json`：部署配置指定的默认产品与通道兼容路径；
+- `GET /v1/products/{product}/channels/{channel}/metadata/{role}.json`：产品范围可信目录；
+- `GET /v1/products/{product}/artifacts/{sha256}`：内容寻址制品下载与单段 Range 请求。
+
+Public API 仍需只读对象存储凭据，并要求显式配置 `XMINDS_RELEASE_DEFAULT_PRODUCT_ID` 与 `XMINDS_RELEASE_DEFAULT_CHANNEL`；缺少任一项时服务拒绝启动。
 
 Worker 依赖预先执行的数据库迁移、可用的 S3/MinIO 桶、经签名的 `root.json`、四类在线角色加密私钥和 32 字节主密钥文件。SCM Provider 凭据使用独立主密钥目录与当前 key ID，历史 key 仅用于轮换期解密，不能复用于目录签名。完整变量见 [`.env.example`](.env.example)，root 与在线密钥边界见[密钥仪式规范](docs/security/key-ceremony.md)。
 

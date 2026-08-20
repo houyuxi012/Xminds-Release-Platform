@@ -26,6 +26,10 @@ tags:
     description: 产品范围内的不可变审计事件查询与导出
   - name: SCM
     description: GitHub、GHES 与 GitLab Self-Managed 连接、密文凭据和 Webhook
+  - name: Endpoints
+    description: 分发端点注册、目录摘要探测与健康状态管理
+  - name: Public Distribution
+    description: 无需登录的 TUF 元数据兼容下载与产品范围制品下载
 paths:
   /health/live:
     get:
@@ -753,6 +757,196 @@ paths:
           $ref: '#/components/responses/Conflict'
         '422':
           $ref: '#/components/responses/UnprocessableEntity'
+  /api/v1/endpoints:
+    post:
+      operationId: registerDistributionEndpoint
+      summary: 注册分发端点
+      description: 端点先以 pending 状态登记，必须通过 HTTPS 目录摘要探测后才能激活。
+      tags: [Endpoints]
+      x-required-action: integration.manage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DistributionEndpointRequest'
+      responses:
+        '201':
+          description: 分发端点已登记
+          headers:
+            Location:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DistributionEndpoint'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '415':
+          description: 请求媒体类型不受支持
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+  /api/v1/endpoints/{endpoint_id}:
+    get:
+      operationId: getDistributionEndpoint
+      summary: 查询分发端点状态
+      tags: [Endpoints]
+      x-required-action: integration.manage
+      parameters:
+        - $ref: '#/components/parameters/EndpointIDPath'
+      responses:
+        '200':
+          description: 分发端点详情
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DistributionEndpoint'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/v1/endpoints/{endpoint_id}/activate:
+    post:
+      operationId: activateDistributionEndpoint
+      summary: 校验并激活分发端点
+      description: 通过 HTTPS 健康探针读取根与时间戳摘要，并与当前产品目录精确比对。
+      tags: [Endpoints]
+      x-required-action: integration.manage
+      parameters:
+        - $ref: '#/components/parameters/EndpointIDPath'
+      responses:
+        '200':
+          description: 端点已通过摘要校验并激活
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DistributionEndpoint'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: 探针失败或目录摘要不一致
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+  /metadata/{role}.json:
+    get:
+      operationId: getCompatibilityCatalogRole
+      summary: 获取默认产品与通道的 TUF 元数据
+      description: 面向既有客户端的兼容路径；默认产品与通道由服务端部署配置唯一确定。
+      tags: [Public Distribution]
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/CatalogRolePath'
+      responses:
+        '200':
+          $ref: '#/components/responses/CatalogMetadata'
+        '304':
+          description: ETag 未变化
+        '404':
+          description: 角色或当前目录不存在
+        '503':
+          description: 目录对象暂时不可用
+  /v1/products/{product}/channels/{channel}/metadata/{role}.json:
+    get:
+      operationId: getProductCatalogRole
+      summary: 获取指定产品通道的 TUF 元数据
+      tags: [Public Distribution]
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/PublicProductPath'
+        - $ref: '#/components/parameters/PublicChannelPath'
+        - $ref: '#/components/parameters/CatalogRolePath'
+      responses:
+        '200':
+          $ref: '#/components/responses/CatalogMetadata'
+        '304':
+          description: ETag 未变化
+        '404':
+          description: 产品、通道、角色或当前目录不存在
+        '503':
+          description: 目录对象暂时不可用
+  /v1/products/{product}/artifacts/{sha256}:
+    get:
+      operationId: downloadProductArtifact
+      summary: 按 SHA-256 下载产品制品
+      description: 摘要必须归属于路径中的产品；支持单个 HTTP 字节范围，不接受多段范围请求。
+      tags: [Public Distribution]
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/PublicProductPath'
+        - name: sha256
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^[0-9a-f]{64}$'
+        - name: Range
+          in: header
+          required: false
+          schema:
+            type: string
+            pattern: '^bytes=[0-9]*-[0-9]*$'
+      responses:
+        '200':
+          description: 完整制品
+          headers:
+            Accept-Ranges:
+              schema:
+                type: string
+                const: bytes
+            Content-Disposition:
+              schema:
+                type: string
+                const: attachment
+            ETag:
+              schema:
+                type: string
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '206':
+          description: 单段范围内容
+          headers:
+            Content-Range:
+              schema:
+                type: string
+            Accept-Ranges:
+              schema:
+                type: string
+                const: bytes
+            Content-Disposition:
+              schema:
+                type: string
+                const: attachment
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '304':
+          description: ETag 未变化
+        '404':
+          description: 产品范围内不存在该摘要
+        '416':
+          description: Range 无效或请求了多段范围
+        '503':
+          description: 制品对象暂时不可用
   /api/v1/audit-events:
     get:
       operationId: queryAuditEvents
@@ -1012,6 +1206,34 @@ components:
       schema:
         type: string
         format: uuid
+    EndpointIDPath:
+      name: endpoint_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    PublicProductPath:
+      name: product
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: '^[a-z][a-z0-9-]{1,62}$'
+    PublicChannelPath:
+      name: channel
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: '^[a-z][a-z0-9._-]{0,63}$'
+    CatalogRolePath:
+      name: role
+      in: path
+      required: true
+      schema:
+        type: string
+        enum: [root, targets, snapshot, timestamp, revocation]
   securitySchemes:
     oidcBearer:
       type: http
@@ -1024,6 +1246,20 @@ components:
       bearerFormat: JWT
       description: 面向 CI/CD、客户端与同步执行器的短期工作负载令牌。
   responses:
+    CatalogMetadata:
+      description: 已签名的 TUF 元数据封装
+      headers:
+        Cache-Control:
+          schema:
+            type: string
+        ETag:
+          schema:
+            type: string
+      content:
+        application/json:
+          schema:
+            type: object
+            additionalProperties: true
     InternalError:
       description: 服务内部错误
       content:
@@ -1065,6 +1301,73 @@ components:
           schema:
             $ref: '#/components/schemas/ProblemDetails'
   schemas:
+    DistributionEndpointRequest:
+      type: object
+      additionalProperties: false
+      required: [product_id, name, type, region, priority, base_url, path_prefix, health_path]
+      properties:
+        product_id:
+          type: string
+          pattern: '^[a-z][a-z0-9-]{1,62}$'
+        name:
+          type: string
+          minLength: 1
+          maxLength: 128
+        type:
+          type: string
+          enum: [origin, cdn, private]
+        region:
+          type: string
+          pattern: '^[a-z][a-z0-9-]{1,62}$'
+        priority:
+          type: integer
+          minimum: 0
+          maximum: 1000
+        base_url:
+          type: string
+          format: uri
+          pattern: '^https://'
+        path_prefix:
+          type: string
+          pattern: '^/'
+          maxLength: 512
+        health_path:
+          type: string
+          pattern: '^/'
+          maxLength: 512
+        tls_ca_ref:
+          type: string
+          maxLength: 256
+    DistributionEndpoint:
+      allOf:
+        - $ref: '#/components/schemas/DistributionEndpointRequest'
+        - type: object
+          required: [id, status, failure_count, created_at, updated_at]
+          properties:
+            id:
+              type: string
+              format: uuid
+            status:
+              type: string
+              enum: [pending, active, unhealthy, disabled]
+            last_root_digest:
+              type: string
+              pattern: '^[0-9a-f]{64}$'
+            last_timestamp_digest:
+              type: string
+              pattern: '^[0-9a-f]{64}$'
+            last_checked_at:
+              type: string
+              format: date-time
+            failure_count:
+              type: integer
+              minimum: 0
+            created_at:
+              type: string
+              format: date-time
+            updated_at:
+              type: string
+              format: date-time
     SCMConnectionRequest:
       type: object
       additionalProperties: false
