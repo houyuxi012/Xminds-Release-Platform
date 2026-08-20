@@ -130,9 +130,17 @@ local_credentials, user_principals, iam_login_state, identity_sources CASCADE;
 	if _, err := pool.Exec(ctx, `
 INSERT INTO identity_sources (id, name, source_kind, status, version, created_at, updated_at)
 VALUES ($1, 'Source A', 'oidc', 'enabled', 1, $3, $3),
-       ($2, 'Source B', 'oidc', 'enabled', 1, $3, $3);
+       ($2, 'Source B', 'oidc', 'enabled', 1, $3, $3)
+`, sourceAID, sourceBID, now); err != nil {
+		t.Fatalf("seed identity sources: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
 INSERT INTO iam_login_state (singleton, login_mode, active_source_id, version, updated_by, updated_at)
-VALUES (TRUE, 'sso', $1, 1, 'test:bootstrap', $3);
+VALUES (TRUE, 'sso', $1, 1, 'test:bootstrap', $2)
+`, sourceAID, now); err != nil {
+		t.Fatalf("seed IAM login state: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
 INSERT INTO user_principals (
     id, identity_source_id, external_subject, username, display_name, user_kind, status,
     version, created_at, updated_at, disabled_at, disabled_reason
@@ -140,15 +148,19 @@ INSERT INTO user_principals (
     ($4, $1, 'shared-subject', 'source-a-user', 'Source A User', 'external', 'active', 1, $3, $3, NULL, ''),
     ($5, $2, 'shared-subject', 'source-b-user', 'Source B User', 'external', 'active', 1, $3, $3, NULL, ''),
     ($6, $2, 'wrong-source-only', 'wrong-source-user', 'Wrong Source User', 'external', 'active', 1, $3, $3, NULL, ''),
-    ($7, $1, 'disabled-user', 'disabled-source-a-user', 'Disabled Source A User', 'external', 'disabled', 1, $3, $3, $3, 'directory disabled');
+    ($7, $1, 'disabled-user', 'disabled-source-a-user', 'Disabled Source A User', 'external', 'disabled', 1, $3, $3, $3, 'directory disabled')
+`, sourceAID, sourceBID, now, sourceAUserID, sourceBUserID, wrongSourceUserID, disabledUserID); err != nil {
+		t.Fatalf("seed governed users: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
 INSERT INTO role_bindings (
     id, subject_type, subject_id, role_name, scope_type, effect, valid_from,
     created_by, version, created_at, updated_at
 ) VALUES
-    ($8, 'user', $4, 'viewer', 'platform', 'allow', $3, 'test:bootstrap', 1, $3, $3),
-    ($9, 'user', $5, 'publisher', 'platform', 'allow', $3, 'test:bootstrap', 1, $3, $3);
-`, sourceAID, sourceBID, now, sourceAUserID, sourceBUserID, wrongSourceUserID, disabledUserID, uuid.New(), uuid.New()); err != nil {
-		t.Fatalf("seed governed principals: %v", err)
+	    ($4, 'user', $2, 'viewer', 'platform', 'allow', $1, 'test:bootstrap', 1, $1, $1),
+	    ($5, 'user', $3, 'publisher', 'platform', 'allow', $1, 'test:bootstrap', 1, $1, $1)
+`, now, sourceAUserID, sourceBUserID, uuid.New(), uuid.New()); err != nil {
+		t.Fatalf("seed governed role bindings: %v", err)
 	}
 
 	resolver, err := iam.NewGovernedPrincipalResolver(iam.NewPostgresRepository(pool), func() time.Time { return now.Add(time.Hour) })
