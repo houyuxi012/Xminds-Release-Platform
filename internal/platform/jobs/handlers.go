@@ -49,6 +49,18 @@ func (registry *DeadLetterRegistry) HandleDeadLetter(ctx context.Context, job Jo
 	return handler.HandleDeadLetter(ctx, job, code)
 }
 
+func (registry *DeadLetterRegistry) ResolveTransactionalDeadLetter(kind string) (TransactionalDeadLetterHandler, bool) {
+	if registry == nil {
+		return nil, false
+	}
+	handler, exists := registry.handlers[strings.TrimSpace(kind)]
+	if !exists {
+		return nil, false
+	}
+	transactional, ok := handler.(TransactionalDeadLetterHandler)
+	return transactional, ok
+}
+
 func NewHandlerRegistry(handlers map[string]Handler) *HandlerRegistry {
 	registry := &HandlerRegistry{handlers: make(map[string]Handler, len(handlers))}
 	for kind, handler := range handlers {

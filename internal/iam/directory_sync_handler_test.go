@@ -22,6 +22,15 @@ func TestDirectorySyncWorkerPayloadRejectsDuplicateMembers(t *testing.T) {
 	}
 }
 
+func TestDirectorySyncWorkerPayloadRejectsCaseFoldAliases(t *testing.T) {
+	jobID, sourceID := uuid.New(), uuid.New()
+	payload := []byte(fmt.Sprintf(`{"job_id":%q,"source_id":%q,"mode":"apply","Mode":"preview"}`, jobID, sourceID))
+	_, err := decodeDirectorySyncJob(jobs.Job{ID: uuid.New(), Kind: JobKindDirectorySync, AggregateID: jobID, Payload: payload})
+	if !errors.Is(err, ErrDirectorySyncConfiguration) {
+		t.Fatalf("decodeDirectorySyncJob() error=%v", err)
+	}
+}
+
 func TestDirectorySyncHandlerRetryResumesFromDurableCursorWithoutRestagingCommittedPage(t *testing.T) {
 	jobID, sourceID := uuid.New(), uuid.New()
 	payload, err := json.Marshal(DirectorySyncJobPayload{JobID: jobID, SourceID: sourceID, Mode: DirectorySyncModeApply})
@@ -58,6 +67,33 @@ func TestDirectorySyncHandlerRetryResumesFromDurableCursorWithoutRestagingCommit
 	}
 	if executor.stagedPages != 2 || executor.job.Status != DirectorySyncStatusCompleted {
 		t.Fatalf("completed job=%#v staged=%d", executor.job, executor.stagedPages)
+	}
+}
+
+func TestDirectorySyncHandlerOperationDeadlineDoesNotResetAcrossSyncPages(t *testing.T) {
+	jobID, sourceID := uuid.New(), uuid.New()
+	payload, err := json.Marshal(DirectorySyncJobPayload{JobID: jobID, SourceID: sourceID, Mode: DirectorySyncModeApply})
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := &directorySyncExecutorFake{
+		job:    DirectorySyncJob{ID: jobID, IdentitySourceID: sourceID, SourceVersion: 5, Mode: DirectorySyncModeApply, Status: DirectorySyncStatusPending, Phase: DirectorySyncPhaseFetch},
+		source: IdentitySource{ID: sourceID, Kind: IdentitySourceSCIM, Status: IdentitySourceStatusVerified, Version: 5},
+	}
+	adapter := &slowDirectorySyncAdapter{delay: 70 * time.Millisecond}
+	handler, err := NewDirectorySyncHandler(DirectorySyncHandlerConfig{
+		Executor: executor, Directory: adapter, MaximumTransitions: 20, OperationTimeout: 100 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	err = handler.Handle(context.Background(), jobs.Job{ID: uuid.New(), Kind: JobKindDirectorySync, AggregateID: jobID, Payload: payload, Attempts: 1})
+	if err == nil || jobs.ErrorCode(err) != "directory_upstream_rejected" || time.Since(started) > 250*time.Millisecond {
+		t.Fatalf("Handle() error=%v code=%q elapsed=%v", err, jobs.ErrorCode(err), time.Since(started))
+	}
+	if adapter.calls != 2 {
+		t.Fatalf("Sync calls=%d, want shared deadline to stop on second page", adapter.calls)
 	}
 }
 
@@ -158,6 +194,31 @@ func (executor *directorySyncExecutorFake) Fail(_ context.Context, _, _ uuid.UUI
 type directorySyncAdapterFake struct {
 	pages   map[string]SyncPage
 	cursors []string
+}
+
+type slowDirectorySyncAdapter struct {
+	delay time.Duration
+	calls int
+}
+
+func (adapter *slowDirectorySyncAdapter) Verify(context.Context, IdentitySource) (CapabilityReport, error) {
+	return CapabilityReport{}, nil
+}
+
+func (adapter *slowDirectorySyncAdapter) Preview(context.Context, IdentitySource) (SyncDiff, error) {
+	return SyncDiff{}, nil
+}
+
+func (adapter *slowDirectorySyncAdapter) Sync(ctx context.Context, _ IdentitySource, cursor string) (SyncPage, error) {
+	adapter.calls++
+	timer := time.NewTimer(adapter.delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return SyncPage{}, ctx.Err()
+	case <-timer.C:
+		return SyncPage{NextCursor: cursor + "x"}, nil
+	}
 }
 
 func (adapter *directorySyncAdapterFake) Verify(context.Context, IdentitySource) (CapabilityReport, error) {

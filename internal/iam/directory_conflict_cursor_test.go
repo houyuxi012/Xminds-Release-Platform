@@ -90,6 +90,27 @@ func TestDirectoryConflictCursorIsOpaqueBoundAuthenticatedAndExpiring(t *testing
 	}
 }
 
+func TestDirectoryConflictCursorKeySecretRequiresStrictBase64URLText(t *testing.T) {
+	raw := bytes.Repeat([]byte{0x5a}, 32)
+	encoded := base64.RawURLEncoding.EncodeToString(raw)
+	decoded, err := DecodeDirectoryConflictCursorKeySecret([]byte(encoded))
+	if err != nil || !bytes.Equal(decoded, raw) {
+		t.Fatalf("decoded=%x error=%v", decoded, err)
+	}
+	for name, secret := range map[string][]byte{
+		"raw bytes":  raw,
+		"padding":    []byte(encoded + "="),
+		"whitespace": []byte(" " + encoded),
+		"short":      []byte(base64.RawURLEncoding.EncodeToString(raw[:31])),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := DecodeDirectoryConflictCursorKeySecret(secret); !errors.Is(err, ErrDirectorySyncConfiguration) {
+				t.Fatalf("error=%v", err)
+			}
+		})
+	}
+}
+
 func newDirectoryTestConflictCursorCodec(t *testing.T, clock func() time.Time) *DirectoryConflictCursorCodec {
 	t.Helper()
 	codec, err := NewDirectoryConflictCursorCodec(bytes.Repeat([]byte{0x3c}, 32), clock, 15*time.Minute)

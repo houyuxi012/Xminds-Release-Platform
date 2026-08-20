@@ -76,6 +76,22 @@ func TestDirectorySyncHTTPVerifyRequiresExpectedVersionAndReturnsCapabilities(t 
 	}
 }
 
+func TestDirectorySyncHTTPRejectsCaseFoldVersionAlias(t *testing.T) {
+	sourceID := uuid.New()
+	application := &directoryHTTPApplication{stubIAMApplication: &stubIAMApplication{}}
+	handler := authenticatedIAMHandler(application)
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/identity-sources/"+sourceID.String()+"/verify", bytes.NewBufferString(`{"version":3,"Version":4}`))
+	request.Header.Set("Authorization", "Bearer token")
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusBadRequest || application.expectedVersion != 0 {
+		t.Fatalf("status=%d decoded_version=%d body=%s", response.Code, application.expectedVersion, response.Body)
+	}
+}
+
 func TestDirectorySyncHTTPJobOwnershipMismatchIsNotFoundAndConflictCursorIsOpaque(t *testing.T) {
 	sourceID, jobID := uuid.New(), uuid.New()
 	application := &directoryHTTPApplication{
@@ -91,7 +107,9 @@ func TestDirectorySyncHTTPJobOwnershipMismatchIsNotFoundAndConflictCursorIsOpaqu
 	jobRequest.Header.Set("Authorization", "Bearer token")
 	jobResponse := httptest.NewRecorder()
 	handler.ServeHTTP(jobResponse, jobRequest)
-	if jobResponse.Code != http.StatusNotFound || !strings.Contains(jobResponse.Body.String(), "DIRECTORY_SYNC_JOB_NOT_FOUND") {
+	if jobResponse.Code != http.StatusNotFound || !strings.Contains(jobResponse.Body.String(), "DIRECTORY_SYNC_JOB_NOT_FOUND") ||
+		!strings.Contains(jobResponse.Body.String(), `"instance":"/api/v1/identity-sources/{source_id}/sync-jobs/{job_id}"`) ||
+		strings.Contains(jobResponse.Body.String(), sourceID.String()) || strings.Contains(jobResponse.Body.String(), jobID.String()) {
 		t.Fatalf("job status=%d body=%s", jobResponse.Code, jobResponse.Body)
 	}
 
@@ -104,6 +122,23 @@ func TestDirectorySyncHTTPJobOwnershipMismatchIsNotFoundAndConflictCursorIsOpaqu
 	}
 	if application.listedPage.Limit != 25 || application.listedPage.Cursor != "opaque-input" || !application.listedPage.BeforeTime.IsZero() || application.listedPage.BeforeID != uuid.Nil {
 		t.Fatalf("directory conflict page=%#v", application.listedPage)
+	}
+}
+
+func TestIAMProblemInstanceTemplatesDirectorySourceJobAndConflictIdentifiers(t *testing.T) {
+	sourceID, jobID := uuid.NewString(), uuid.NewString()
+	for raw, want := range map[string]string{
+		"/api/v1/identity-sources/" + sourceID:                                        "/api/v1/identity-sources/{source_id}",
+		"/api/v1/identity-sources/" + sourceID + "/sync-jobs/" + jobID:                "/api/v1/identity-sources/{source_id}/sync-jobs/{job_id}",
+		"/api/v1/identity-sources/" + sourceID + "/sync-jobs/" + jobID + "/conflicts": "/api/v1/identity-sources/{source_id}/sync-jobs/{job_id}/conflicts",
+		"/api/v1/identity-sources/" + sourceID + "/sync-conflicts":                    "/api/v1/identity-sources/{source_id}/sync-conflicts",
+	} {
+		if got := iamProblemInstance(raw); got != want {
+			t.Errorf("iamProblemInstance(%q)=%q want=%q", raw, got, want)
+		}
+		if got := iamProblemInstance(raw); strings.Contains(got, sourceID) || strings.Contains(got, jobID) {
+			t.Errorf("iamProblemInstance(%q) leaked identifier in %q", raw, got)
+		}
 	}
 }
 

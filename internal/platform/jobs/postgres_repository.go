@@ -9,6 +9,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"xminds-release-platform/internal/platform/database"
 )
 
 const returnedJobFields = `
@@ -136,6 +138,54 @@ SET status = 'dead_letter', lease_owner = NULL, lease_expires_at = NULL,
     last_error_code = $3, updated_at = clock_timestamp()
 WHERE id = $1 AND status = 'leased' AND lease_owner = $2
 `, strings.TrimSpace(code))
+}
+
+func (repository *PostgresRepository) SettleDeadLetter(
+	ctx context.Context,
+	owner string,
+	id uuid.UUID,
+	code string,
+	transition func(pgx.Tx) error,
+) error {
+	owner = strings.TrimSpace(owner)
+	code = strings.TrimSpace(code)
+	if repository == nil || repository.pool == nil || owner == "" || id == uuid.Nil || !errorCodePattern.MatchString(code) || len(code) > 128 {
+		return ErrWorkerConfiguration
+	}
+	return database.WithTx(ctx, repository.pool, func(tx pgx.Tx) error {
+		var status, leaseOwner string
+		if err := tx.QueryRow(ctx, `
+SELECT status, COALESCE(lease_owner, '')
+FROM outbox_jobs
+WHERE id=$1
+FOR UPDATE`, id).Scan(&status, &leaseOwner); err != nil {
+			if err == pgx.ErrNoRows {
+				return ErrLeaseNotOwned
+			}
+			return fmt.Errorf("lock outbox job for dead-letter settlement: %w", err)
+		}
+		if status != string(StatusLeased) || leaseOwner != owner {
+			return ErrLeaseNotOwned
+		}
+		if transition != nil {
+			if err := transition(tx); err != nil {
+				return fmt.Errorf("apply dead-letter domain transition: %w", err)
+			}
+		}
+		result, err := tx.Exec(ctx, `
+UPDATE outbox_jobs
+SET status = 'dead_letter', lease_owner = NULL, lease_expires_at = NULL,
+    last_error_code = $3, updated_at = clock_timestamp()
+WHERE id = $1 AND status = 'leased' AND lease_owner = $2
+`, id, owner, code)
+		if err != nil {
+			return fmt.Errorf("transition outbox job to dead letter: %w", err)
+		}
+		if result.RowsAffected() != 1 {
+			return ErrLeaseNotOwned
+		}
+		return nil
+	})
 }
 
 func (repository *PostgresRepository) transition(ctx context.Context, owner string, id uuid.UUID, statement string, arguments ...any) error {

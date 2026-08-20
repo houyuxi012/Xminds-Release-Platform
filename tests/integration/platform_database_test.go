@@ -143,6 +143,88 @@ func TestPlatformDatabaseRejectsMigrationChecksumDrift(t *testing.T) {
 	}
 }
 
+func TestPlatformDatabasePreflightIsAtomicChecksummedAndSingleLeader(t *testing.T) {
+	databaseURL := integrationDatabaseURL(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool, err := database.Open(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if err := database.ApplyMigrations(ctx, pool, migrations.FS); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+DELETE FROM schema_migration_preflights WHERE migration_version IN (900014,900015);
+DELETE FROM schema_migrations WHERE version IN (900014,900015);
+DROP TABLE IF EXISTS task14_preflight_atomic_probe`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `
+DELETE FROM schema_migration_preflights WHERE migration_version IN (900014,900015);
+DELETE FROM schema_migrations WHERE version IN (900014,900015);
+DROP TABLE IF EXISTS task14_preflight_atomic_probe`)
+	})
+	failing := fstest.MapFS{
+		"900014_atomic.pre.sql": &fstest.MapFile{Data: []byte(`CREATE TABLE task14_preflight_atomic_probe (id integer PRIMARY KEY);`)},
+		"900014_atomic.up.sql":  &fstest.MapFile{Data: []byte(`SELECT task14_missing_migration_function();`)},
+	}
+	if err := database.ApplyMigrations(ctx, pool, failing); err == nil {
+		t.Fatal("failing target migration unexpectedly succeeded")
+	}
+	var probeExists bool
+	if err := pool.QueryRow(ctx, `SELECT to_regclass('public.task14_preflight_atomic_probe') IS NOT NULL`).Scan(&probeExists); err != nil {
+		t.Fatal(err)
+	}
+	var failedRecords int
+	if err := pool.QueryRow(ctx, `
+SELECT (SELECT count(*) FROM schema_migrations WHERE version=900014) +
+       (SELECT count(*) FROM schema_migration_preflights WHERE migration_version=900014)`).Scan(&failedRecords); err != nil {
+		t.Fatal(err)
+	}
+	if probeExists || failedRecords != 0 {
+		t.Fatalf("failed target left preflight effects probe=%t records=%d", probeExists, failedRecords)
+	}
+
+	successful := fstest.MapFS{
+		"900015_concurrent.pre.sql": &fstest.MapFile{Data: []byte(`SELECT pg_sleep(0.02);`)},
+		"900015_concurrent.up.sql":  &fstest.MapFile{Data: []byte(`SELECT 1;`)},
+	}
+	start := make(chan struct{})
+	errorsByMigrator := make(chan error, 2)
+	for range 2 {
+		go func() {
+			<-start
+			errorsByMigrator <- database.ApplyMigrations(ctx, pool, successful)
+		}()
+	}
+	close(start)
+	for range 2 {
+		if err := <-errorsByMigrator; err != nil {
+			t.Fatalf("concurrent ApplyMigrations() error=%v", err)
+		}
+	}
+	var migrationRows, preflightRows int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM schema_migrations WHERE version=900015`).Scan(&migrationRows); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM schema_migration_preflights WHERE migration_version=900015 AND name='concurrent'`).Scan(&preflightRows); err != nil {
+		t.Fatal(err)
+	}
+	if migrationRows != 1 || preflightRows != 1 {
+		t.Fatalf("concurrent records migration=%d preflight=%d", migrationRows, preflightRows)
+	}
+	modified := fstest.MapFS{
+		"900015_concurrent.pre.sql": &fstest.MapFile{Data: []byte(`SELECT pg_sleep(0.03);`)},
+		"900015_concurrent.up.sql":  &fstest.MapFile{Data: []byte(`SELECT 1;`)},
+	}
+	if err := database.ApplyMigrations(ctx, pool, modified); err == nil || !strings.Contains(err.Error(), "preflight") || !strings.Contains(err.Error(), "checksum changed") {
+		t.Fatalf("modified preflight error=%v", err)
+	}
+}
+
 func integrationDatabaseURL(t *testing.T) string {
 	t.Helper()
 

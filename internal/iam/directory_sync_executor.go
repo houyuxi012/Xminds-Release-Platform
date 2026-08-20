@@ -201,26 +201,34 @@ func (executor *PostgresDirectorySyncExecutor) Fail(ctx context.Context, jobID, 
 		return ErrDirectorySyncConfiguration
 	}
 	return database.WithTx(ctx, executor.pool, func(tx pgx.Tx) error {
-		job, _, err := executor.lockExecution(ctx, tx, jobID, sourceID)
-		if err != nil {
-			return err
-		}
-		if job.Status == DirectorySyncStatusCompleted || job.Status == DirectorySyncStatusFailed {
-			return nil
-		}
-		now := executor.now()
-		if _, err := tx.Exec(ctx, `
+		return executor.FailWithinTransaction(ctx, tx, jobID, sourceID, code)
+	})
+}
+
+func (executor *PostgresDirectorySyncExecutor) FailWithinTransaction(ctx context.Context, tx pgx.Tx, jobID, sourceID uuid.UUID, code string) error {
+	code = strings.TrimSpace(code)
+	if executor == nil || executor.pool == nil || jobID == uuid.Nil || sourceID == uuid.Nil || !directorySyncErrorCodePattern.MatchString(code) || len(code) > 128 {
+		return ErrDirectorySyncConfiguration
+	}
+	job, _, err := executor.lockExecution(ctx, tx, jobID, sourceID)
+	if err != nil {
+		return err
+	}
+	if job.Status == DirectorySyncStatusCompleted || job.Status == DirectorySyncStatusFailed {
+		return nil
+	}
+	now := executor.now()
+	if _, err := tx.Exec(ctx, `
 UPDATE directory_sync_jobs SET status='failed', error_code=$2, completed_at=$3, updated_at=$3
 WHERE id=$1 AND identity_source_id=$4`, job.ID, code, now, sourceID); err != nil {
-			return fmt.Errorf("fail directory synchronization job: %w", err)
-		}
-		_, err = executor.auditor.Append(ctx, tx, audit.AppendCommand{
-			Actor: directorySyncWorkerPrincipal(), Action: "identity.directory_sync.failed", ResourceType: "directory_sync_job", ResourceID: job.ID.String(),
-			Outcome: audit.OutcomeFailed, RequestID: job.RequestID.String(),
-			Metadata: map[string]any{"identity_source_id": sourceID.String(), "mode": job.Mode, "error_code": code, "requested_by": job.RequestedBy},
-		})
-		return err
+		return fmt.Errorf("fail directory synchronization job: %w", err)
+	}
+	_, err = executor.auditor.Append(ctx, tx, audit.AppendCommand{
+		Actor: directorySyncWorkerPrincipal(), Action: "identity.directory_sync.failed", ResourceType: "directory_sync_job", ResourceID: job.ID.String(),
+		Outcome: audit.OutcomeFailed, RequestID: job.RequestID.String(),
+		Metadata: map[string]any{"identity_source_id": sourceID.String(), "mode": job.Mode, "error_code": code, "requested_by": job.RequestedBy},
 	})
+	return err
 }
 
 func (executor *PostgresDirectorySyncExecutor) lockExecution(ctx context.Context, tx pgx.Tx, jobID, sourceID uuid.UUID) (DirectorySyncJob, IdentitySource, error) {

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 )
 
 func TestWorkerRetriesFirstFailureWithStableDelayAndCode(t *testing.T) {
@@ -69,6 +70,67 @@ func TestWorkerDeadLettersFifthFailureAfterDomainFailureTransition(t *testing.T)
 	}
 	if repository.retryCode != "" {
 		t.Fatalf("fifth failure was retried with %q", repository.retryCode)
+	}
+}
+
+func TestWorkerFailsConfigurationWhenAtomicRepositoryHasOnlyLegacyDeadLetterHandler(t *testing.T) {
+	t.Parallel()
+
+	repository := &transactionalWorkerRepositoryFake{}
+	_, err := NewWorker(WorkerConfig{
+		Owner: "worker-a", Repository: repository, DeadLetters: &deadLetterHandlerFake{},
+		RequiredTransactionalDeadLetterKinds: []string{"catalog.publish.v1"},
+		Handlers:                             NewHandlerRegistry(map[string]Handler{"catalog.publish.v1": HandlerFunc(func(context.Context, Job) error { return nil })}),
+	})
+	if !errors.Is(err, ErrWorkerConfiguration) {
+		t.Fatalf("NewWorker() error=%v, want fail-closed transactional dead-letter configuration", err)
+	}
+}
+
+func TestWorkerUsesSingleTransactionalDeadLetterSettlement(t *testing.T) {
+	t.Parallel()
+
+	job := Job{ID: uuid.New(), Kind: "catalog.publish.v1", Attempts: 5}
+	repository := &transactionalWorkerRepositoryFake{workerRepositoryFake: workerRepositoryFake{leased: []Job{job}}}
+	deadLetters := &transactionalDeadLetterHandlerFake{}
+	worker := mustWorker(t, WorkerConfig{
+		Owner: "worker-a", Repository: repository, DeadLetters: deadLetters,
+		RequiredTransactionalDeadLetterKinds: []string{job.Kind},
+		Handlers: NewHandlerRegistry(map[string]Handler{
+			job.Kind: HandlerFunc(func(context.Context, Job) error {
+				return NewCodedError("catalog_signing_failed", errors.New("signing failed"))
+			}),
+		}),
+	})
+
+	if _, err := worker.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce() error=%v", err)
+	}
+	if repository.transactionalSettlements != 1 || repository.deadLetterCode != "" || deadLetters.transactionalCalls != 1 || deadLetters.legacyCalls != 0 {
+		t.Fatalf("atomic=%d legacy_repository=%q tx_handler=%d legacy_handler=%d", repository.transactionalSettlements, repository.deadLetterCode, deadLetters.transactionalCalls, deadLetters.legacyCalls)
+	}
+}
+
+func TestWorkerKeepsLegacySettlementForUnrequiredDeadLetterKind(t *testing.T) {
+	t.Parallel()
+
+	job := Job{ID: uuid.New(), Kind: "catalog.publish.v1", Attempts: 5}
+	repository := &transactionalWorkerRepositoryFake{workerRepositoryFake: workerRepositoryFake{leased: []Job{job}}}
+	deadLetters := &transactionalDeadLetterHandlerFake{}
+	worker := mustWorker(t, WorkerConfig{
+		Owner: "worker-a", Repository: repository, DeadLetters: deadLetters,
+		Handlers: NewHandlerRegistry(map[string]Handler{
+			job.Kind: HandlerFunc(func(context.Context, Job) error {
+				return NewCodedError("catalog_signing_failed", errors.New("signing failed"))
+			}),
+		}),
+	})
+
+	if _, err := worker.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce() error=%v", err)
+	}
+	if repository.transactionalSettlements != 0 || repository.deadLetterCode != "catalog_signing_failed" || deadLetters.transactionalCalls != 0 || deadLetters.legacyCalls != 1 {
+		t.Fatalf("atomic=%d legacy_repository=%q tx_handler=%d legacy_handler=%d", repository.transactionalSettlements, repository.deadLetterCode, deadLetters.transactionalCalls, deadLetters.legacyCalls)
 	}
 }
 
@@ -244,5 +306,30 @@ type deadLetterHandlerFake struct {
 func (handler *deadLetterHandlerFake) HandleDeadLetter(_ context.Context, _ Job, code string) error {
 	handler.calls++
 	handler.code = code
+	return nil
+}
+
+type transactionalWorkerRepositoryFake struct {
+	workerRepositoryFake
+	transactionalSettlements int
+}
+
+func (repository *transactionalWorkerRepositoryFake) SettleDeadLetter(_ context.Context, _ string, _ uuid.UUID, _ string, transition func(pgx.Tx) error) error {
+	repository.transactionalSettlements++
+	return transition(nil)
+}
+
+type transactionalDeadLetterHandlerFake struct {
+	legacyCalls        int
+	transactionalCalls int
+}
+
+func (handler *transactionalDeadLetterHandlerFake) HandleDeadLetter(context.Context, Job, string) error {
+	handler.legacyCalls++
+	return nil
+}
+
+func (handler *transactionalDeadLetterHandlerFake) HandleDeadLetterTx(context.Context, pgx.Tx, Job, string) error {
+	handler.transactionalCalls++
 	return nil
 }

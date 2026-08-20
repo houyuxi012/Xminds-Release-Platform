@@ -34,14 +34,14 @@ func revalidateDirectoryUserMapping(ctx context.Context, tx pgx.Tx, sourceID uui
 	var conflicts directoryMappingConflicts
 	if err := tx.QueryRow(ctx, `
 SELECT EXISTS (
-           SELECT 1 FROM user_principals principal
-           WHERE $4<>'' AND lower(principal.email)=lower($4)
-             AND NOT (principal.identity_source_id=$1 AND principal.external_subject=$2)
+		   SELECT 1 FROM principal_mapping_registry mapping
+		   WHERE $4<>'' AND mapping.mapping_kind='email' AND mapping.canonical_value=lower($4)
+		     AND NOT (mapping.identity_source_id=$1 AND mapping.external_subject=$2)
        ),
        EXISTS (
-           SELECT 1 FROM user_principals principal
-           WHERE lower(principal.username)=lower($3)
-             AND NOT (principal.identity_source_id=$1 AND principal.external_subject=$2)
+		   SELECT 1 FROM principal_mapping_registry mapping
+		   WHERE mapping.mapping_kind='username' AND mapping.canonical_value=lower($3)
+		     AND NOT (mapping.identity_source_id=$1 AND mapping.external_subject=$2)
        )`, sourceID, externalSubject, username, email).Scan(&conflicts.ambiguousEmail, &conflicts.usernameConflict); err != nil {
 		return directoryMappingConflicts{}, fmt.Errorf("revalidate directory mapping: %w", err)
 	}

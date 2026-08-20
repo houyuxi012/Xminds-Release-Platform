@@ -47,6 +47,17 @@ type directoryConflictCursorBinding struct {
 	Filter   string    `json:"filter"`
 }
 
+func DecodeDirectoryConflictCursorKeySecret(encoded []byte) ([]byte, error) {
+	if len(encoded) != base64.RawURLEncoding.EncodedLen(32) || strings.TrimSpace(string(encoded)) != string(encoded) {
+		return nil, ErrDirectorySyncConfiguration
+	}
+	key, err := base64.RawURLEncoding.DecodeString(string(encoded))
+	if err != nil || len(key) != 32 {
+		return nil, ErrDirectorySyncConfiguration
+	}
+	return key, nil
+}
+
 func NewDirectoryConflictCursorCodec(key []byte, clock func() time.Time, ttl time.Duration) (*DirectoryConflictCursorCodec, error) {
 	if len(key) != 32 || clock == nil || ttl < time.Minute || ttl > 24*time.Hour {
 		return nil, ErrDirectorySyncConfiguration

@@ -21,6 +21,8 @@ func TestDecodeRejectsDuplicateUnknownTrailingAndActualOversizeInput(t *testing.
 	}{
 		{name: "top-level duplicate", raw: `{"version":1,"version":2,"nested":{"name":"ok"}}`, max: 128},
 		{name: "nested duplicate", raw: `{"version":1,"nested":{"name":"first","name":"second"}}`, max: 128},
+		{name: "case-fold alias", raw: `{"version":1,"Version":2,"nested":{"name":"ok"}}`, max: 128},
+		{name: "nested case-fold alias", raw: `{"version":1,"nested":{"name":"ok","Name":"override"}}`, max: 128},
 		{name: "unknown", raw: `{"version":1,"unexpected":true,"nested":{"name":"ok"}}`, max: 128},
 		{name: "trailing", raw: `{"version":1,"nested":{"name":"ok"}} {}`, max: 128},
 		{name: "whitespace beyond limit", raw: `{"version":1,"nested":{"name":"ok"}}` + strings.Repeat(" ", 128), max: 64},
@@ -35,6 +37,16 @@ func TestDecodeRejectsDuplicateUnknownTrailingAndActualOversizeInput(t *testing.
 				t.Fatal("Decode() error=nil")
 			}
 		})
+	}
+}
+
+func TestDecodeKnownBytesAllowsExtensionsButRejectsKnownFieldAliases(t *testing.T) {
+	var decoded strictJSONFixture
+	if err := DecodeKnownBytes([]byte(`{"version":1,"extension":{"vendor":true},"nested":{"name":"ok","vendor_name":"allowed"}}`), 128, &decoded); err != nil {
+		t.Fatalf("DecodeKnownBytes(extension) error=%v", err)
+	}
+	if err := DecodeKnownBytes([]byte(`{"Version":1,"nested":{"name":"ok"}}`), 128, &decoded); err == nil {
+		t.Fatal("DecodeKnownBytes() accepted known-field case alias")
 	}
 }
 

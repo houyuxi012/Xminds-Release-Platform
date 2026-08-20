@@ -711,6 +711,17 @@ func iamProblemInstance(path string) string {
 	if strings.HasPrefix(path, challengePrefix) {
 		return challengePrefix + "{challenge_id}/complete"
 	}
+	const sourcePrefix = "/api/v1/identity-sources/"
+	if strings.HasPrefix(path, sourcePrefix) {
+		segments := strings.Split(strings.TrimPrefix(path, sourcePrefix), "/")
+		if len(segments) > 0 && segments[0] != "" {
+			segments[0] = "{source_id}"
+		}
+		if len(segments) >= 3 && segments[1] == "sync-jobs" && segments[2] != "" {
+			segments[2] = "{job_id}"
+		}
+		return sourcePrefix + strings.Join(segments, "/")
+	}
 	return path
 }
 

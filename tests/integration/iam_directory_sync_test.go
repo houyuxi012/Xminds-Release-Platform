@@ -174,8 +174,8 @@ VALUES ($1, $2, 'apply', $3, '', 'migration:test', $4, $5, $5)`, uuid.New(), sou
 			t.Fatal(err)
 		}
 	}
-	if err := database.ApplyMigrations(ctx, pool, directoryMigrationSubset(t, 14)); err != nil {
-		t.Fatalf("apply migration 14: %v", err)
+	if err := database.ApplyMigrations(ctx, pool, directoryMigrationSubset(t, 15)); err != nil {
+		t.Fatalf("apply migration 14 with preflight then migration 15: %v", err)
 	}
 	var failed, coded, completed int
 	if err := pool.QueryRow(ctx, `
@@ -194,6 +194,157 @@ FROM directory_sync_jobs WHERE identity_source_id=$1`, sourceID).Scan(&failed, &
 	}
 	if strings.Contains(statusConstraint, "partial") {
 		t.Fatalf("status constraint still permits partial: %s", statusConstraint)
+	}
+	var preflightChecksum string
+	if err := pool.QueryRow(ctx, `SELECT checksum FROM schema_migration_preflights WHERE migration_version=14 AND name='directory_sync'`).Scan(&preflightChecksum); err != nil {
+		t.Fatalf("read migration 14 preflight checksum: %v", err)
+	}
+	if len(preflightChecksum) != 64 {
+		t.Fatalf("preflight checksum=%q", preflightChecksum)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE directory_sync_jobs SET status='partial' WHERE identity_source_id=$1`, sourceID); err == nil {
+		t.Fatal("migration 15 still permits partial status")
+	}
+	var stagedJobID uuid.UUID
+	if err := pool.QueryRow(ctx, `SELECT id FROM directory_sync_jobs WHERE identity_source_id=$1 ORDER BY created_at LIMIT 1`, sourceID).Scan(&stagedJobID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO directory_sync_stage_organizations (sync_job_id, external_id, name) VALUES ($1, 'self-cycle', 'Self Cycle')`, stagedJobID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO directory_sync_stage_parents (sync_job_id, organization_external_id, parent_external_id) VALUES ($1, 'self-cycle', 'self-cycle')`, stagedJobID); err != nil {
+		t.Fatalf("migration 15 rejected self relation before cycle detection: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM directory_sync_stage_parents WHERE sync_job_id=$1`, stagedJobID); err != nil {
+		t.Fatal(err)
+	}
+	downSQL, err := fs.ReadFile(migrations.FS, "000015_directory_sync_invariants.down.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, string(downSQL)); err != nil {
+		t.Fatalf("apply migration 15 down: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+INSERT INTO directory_sync_stage_parents (sync_job_id, organization_external_id, parent_external_id)
+VALUES ($1, 'self-cycle', 'self-cycle')`, stagedJobID); err == nil {
+		t.Fatal("migration 15 down did not restore self relation CHECK")
+	}
+}
+
+func TestDirectorySyncMigrationUpgradesImmutableOriginal14To15(t *testing.T) {
+	databaseURL := integrationDatabaseURL(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	adminPool, err := database.Open(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer adminPool.Close()
+	databaseName := "directory_migration_upgrade_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	if _, err := adminPool.Exec(ctx, `CREATE DATABASE `+databaseName); err != nil {
+		t.Fatal(err)
+	}
+	configuration, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configuration.ConnConfig.Database = databaseName
+	pool, err := pgxpool.NewWithConfig(ctx, configuration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		pool.Close()
+		_, _ = adminPool.Exec(context.Background(), `DROP DATABASE `+databaseName)
+	})
+	originalMigrations := directoryMigrationSubset(t, 14)
+	delete(originalMigrations, "000014_directory_sync.pre.sql")
+	if err := database.ApplyMigrations(ctx, pool, originalMigrations); err != nil {
+		t.Fatalf("apply original migrations 1..14: %v", err)
+	}
+	var checksum string
+	if err := pool.QueryRow(ctx, `SELECT checksum FROM schema_migrations WHERE version=14`).Scan(&checksum); err != nil {
+		t.Fatal(err)
+	}
+	const original14Checksum = "b9a31fb9092bdd4572f154535ecb38d415a013bf9a49960f8d5e283958321f81"
+	if checksum != original14Checksum {
+		t.Fatalf("migration 14 checksum=%s, want immutable %s", checksum, original14Checksum)
+	}
+	if err := database.ApplyMigrations(ctx, pool, migrations.FS); err != nil {
+		t.Fatalf("upgrade original migration 14 database to 15: %v", err)
+	}
+	var maximumVersion int
+	if err := pool.QueryRow(ctx, `SELECT max(version) FROM schema_migrations`).Scan(&maximumVersion); err != nil {
+		t.Fatal(err)
+	}
+	if maximumVersion != 15 {
+		t.Fatalf("maximum migration version=%d, want 15", maximumVersion)
+	}
+	var original14PreflightRows int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM schema_migration_preflights WHERE migration_version=14`).Scan(&original14PreflightRows); err != nil {
+		t.Fatal(err)
+	}
+	if original14PreflightRows != 0 {
+		t.Fatalf("already-applied migration 14 unexpectedly backfilled preflight rows=%d", original14PreflightRows)
+	}
+}
+
+func TestDirectorySyncMigrationPreflightRefusesHistoricalCanonicalConflictsWithoutChoosingWinner(t *testing.T) {
+	databaseURL := integrationDatabaseURL(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	adminPool, err := database.Open(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer adminPool.Close()
+	databaseName := "directory_mapping_preflight_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	if _, err := adminPool.Exec(ctx, `CREATE DATABASE `+databaseName); err != nil {
+		t.Fatal(err)
+	}
+	configuration, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configuration.ConnConfig.Database = databaseName
+	pool, err := pgxpool.NewWithConfig(ctx, configuration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		pool.Close()
+		_, _ = adminPool.Exec(context.Background(), `DROP DATABASE `+databaseName)
+	})
+	originalMigrations := directoryMigrationSubset(t, 14)
+	delete(originalMigrations, "000014_directory_sync.pre.sql")
+	if err := database.ApplyMigrations(ctx, pool, originalMigrations); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 21, 16, 30, 0, 0, time.UTC)
+	if _, err := pool.Exec(ctx, `
+INSERT INTO user_principals (id, username, display_name, email, user_kind, status, version, created_at, updated_at)
+VALUES ($1, 'first.local', 'First Local', 'shared@example.com', 'local', 'active', 1, $3, $3),
+       ($2, 'second.local', 'Second Local', 'SHARED@example.com', 'local', 'active', 1, $3, $3)`, uuid.New(), uuid.New(), now); err != nil {
+		t.Fatal(err)
+	}
+	err = database.ApplyMigrations(ctx, pool, migrations.FS)
+	if err == nil || !strings.Contains(err.Error(), "principal mapping preflight") {
+		t.Fatalf("ApplyMigrations() error=%v", err)
+	}
+	var version15Rows, principals int
+	var registryExists bool
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM schema_migrations WHERE version=15`).Scan(&version15Rows); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM user_principals`).Scan(&principals); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT to_regclass('public.principal_mapping_registry') IS NOT NULL`).Scan(&registryExists); err != nil {
+		t.Fatal(err)
+	}
+	if version15Rows != 0 || principals != 2 || registryExists {
+		t.Fatalf("failed preflight version15=%d principals=%d registry=%t", version15Rows, principals, registryExists)
 	}
 }
 
@@ -245,6 +396,193 @@ INSERT INTO identity_sources (
 	}
 	if jobCount != 0 || outboxCount != 0 {
 		t.Fatalf("audit failure committed job=%d outbox=%d", jobCount, outboxCount)
+	}
+}
+
+func TestIAMDirectorySyncDeadLetterSettlementIsAtomicAndCannotReplayAsCompleted(t *testing.T) {
+	databaseURL := integrationDatabaseURL(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool, err := database.Open(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if err := database.ApplyMigrations(ctx, pool, migrations.FS); err != nil {
+		t.Fatal(err)
+	}
+	resetDirectoryIntegrationTables(t, ctx, pool)
+	now := time.Date(2026, 8, 21, 15, 0, 0, 0, time.UTC)
+	sourceID := uuid.New()
+	seedDirectoryIntegrationSource(t, ctx, pool, sourceID, iam.IdentitySourceSCIM, now, 5)
+	repository := iam.NewPostgresRepository(pool)
+	auditor := audit.NewService(audit.NewPostgresRepository(pool))
+	service, err := iam.NewDirectorySyncService(iam.DirectorySyncServiceConfig{
+		Store: repository, Jobs: jobs.NewPostgresRepository(pool), Auditor: auditor, Clock: func() time.Time { return now }, ConflictCursors: directoryIntegrationCursorCodec(t, now),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor, err := iam.NewPostgresDirectorySyncExecutor(iam.PostgresDirectorySyncExecutorConfig{Pool: pool, Auditor: auditor, Sessions: repository, Clock: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := iam.NewDirectorySyncHandler(iam.DirectorySyncHandlerConfig{Executor: executor, Directory: &directoryIntegrationAdapter{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := service.Start(ctx, directorySyncIntegrationAdmin(), sourceID, iam.DirectorySyncModePreview, 5, iam.RequestContext{RequestID: uuid.NewString()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE outbox_jobs SET attempts=4, available_at=clock_timestamp() WHERE aggregate_id=$1`, created.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+CREATE OR REPLACE FUNCTION task14_reject_outbox_dead_letter() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.status='dead_letter' AND NEW.kind='iam.directory.sync.v1' THEN
+        RAISE EXCEPTION 'injected outbox dead-letter failure';
+    END IF;
+    RETURN NEW;
+END $$;
+CREATE TRIGGER task14_reject_outbox_dead_letter
+BEFORE UPDATE ON outbox_jobs FOR EACH ROW EXECUTE FUNCTION task14_reject_outbox_dead_letter()`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DROP TRIGGER IF EXISTS task14_reject_outbox_dead_letter ON outbox_jobs`)
+		_, _ = pool.Exec(context.Background(), `DROP FUNCTION IF EXISTS task14_reject_outbox_dead_letter()`)
+	})
+	jobRepository := jobs.NewPostgresRepository(pool)
+	worker, err := jobs.NewWorker(jobs.WorkerConfig{
+		Owner: "directory-worker-i10", Repository: jobRepository,
+		Handlers:                             jobs.NewHandlerRegistry(map[string]jobs.Handler{iam.JobKindDirectorySync: handler}),
+		DeadLetters:                          jobs.NewDeadLetterRegistry(map[string]jobs.DeadLetterHandler{iam.JobKindDirectorySync: handler}),
+		RequiredTransactionalDeadLetterKinds: []string{iam.JobKindDirectorySync},
+		LeaseDuration:                        time.Minute, RenewInterval: 10 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := worker.RunOnce(ctx); err == nil {
+		t.Error("RunOnce() error=nil, want injected atomic settlement failure")
+	}
+	var domainStatus, outboxStatus string
+	var failureAudits int
+	if err := pool.QueryRow(ctx, `SELECT status FROM directory_sync_jobs WHERE id=$1`, created.ID).Scan(&domainStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT status FROM outbox_jobs WHERE aggregate_id=$1`, created.ID).Scan(&outboxStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM audit_events WHERE resource_id=$1 AND action='identity.directory_sync.failed'`, created.ID.String()).Scan(&failureAudits); err != nil {
+		t.Fatal(err)
+	}
+	if domainStatus != "pending" || outboxStatus != "leased" || failureAudits != 0 {
+		t.Errorf("non-atomic first settlement domain=%q outbox=%q failure_audits=%d", domainStatus, outboxStatus, failureAudits)
+	}
+	if _, err := pool.Exec(ctx, `DROP TRIGGER task14_reject_outbox_dead_letter ON outbox_jobs; DROP FUNCTION task14_reject_outbox_dead_letter()`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE outbox_jobs SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE aggregate_id=$1`, created.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := worker.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce(replay) error=%v", err)
+	}
+	var failureCode string
+	if err := pool.QueryRow(ctx, `SELECT status, error_code FROM directory_sync_jobs WHERE id=$1`, created.ID).Scan(&domainStatus, &failureCode); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT status FROM outbox_jobs WHERE aggregate_id=$1`, created.ID).Scan(&outboxStatus); err != nil {
+		t.Fatal(err)
+	}
+	if domainStatus != "failed" || failureCode != "directory_response_invalid" || outboxStatus != "dead_letter" {
+		t.Fatalf("replay settlement domain=%q code=%q outbox=%q", domainStatus, failureCode, outboxStatus)
+	}
+
+	auditFailureJob, err := service.Start(ctx, directorySyncIntegrationAdmin(), sourceID, iam.DirectorySyncModePreview, 5, iam.RequestContext{RequestID: uuid.NewString()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE outbox_jobs SET attempts=4, available_at=clock_timestamp() WHERE aggregate_id=$1`, auditFailureJob.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+CREATE OR REPLACE FUNCTION task14_reject_directory_failure_audit() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.action='identity.directory_sync.failed' THEN
+        RAISE EXCEPTION 'injected immutable audit failure';
+    END IF;
+    RETURN NEW;
+END $$;
+CREATE TRIGGER task14_reject_directory_failure_audit
+BEFORE INSERT ON audit_events FOR EACH ROW EXECUTE FUNCTION task14_reject_directory_failure_audit()`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DROP TRIGGER IF EXISTS task14_reject_directory_failure_audit ON audit_events`)
+		_, _ = pool.Exec(context.Background(), `DROP FUNCTION IF EXISTS task14_reject_directory_failure_audit()`)
+	})
+	if _, err := worker.RunOnce(ctx); err == nil {
+		t.Error("RunOnce() error=nil, want injected audit failure")
+	}
+	if err := pool.QueryRow(ctx, `SELECT status FROM directory_sync_jobs WHERE id=$1`, auditFailureJob.ID).Scan(&domainStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT status FROM outbox_jobs WHERE aggregate_id=$1`, auditFailureJob.ID).Scan(&outboxStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM audit_events WHERE resource_id=$1 AND action='identity.directory_sync.failed'`, auditFailureJob.ID.String()).Scan(&failureAudits); err != nil {
+		t.Fatal(err)
+	}
+	if domainStatus != "pending" || outboxStatus != "leased" || failureAudits != 0 {
+		t.Fatalf("audit outage committed settlement domain=%q outbox=%q failure_audits=%d", domainStatus, outboxStatus, failureAudits)
+	}
+	if _, err := pool.Exec(ctx, `DROP TRIGGER task14_reject_directory_failure_audit ON audit_events; DROP FUNCTION task14_reject_directory_failure_audit()`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE outbox_jobs SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE aggregate_id=$1`, auditFailureJob.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := worker.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce(audit recovery) error=%v", err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT status FROM directory_sync_jobs WHERE id=$1`, auditFailureJob.ID).Scan(&domainStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT status FROM outbox_jobs WHERE aggregate_id=$1`, auditFailureJob.ID).Scan(&outboxStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM audit_events WHERE resource_id=$1 AND action='identity.directory_sync.failed'`, auditFailureJob.ID.String()).Scan(&failureAudits); err != nil {
+		t.Fatal(err)
+	}
+	if domainStatus != "failed" || outboxStatus != "dead_letter" || failureAudits != 1 {
+		t.Fatalf("audit recovery settlement domain=%q outbox=%q failure_audits=%d", domainStatus, outboxStatus, failureAudits)
+	}
+
+	legacyIntermediateJob, err := service.Start(ctx, directorySyncIntegrationAdmin(), sourceID, iam.DirectorySyncModePreview, 5, iam.RequestContext{RequestID: uuid.NewString()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := executor.Fail(ctx, legacyIntermediateJob.ID, sourceID, "directory_response_invalid"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE outbox_jobs SET attempts=4, available_at=clock_timestamp() WHERE aggregate_id=$1`, legacyIntermediateJob.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := worker.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce(legacy intermediate replay) error=%v", err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT status FROM outbox_jobs WHERE aggregate_id=$1`, legacyIntermediateJob.ID).Scan(&outboxStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM audit_events WHERE resource_id=$1 AND action='identity.directory_sync.failed'`, legacyIntermediateJob.ID.String()).Scan(&failureAudits); err != nil {
+		t.Fatal(err)
+	}
+	if outboxStatus != "dead_letter" || failureAudits != 1 {
+		t.Fatalf("legacy intermediate replay outbox=%q failure_audits=%d", outboxStatus, failureAudits)
 	}
 }
 
@@ -746,6 +1084,135 @@ func TestIAMDirectorySyncConcurrentSourcesRevalidateUsernameAndEmailMappings(t *
 	}
 }
 
+func TestIAMDirectorySyncAndLocalCreationShareCanonicalMappingAuthority(t *testing.T) {
+	databaseURL := integrationDatabaseURL(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool, err := database.Open(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if err := database.ApplyMigrations(ctx, pool, migrations.FS); err != nil {
+		t.Fatal(err)
+	}
+	for _, scenario := range []struct {
+		name, localUsername, localEmail, conflictCode string
+		failDirectoryAudit                            bool
+	}{
+		{name: "username", localUsername: "shared.user", localEmail: "local@example.com", conflictCode: "CANONICAL_USERNAME_CONFLICT"},
+		{name: "email", localUsername: "local.user", localEmail: "shared@example.com", conflictCode: "AMBIGUOUS_EMAIL"},
+		{name: "audit rollback", localUsername: "shared.user", localEmail: "local@example.com", conflictCode: "CANONICAL_USERNAME_CONFLICT", failDirectoryAudit: true},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			resetDirectoryIntegrationTables(t, ctx, pool)
+			now := time.Date(2026, 8, 21, 16, 0, 0, 0, time.UTC)
+			sourceID := uuid.New()
+			seedDirectoryIntegrationSource(t, ctx, pool, sourceID, iam.IdentitySourceSCIM, now, 5)
+			repository := iam.NewPostgresRepository(pool)
+			realAuditor := audit.NewService(audit.NewPostgresRepository(pool))
+			var auditor iam.AuditAppender = realAuditor
+			var auditGate *directoryIntegrationAuditGate
+			if scenario.failDirectoryAudit {
+				auditGate = &directoryIntegrationAuditGate{delegate: realAuditor, failAction: "identity.directory_sync.batch.apply", failPhase: string(iam.DirectorySyncPhaseUsers), remainingFailures: 1}
+				auditor = auditGate
+			}
+			service, err := iam.NewDirectorySyncService(iam.DirectorySyncServiceConfig{Store: repository, Jobs: jobs.NewPostgresRepository(pool), Auditor: auditor, Clock: func() time.Time { return now }, ConflictCursors: directoryIntegrationCursorCodec(t, now)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			executor, err := iam.NewPostgresDirectorySyncExecutor(iam.PostgresDirectorySyncExecutorConfig{Pool: pool, Auditor: auditor, Sessions: repository, Clock: func() time.Time { return now }, BatchSize: 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			created, err := service.Start(ctx, directorySyncIntegrationAdmin(), sourceID, iam.DirectorySyncModeApply, 5, iam.RequestContext{RequestID: uuid.NewString()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			job, source, err := executor.Load(ctx, created.ID, sourceID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := executor.Stage(ctx, job, source, iam.SyncPage{Users: []iam.DirectoryUser{{ExternalSubject: "directory-user", Username: "shared.user", DisplayName: "Directory User", Email: "shared@example.com", Enabled: true}}, Complete: true}); err != nil {
+				t.Fatal(err)
+			}
+			job, source, err = executor.Load(ctx, created.ID, sourceID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := executor.Advance(ctx, job, source); err != nil {
+				t.Fatal(err)
+			}
+			job, source, err = executor.Load(ctx, created.ID, sourceID)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			localID := uuid.New()
+			localUser := iam.UserPrincipal{ID: localID, Username: scenario.localUsername, DisplayName: "Local User", Email: scenario.localEmail, Kind: iam.UserKindLocal, Status: iam.UserStatusPending, Version: 1, CreatedAt: now, UpdatedAt: now}
+			credential := iam.LocalCredential{
+				UserID: localID, Password: iam.PasswordDigest{Algorithm: "argon2id", Parameters: "m=19456,t=1,p=1,l=16", Salt: bytes.Repeat([]byte{1}, 16), DerivedKey: bytes.Repeat([]byte{2}, 16)},
+				PasswordChangedAt: now, ActivationDigest: strings.Repeat("a", 64), ActivationExpiresAt: now.Add(time.Hour),
+			}
+			start := make(chan struct{})
+			directoryResult := make(chan error, 1)
+			localResult := make(chan error, 1)
+			go func() {
+				<-start
+				_, advanceErr := executor.Advance(ctx, job, source)
+				directoryResult <- advanceErr
+			}()
+			go func() {
+				<-start
+				localResult <- repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
+					return repository.InsertLocalUser(ctx, tx, localUser, credential)
+				})
+			}()
+			close(start)
+			directoryErr, localErr := <-directoryResult, <-localResult
+			if scenario.failDirectoryAudit {
+				if directoryErr == nil || localErr != nil {
+					t.Fatalf("audit race directory_error=%v local_error=%v", directoryErr, localErr)
+				}
+				auditGate.clearFailure()
+				job, source, err = executor.Load(ctx, created.ID, sourceID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := executor.Advance(ctx, job, source); err != nil {
+					t.Fatalf("retry after audit rollback: %v", err)
+				}
+			} else {
+				if directoryErr != nil || (localErr != nil && !errors.Is(localErr, iam.ErrIAMConflict)) {
+					t.Fatalf("directory_error=%v local_error=%v", directoryErr, localErr)
+				}
+			}
+			var canonicalUsers, mappings, conflicts int
+			if scenario.conflictCode == "AMBIGUOUS_EMAIL" {
+				err = pool.QueryRow(ctx, `SELECT count(*) FROM user_principals WHERE lower(email)='shared@example.com'`).Scan(&canonicalUsers)
+			} else {
+				err = pool.QueryRow(ctx, `SELECT count(*) FROM user_principals WHERE lower(username)='shared.user'`).Scan(&canonicalUsers)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			canonicalMapping := "shared.user"
+			if scenario.conflictCode == "AMBIGUOUS_EMAIL" {
+				canonicalMapping = "shared@example.com"
+			}
+			if err := pool.QueryRow(ctx, `SELECT count(*) FROM principal_mapping_registry WHERE canonical_value=$1`, canonicalMapping).Scan(&mappings); err != nil {
+				t.Fatal(err)
+			}
+			if err := pool.QueryRow(ctx, `SELECT count(*) FROM directory_sync_conflicts WHERE sync_job_id=$1 AND conflict_code=$2`, created.ID, scenario.conflictCode).Scan(&conflicts); err != nil {
+				t.Fatal(err)
+			}
+			if canonicalUsers != 1 || mappings != 1 || (localErr == nil && conflicts != 1) {
+				t.Fatalf("canonical users=%d mappings=%d conflicts=%d local_error=%v", canonicalUsers, mappings, conflicts, localErr)
+			}
+		})
+	}
+}
+
 func TestIAMDirectorySyncPreviewAndApplyPreserveOwnershipConflictsAndLastSafeState(t *testing.T) {
 	databaseURL := integrationDatabaseURL(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
@@ -1067,7 +1534,7 @@ func directoryMigrationSubset(t *testing.T, maximumVersion int) fstest.MapFS {
 	result := fstest.MapFS{}
 	for _, entry := range entries {
 		name := entry.Name()
-		if entry.IsDir() || !strings.HasSuffix(name, ".up.sql") || len(name) < 6 {
+		if entry.IsDir() || (!strings.HasSuffix(name, ".up.sql") && !strings.HasSuffix(name, ".pre.sql")) || len(name) < 6 {
 			continue
 		}
 		var version int

@@ -5,14 +5,20 @@ import (
 	"errors"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"xminds-release-platform/internal/platform/jobs"
 	"xminds-release-platform/internal/platform/strictjson"
 )
 
-const defaultDirectorySyncMaximumTransitions = 20_000
+const (
+	defaultDirectorySyncMaximumTransitions = 20_000
+	defaultDirectorySyncOperationTimeout   = 10 * time.Second
+	maximumDirectorySyncOperationTimeout   = 30 * time.Second
+)
 
 var directorySyncErrorCodePattern = regexp.MustCompile(`^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$`)
 
@@ -23,29 +29,49 @@ type DirectorySyncExecutor interface {
 	Fail(ctx context.Context, jobID, sourceID uuid.UUID, code string) error
 }
 
+type DirectorySyncTransactionalFailureExecutor interface {
+	FailWithinTransaction(ctx context.Context, tx pgx.Tx, jobID, sourceID uuid.UUID, code string) error
+}
+
 type DirectorySyncHandlerConfig struct {
 	Executor           DirectorySyncExecutor
 	Directory          DirectoryAdapter
 	MaximumTransitions int
+	OperationTimeout   time.Duration
 }
 
 type DirectorySyncHandler struct {
 	executor           DirectorySyncExecutor
 	directory          DirectoryAdapter
 	maximumTransitions int
+	operationTimeout   time.Duration
 }
 
 func NewDirectorySyncHandler(config DirectorySyncHandlerConfig) (*DirectorySyncHandler, error) {
 	if config.MaximumTransitions == 0 {
 		config.MaximumTransitions = defaultDirectorySyncMaximumTransitions
 	}
+	if config.OperationTimeout == 0 {
+		config.OperationTimeout = defaultDirectorySyncOperationTimeout
+	}
 	if config.Executor == nil || config.Directory == nil || config.MaximumTransitions < 5 || config.MaximumTransitions > defaultDirectorySyncMaximumTransitions {
 		return nil, ErrDirectorySyncConfiguration
 	}
-	return &DirectorySyncHandler{executor: config.Executor, directory: config.Directory, maximumTransitions: config.MaximumTransitions}, nil
+	if config.OperationTimeout <= 0 || config.OperationTimeout > maximumDirectorySyncOperationTimeout {
+		return nil, ErrDirectorySyncConfiguration
+	}
+	return &DirectorySyncHandler{
+		executor: config.Executor, directory: config.Directory,
+		maximumTransitions: config.MaximumTransitions, operationTimeout: config.OperationTimeout,
+	}, nil
 }
 
 func (handler *DirectorySyncHandler) Handle(ctx context.Context, outboxJob jobs.Job) error {
+	if handler == nil || ctx == nil {
+		return jobs.NewCodedError("directory_job_invalid", ErrDirectorySyncConfiguration)
+	}
+	ctx, cancel := context.WithTimeout(ctx, handler.operationTimeout)
+	defer cancel()
 	payload, err := decodeDirectorySyncJob(outboxJob)
 	if err != nil {
 		return jobs.NewCodedError("directory_job_invalid", ErrDirectorySyncConfiguration)
@@ -55,8 +81,11 @@ func (handler *DirectorySyncHandler) Handle(ctx context.Context, outboxJob jobs.
 		if err != nil {
 			return jobs.NewCodedError("directory_job_load_failed", ErrDirectorySyncConfiguration)
 		}
-		if job.Status == DirectorySyncStatusCompleted || job.Status == DirectorySyncStatusFailed {
+		if job.Status == DirectorySyncStatusCompleted {
 			return nil
+		}
+		if job.Status == DirectorySyncStatusFailed {
+			return jobs.NewCodedError(stableDirectorySyncFailureCode(job.ErrorCode), ErrDirectorySyncConfiguration)
 		}
 		if job.SourceVersion != source.Version || source.Status != IdentitySourceStatusVerified {
 			if err := handler.executor.Fail(ctx, payload.JobID, payload.SourceID, "directory_source_changed"); err != nil {
@@ -116,11 +145,32 @@ func (handler *DirectorySyncHandler) HandleDeadLetter(ctx context.Context, outbo
 	if err != nil {
 		return ErrDirectorySyncConfiguration
 	}
+	code = stableDirectorySyncFailureCode(code)
+	return handler.executor.Fail(ctx, payload.JobID, payload.SourceID, code)
+}
+
+func (handler *DirectorySyncHandler) HandleDeadLetterTx(ctx context.Context, tx pgx.Tx, outboxJob jobs.Job, code string) error {
+	if handler == nil {
+		return ErrDirectorySyncConfiguration
+	}
+	payload, err := decodeDirectorySyncJob(outboxJob)
+	if err != nil {
+		return ErrDirectorySyncConfiguration
+	}
+	executor, ok := handler.executor.(DirectorySyncTransactionalFailureExecutor)
+	if !ok {
+		return ErrDirectorySyncConfiguration
+	}
+	code = stableDirectorySyncFailureCode(code)
+	return executor.FailWithinTransaction(ctx, tx, payload.JobID, payload.SourceID, code)
+}
+
+func stableDirectorySyncFailureCode(code string) string {
 	code = strings.TrimSpace(code)
 	if !directorySyncErrorCodePattern.MatchString(code) || len(code) > 128 {
-		code = "directory_sync_failed"
+		return "directory_sync_failed"
 	}
-	return handler.executor.Fail(ctx, payload.JobID, payload.SourceID, code)
+	return code
 }
 
 func decodeDirectorySyncJob(outboxJob jobs.Job) (DirectorySyncJobPayload, error) {

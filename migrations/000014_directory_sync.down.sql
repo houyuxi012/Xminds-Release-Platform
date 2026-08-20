@@ -15,9 +15,6 @@ ALTER TABLE directory_sync_conflicts
 DROP INDEX IF EXISTS directory_sync_jobs_source_created_idx;
 DROP INDEX IF EXISTS directory_sync_jobs_one_active_source_uidx;
 ALTER TABLE directory_sync_jobs
-	DROP CONSTRAINT IF EXISTS directory_sync_jobs_status_check,
-	ADD CONSTRAINT directory_sync_jobs_status_check
-	    CHECK (status IN ('pending', 'running', 'completed', 'failed', 'partial')),
     DROP CONSTRAINT IF EXISTS directory_sync_jobs_processed_counts_nonnegative,
     DROP CONSTRAINT IF EXISTS directory_sync_jobs_phase_valid,
     DROP CONSTRAINT IF EXISTS directory_sync_jobs_source_version_positive,

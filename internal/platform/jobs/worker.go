@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 )
 
 const (
@@ -37,26 +38,43 @@ type DeadLetterHandler interface {
 	HandleDeadLetter(ctx context.Context, job Job, code string) error
 }
 
+// TransactionalDeadLetterHandler applies the domain failure transition and its
+// immutable audit record within the outbox settlement transaction supplied by
+// the repository.
+type TransactionalDeadLetterHandler interface {
+	HandleDeadLetterTx(ctx context.Context, tx pgx.Tx, job Job, code string) error
+}
+
+type TransactionalDeadLetterRepository interface {
+	SettleDeadLetter(ctx context.Context, owner string, id uuid.UUID, code string, transition func(pgx.Tx) error) error
+}
+
+type TransactionalDeadLetterResolver interface {
+	ResolveTransactionalDeadLetter(kind string) (TransactionalDeadLetterHandler, bool)
+}
+
 type WorkerConfig struct {
-	Owner         string
-	Repository    WorkerRepository
-	Handlers      *HandlerRegistry
-	DeadLetters   DeadLetterHandler
-	Clock         func() time.Time
-	BatchSize     int
-	LeaseDuration time.Duration
-	RenewInterval time.Duration
+	Owner                                string
+	Repository                           WorkerRepository
+	Handlers                             *HandlerRegistry
+	DeadLetters                          DeadLetterHandler
+	RequiredTransactionalDeadLetterKinds []string
+	Clock                                func() time.Time
+	BatchSize                            int
+	LeaseDuration                        time.Duration
+	RenewInterval                        time.Duration
 }
 
 type Worker struct {
-	owner         string
-	repository    WorkerRepository
-	handlers      *HandlerRegistry
-	deadLetters   DeadLetterHandler
-	clock         func() time.Time
-	batchSize     int
-	leaseDuration time.Duration
-	renewInterval time.Duration
+	owner                            string
+	repository                       WorkerRepository
+	handlers                         *HandlerRegistry
+	deadLetters                      DeadLetterHandler
+	requiredTransactionalDeadLetters map[string]struct{}
+	clock                            func() time.Time
+	batchSize                        int
+	leaseDuration                    time.Duration
+	renewInterval                    time.Duration
 }
 
 func NewWorker(config WorkerConfig) (*Worker, error) {
@@ -77,9 +95,28 @@ func NewWorker(config WorkerConfig) (*Worker, error) {
 		config.LeaseDuration <= 0 || config.RenewInterval <= 0 || config.RenewInterval >= config.LeaseDuration {
 		return nil, ErrWorkerConfiguration
 	}
+	requiredTransactional := make(map[string]struct{}, len(config.RequiredTransactionalDeadLetterKinds))
+	for _, kind := range config.RequiredTransactionalDeadLetterKinds {
+		kind = strings.TrimSpace(kind)
+		if kind == "" {
+			return nil, ErrWorkerConfiguration
+		}
+		requiredTransactional[kind] = struct{}{}
+	}
+	if len(requiredTransactional) > 0 {
+		if _, ok := config.Repository.(TransactionalDeadLetterRepository); !ok || config.DeadLetters == nil {
+			return nil, ErrWorkerConfiguration
+		}
+		for kind := range requiredTransactional {
+			if !resolvesTransactionalDeadLetter(config.DeadLetters, kind) {
+				return nil, fmt.Errorf("%w: transactional dead-letter handler is not registered for %s", ErrWorkerConfiguration, kind)
+			}
+		}
+	}
 	return &Worker{
 		owner: config.Owner, repository: config.Repository, handlers: config.Handlers,
-		deadLetters: config.DeadLetters, clock: config.Clock, batchSize: config.BatchSize,
+		deadLetters: config.DeadLetters, requiredTransactionalDeadLetters: requiredTransactional,
+		clock: config.Clock, batchSize: config.BatchSize,
 		leaseDuration: config.LeaseDuration, renewInterval: config.RenewInterval,
 	}, nil
 }
@@ -179,6 +216,23 @@ func (worker *Worker) settle(ctx context.Context, job Job, handlerErr error) err
 	}
 	code := ErrorCode(handlerErr)
 	if job.Attempts >= maximumJobAttempts {
+		if _, required := worker.requiredTransactionalDeadLetters[job.Kind]; required {
+			repository, ok := worker.repository.(TransactionalDeadLetterRepository)
+			if !ok {
+				return ErrWorkerConfiguration
+			}
+			transition, err := worker.transactionalDeadLetterTransition(ctx, job, code)
+			if err != nil {
+				return err
+			}
+			if transition == nil {
+				return fmt.Errorf("%w: transactional dead-letter handler is not registered", ErrWorkerConfiguration)
+			}
+			if err := repository.SettleDeadLetter(ctx, worker.owner, job.ID, code, transition); err != nil {
+				return fmt.Errorf("atomically dead-letter job: %w", err)
+			}
+			return nil
+		}
 		if worker.deadLetters != nil {
 			if err := worker.deadLetters.HandleDeadLetter(ctx, job, code); err != nil {
 				return fmt.Errorf("handle job dead letter domain transition: %w", err)
@@ -201,4 +255,34 @@ func (worker *Worker) settle(ctx context.Context, job Job, handlerErr error) err
 		return fmt.Errorf("retry job: %w", err)
 	}
 	return nil
+}
+
+func (worker *Worker) transactionalDeadLetterTransition(ctx context.Context, job Job, code string) (func(pgx.Tx) error, error) {
+	if worker.deadLetters == nil {
+		return nil, nil
+	}
+	if handler, ok := worker.deadLetters.(TransactionalDeadLetterHandler); ok {
+		return func(tx pgx.Tx) error { return handler.HandleDeadLetterTx(ctx, tx, job, code) }, nil
+	}
+	resolver, ok := worker.deadLetters.(TransactionalDeadLetterResolver)
+	if !ok {
+		return nil, nil
+	}
+	handler, exists := resolver.ResolveTransactionalDeadLetter(job.Kind)
+	if !exists {
+		return nil, nil
+	}
+	return func(tx pgx.Tx) error { return handler.HandleDeadLetterTx(ctx, tx, job, code) }, nil
+}
+
+func resolvesTransactionalDeadLetter(deadLetters DeadLetterHandler, kind string) bool {
+	if _, ok := deadLetters.(TransactionalDeadLetterHandler); ok {
+		return true
+	}
+	resolver, ok := deadLetters.(TransactionalDeadLetterResolver)
+	if !ok {
+		return false
+	}
+	_, exists := resolver.ResolveTransactionalDeadLetter(kind)
+	return exists
 }
