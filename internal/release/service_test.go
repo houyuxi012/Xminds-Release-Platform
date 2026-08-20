@@ -114,6 +114,29 @@ func TestGovernedExplicitDenyBlocksProtectedReleaseCreate(t *testing.T) {
 	}
 }
 
+func TestGovernedChannelScopesControlProtectedReleaseCreate(t *testing.T) {
+	t.Parallel()
+	command := validCreateCommand()
+	principal := releasePrincipal("governed-publisher", identity.RolePublisher)
+	principal.Governed = true
+	principal.RoleScopes = []identity.RoleScope{
+		{Role: identity.RolePublisher, Effect: "allow", ScopeType: "product", ProductID: "ngep"},
+		{Role: identity.RolePublisher, Effect: "deny", ScopeType: "channel", ProductID: "ngep", ChannelName: command.Channel},
+	}
+	if _, err := newTestReleaseService().Create(context.Background(), principal, command, testRequestContext()); !errors.Is(err, identity.ErrActionDenied) {
+		t.Fatalf("Create() product allow + channel deny error = %v", err)
+	}
+
+	principal.RoleScopes = []identity.RoleScope{{Role: identity.RolePublisher, Effect: "allow", ScopeType: "channel", ProductID: "ngep", ChannelName: command.Channel}}
+	if _, err := newTestReleaseService().Create(context.Background(), principal, command, testRequestContext()); err != nil {
+		t.Fatalf("Create() matching channel allow error = %v", err)
+	}
+	command.Channel = "beta"
+	if _, err := newTestReleaseService().Create(context.Background(), principal, command, testRequestContext()); !errors.Is(err, identity.ErrActionDenied) {
+		t.Fatalf("Create() different channel error = %v", err)
+	}
+}
+
 func TestCreateRejectsArtifactFromAnotherProductWithoutLeakingItsExistence(t *testing.T) {
 	t.Parallel()
 

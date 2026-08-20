@@ -76,7 +76,7 @@ func (service *Service) Create(ctx context.Context, principal identity.Principal
 		return Release{}, err
 	}
 	command.ProductID = strings.TrimSpace(command.ProductID)
-	if err := service.authorizer.Require(principal, identity.ActionReleaseCreate, command.ProductID); err != nil {
+	if err := service.authorizer.RequireInChannel(principal, identity.ActionReleaseCreate, command.ProductID, command.Channel); err != nil {
 		return Release{}, err
 	}
 	productRecord, err := service.products.Get(ctx, command.ProductID)
@@ -153,11 +153,11 @@ func (service *Service) Approve(ctx context.Context, principal identity.Principa
 	if err := requireExplicitApprover(principal); err != nil {
 		return Release{}, err
 	}
-	if err := service.authorizer.Require(principal, identity.ActionReleaseApprove, productID); err != nil {
-		return Release{}, err
-	}
 	current, err := service.repository.Get(ctx, productID, releaseID)
 	if err != nil {
+		return Release{}, err
+	}
+	if err := service.authorizer.RequireInChannel(principal, identity.ActionReleaseApprove, productID, current.Channel); err != nil {
 		return Release{}, err
 	}
 	if strings.TrimSpace(current.SubmittedBy) == strings.TrimSpace(principal.Subject) {
@@ -174,15 +174,15 @@ func (service *Service) Reject(ctx context.Context, principal identity.Principal
 	if err := requireExplicitApprover(principal); err != nil {
 		return Release{}, err
 	}
-	if err := service.authorizer.Require(principal, identity.ActionReleaseApprove, productID); err != nil {
-		return Release{}, err
-	}
 	reason = strings.TrimSpace(reason)
 	if reason == "" || len(reason) > 2048 || containsControl(reason) {
 		return Release{}, ErrRejectionReasonRequired
 	}
 	current, err := service.repository.Get(ctx, productID, releaseID)
 	if err != nil {
+		return Release{}, err
+	}
+	if err := service.authorizer.RequireInChannel(principal, identity.ActionReleaseApprove, productID, current.Channel); err != nil {
 		return Release{}, err
 	}
 	if strings.TrimSpace(current.SubmittedBy) == strings.TrimSpace(principal.Subject) {
@@ -207,9 +207,6 @@ func (service *Service) Revoke(ctx context.Context, principal identity.Principal
 	if err := requireExplicitApprover(principal); err != nil {
 		return OperationResult{}, err
 	}
-	if err := service.authorizer.Require(principal, identity.ActionReleaseApprove, productID); err != nil {
-		return OperationResult{}, err
-	}
 	reason = strings.TrimSpace(reason)
 	if reason == "" || len(reason) > 2048 || containsControl(reason) {
 		return OperationResult{}, ErrRevocationReasonRequired
@@ -218,15 +215,17 @@ func (service *Service) Revoke(ctx context.Context, principal identity.Principal
 	if !idempotencyPattern.MatchString(idempotencyKey) {
 		return OperationResult{}, ErrIdempotencyKeyInvalid
 	}
-	if existing, err := service.repository.FindAttempt(ctx, nil, releaseID, AttemptKindRevoke, idempotencyKey); err == nil {
-		current, getErr := service.repository.Get(ctx, productID, releaseID)
-		return OperationResult{Release: current, Attempt: existing}, getErr
-	} else if !errors.Is(err, ErrAttemptNotFound) {
-		return OperationResult{}, err
-	}
 	current, err := service.repository.Get(ctx, productID, releaseID)
 	if err != nil {
 		return OperationResult{}, err
+	}
+	if err := service.authorizer.RequireInChannel(principal, identity.ActionReleaseApprove, productID, current.Channel); err != nil {
+		return OperationResult{}, err
+	}
+	if existing, findErr := service.repository.FindAttempt(ctx, nil, releaseID, AttemptKindRevoke, idempotencyKey); findErr == nil {
+		return OperationResult{Release: current, Attempt: existing}, nil
+	} else if !errors.Is(findErr, ErrAttemptNotFound) {
+		return OperationResult{}, findErr
 	}
 	if current.RevokedAt != nil {
 		return OperationResult{}, ErrReleaseAlreadyRevoked
@@ -297,9 +296,6 @@ func (service *Service) startPublication(ctx context.Context, principal identity
 			return OperationResult{}, err
 		}
 	}
-	if err := service.authorizer.Require(principal, action, productID); err != nil {
-		return OperationResult{}, err
-	}
 	idempotencyKey = strings.TrimSpace(idempotencyKey)
 	if !idempotencyPattern.MatchString(idempotencyKey) {
 		return OperationResult{}, ErrIdempotencyKeyInvalid
@@ -312,6 +308,9 @@ func (service *Service) startPublication(ctx context.Context, principal identity
 	}
 	current, err := service.repository.Get(ctx, productID, releaseID)
 	if err != nil {
+		return OperationResult{}, err
+	}
+	if err := service.authorizer.RequireInChannel(principal, action, productID, current.Channel); err != nil {
 		return OperationResult{}, err
 	}
 	if !TransitionAllowed(current.Status, StatusPublishing) {
@@ -398,10 +397,14 @@ func (service *Service) Get(ctx context.Context, principal identity.Principal, p
 		return Release{}, err
 	}
 	productID = strings.TrimSpace(productID)
-	if err := service.authorizer.Require(principal, identity.ActionProductRead, productID); err != nil {
+	current, err := service.repository.Get(ctx, productID, releaseID)
+	if err != nil {
 		return Release{}, err
 	}
-	return service.repository.Get(ctx, productID, releaseID)
+	if err := service.authorizer.RequireInChannel(principal, identity.ActionProductRead, productID, current.Channel); err != nil {
+		return Release{}, err
+	}
+	return current, nil
 }
 
 func (service *Service) transition(ctx context.Context, principal identity.Principal, action identity.Action, productID string, releaseID uuid.UUID, expectedLockVersion int64, target Status, reason string, request RequestContext) (Release, error) {
@@ -409,11 +412,11 @@ func (service *Service) transition(ctx context.Context, principal identity.Princ
 		return Release{}, err
 	}
 	productID = strings.TrimSpace(productID)
-	if err := service.authorizer.Require(principal, action, productID); err != nil {
-		return Release{}, err
-	}
 	current, err := service.repository.Get(ctx, productID, releaseID)
 	if err != nil {
+		return Release{}, err
+	}
+	if err := service.authorizer.RequireInChannel(principal, action, productID, current.Channel); err != nil {
 		return Release{}, err
 	}
 	return service.transitionAuthorized(ctx, principal, current, expectedLockVersion, target, reason, request)

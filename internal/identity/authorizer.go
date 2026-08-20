@@ -130,6 +130,16 @@ func (authorizer *Authorizer) Allowed(principal Principal, action Action, produc
 	return authorizer.Require(principal, action, productID) == nil
 }
 
+func (authorizer *Authorizer) RequireInChannel(principal Principal, action Action, productID, channel string) error {
+	if err := principal.Validate(); err != nil {
+		return err
+	}
+	if principal.Governed {
+		return authorizer.requireGoverned(principal, action, productID, channel)
+	}
+	return authorizer.Require(principal, action, productID)
+}
+
 func actionSet(actions ...Action) map[Action]struct{} {
 	result := make(map[Action]struct{}, len(actions))
 	for _, action := range actions {

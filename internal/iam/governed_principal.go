@@ -36,9 +36,22 @@ func (resolver *GovernedPrincipalResolver) ResolvePrincipal(ctx context.Context,
 		return identity.Principal{}, ErrGovernedPrincipalUnavailable
 	}
 	var sourceStatus *IdentitySourceStatus
-	user, err := scanUser(resolver.repository.pool.QueryRow(ctx, userSelect+`
-WHERE lower(user_record.username) = lower($1) OR user_record.external_subject = $1
-ORDER BY user_record.created_at DESC LIMIT 1`, strings.TrimSpace(principal.Subject)))
+	var user UserPrincipal
+	var err error
+	switch principal.Kind {
+	case identity.PrincipalKindHuman:
+		state, stateErr := resolver.repository.GetLoginState(ctx, nil)
+		if stateErr != nil || state.Mode != LoginModeSSO || state.ActiveSourceID == uuid.Nil {
+			return identity.Principal{}, ErrGovernedPrincipalUnavailable
+		}
+		user, err = scanUser(resolver.repository.pool.QueryRow(ctx, userSelect+`
+WHERE user_record.identity_source_id = $1 AND user_record.external_subject = $2`, state.ActiveSourceID, strings.TrimSpace(principal.Subject)))
+	case identity.PrincipalKindLocal:
+		user, err = scanUser(resolver.repository.pool.QueryRow(ctx, userSelect+`
+WHERE lower(user_record.username) = lower($1) AND user_record.user_kind IN ('local', 'emergency')`, strings.TrimSpace(principal.Subject)))
+	default:
+		return identity.Principal{}, ErrGovernedPrincipalUnavailable
+	}
 	if err != nil {
 		return identity.Principal{}, ErrGovernedPrincipalUnavailable
 	}
