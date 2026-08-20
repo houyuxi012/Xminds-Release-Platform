@@ -55,6 +55,46 @@ WHERE singleton = TRUE`
 	return state, nil
 }
 
+// GetActiveOIDCSnapshot reads the login state and its referenced source from
+// one PostgreSQL statement, so an authentication request cannot combine login
+// state from before a source switch with an identity-source row read after it.
+func (repository *PostgresRepository) GetActiveOIDCSnapshot(ctx context.Context) (LoginState, IdentitySource, error) {
+	if repository == nil || repository.pool == nil {
+		return LoginState{}, IdentitySource{}, ErrIAMConfiguration
+	}
+	var state LoginState
+	var source IdentitySource
+	var verifiedAt, previewedAt *time.Time
+	err := repository.pool.QueryRow(ctx, `
+SELECT login.login_mode,
+       COALESCE(login.active_source_id, '00000000-0000-0000-0000-000000000000'::uuid),
+       login.fault_code, login.version, login.updated_by, login.updated_at,
+       COALESCE(source.id, '00000000-0000-0000-0000-000000000000'::uuid),
+       COALESCE(source.name, ''), COALESCE(source.source_kind, ''), COALESCE(source.status, ''),
+       COALESCE(source.secret_reference, ''), COALESCE(source.required_mappings_complete, FALSE),
+       source.verified_at, source.previewed_at, COALESCE(source.fault_code, ''),
+       COALESCE(source.version, 0), COALESCE(source.created_at, 'epoch'::timestamptz),
+       COALESCE(source.updated_at, 'epoch'::timestamptz)
+FROM iam_login_state AS login
+LEFT JOIN identity_sources AS source ON source.id = login.active_source_id
+WHERE login.singleton = TRUE
+`).Scan(
+		&state.Mode, &state.ActiveSourceID, &state.FaultCode, &state.Version, &state.UpdatedBy, &state.UpdatedAt,
+		&source.ID, &source.Name, &source.Kind, &source.Status, &source.SecretReference, &source.RequiredMappingsComplete,
+		&verifiedAt, &previewedAt, &source.FaultCode, &source.Version, &source.CreatedAt, &source.UpdatedAt,
+	)
+	if err != nil {
+		return LoginState{}, IdentitySource{}, fmt.Errorf("get active OIDC snapshot: %w", err)
+	}
+	if verifiedAt != nil {
+		source.VerifiedAt = verifiedAt.UTC()
+	}
+	if previewedAt != nil {
+		source.PreviewedAt = previewedAt.UTC()
+	}
+	return state, source, nil
+}
+
 func (repository *PostgresRepository) SetLoginState(ctx context.Context, tx pgx.Tx, state LoginState, expectedVersion int64) error {
 	if tx == nil {
 		return ErrIAMConfiguration

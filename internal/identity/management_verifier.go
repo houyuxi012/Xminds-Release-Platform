@@ -2,8 +2,11 @@ package identity
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"strings"
+
+	"xminds-release-platform/internal/platform/strictjson"
 )
 
 var ErrManagementVerifierConfiguration = errors.New("management identity verifier configuration is invalid")
@@ -35,12 +38,40 @@ func (verifier *ManagementVerifier) Verify(ctx context.Context, rawToken string)
 	if strings.HasPrefix(rawToken, apiTokenPrefix+".") {
 		return verifier.apiToken.Verify(ctx, rawToken)
 	}
-	principal, err := verifier.human.Verify(ctx, rawToken)
-	if err == nil {
-		return principal, nil
-	}
-	if !errors.Is(err, ErrTokenUseInvalid) {
+	tokenUse, err := managementTokenUse(rawToken)
+	if err != nil {
 		return Principal{}, err
 	}
-	return verifier.workload.Verify(ctx, rawToken)
+	switch tokenUse {
+	case defaultHumanTokenUse:
+		return verifier.human.Verify(ctx, rawToken)
+	case workloadTokenUse:
+		return verifier.workload.Verify(ctx, rawToken)
+	default:
+		return Principal{}, ErrTokenUseInvalid
+	}
+}
+
+func managementTokenUse(rawToken string) (string, error) {
+	if rawToken == "" || len(rawToken) > maximumBearerTokenLength {
+		return "", ErrTokenUseInvalid
+	}
+	segments := strings.Split(rawToken, ".")
+	if len(segments) != 3 || segments[0] == "" || segments[1] == "" || segments[2] == "" {
+		return "", ErrTokenUseInvalid
+	}
+	payload, err := base64.RawURLEncoding.Strict().DecodeString(segments[1])
+	if err != nil || len(payload) == 0 || len(payload) > maximumBearerTokenLength {
+		return "", ErrTokenUseInvalid
+	}
+	claims := struct {
+		TokenUse string `json:"token_use"`
+	}{}
+	if err := strictjson.DecodeKnownBytes(payload, maximumBearerTokenLength, &claims); err != nil {
+		return "", ErrTokenUseInvalid
+	}
+	if claims.TokenUse != defaultHumanTokenUse && claims.TokenUse != workloadTokenUse {
+		return "", ErrTokenUseInvalid
+	}
+	return claims.TokenUse, nil
 }

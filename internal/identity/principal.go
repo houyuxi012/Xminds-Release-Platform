@@ -42,6 +42,7 @@ var (
 type Principal struct {
 	Subject                 string
 	Kind                    PrincipalKind
+	IdentitySourceID        string
 	Roles                   []Role
 	ProductIDs              []string
 	TokenID                 string

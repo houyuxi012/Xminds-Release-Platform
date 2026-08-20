@@ -112,14 +112,8 @@ func run(ctx context.Context, arguments []string, environ map[string]string) err
 	if err != nil {
 		return fmt.Errorf("configure public distribution API: %w", err)
 	}
-	humanVerifier, err := identity.NewOIDCVerifier(ctx, identity.OIDCVerifierConfig{
-		Issuer: configuration.OIDCIssuer, Audience: configuration.OIDCAudience,
-	})
-	if err != nil {
-		return fmt.Errorf("configure human OIDC identity: %w", err)
-	}
 	workloadVerifier, err := identity.NewWorkloadVerifier(ctx, identity.OIDCVerifierConfig{
-		Issuer: configuration.OIDCIssuer, Audience: configuration.OIDCAudience,
+		Issuer: configuration.WorkloadOIDCIssuer, Audience: configuration.WorkloadOIDCAudience,
 	})
 	if err != nil {
 		return fmt.Errorf("configure workload OIDC identity: %w", err)
@@ -203,8 +197,15 @@ func run(ctx context.Context, arguments []string, environ map[string]string) err
 	if err != nil {
 		return fmt.Errorf("configure IAM directory conflict cursor codec: %w", err)
 	}
-	directoryAdapter, err := iam.NewSecretBackedDirectoryAdapter(iam.SecretBackedDirectoryAdapterConfig{
+	oidcTrusts, err := iam.NewOIDCTrustFactory(iam.OIDCTrustFactoryConfig{
 		Secrets: secretResolver, RequestTimeout: runtimeConfig.Directory.RequestTimeout,
+		AllowLoopbackHTTP: runtimeConfig.Directory.AllowLoopbackHTTP, AllowedPrivatePrefixes: runtimeConfig.Directory.AllowedPrivatePrefixes,
+	})
+	if err != nil {
+		return fmt.Errorf("configure shared IAM OIDC trust: %w", err)
+	}
+	directoryAdapter, err := iam.NewSecretBackedDirectoryAdapter(iam.SecretBackedDirectoryAdapterConfig{
+		Secrets: secretResolver, OIDCTrusts: oidcTrusts, RequestTimeout: runtimeConfig.Directory.RequestTimeout,
 		MaximumPages: runtimeConfig.Directory.MaximumPages, MaximumObjects: runtimeConfig.Directory.MaximumObjects,
 		AllowLoopbackHTTP: runtimeConfig.Directory.AllowLoopbackHTTP, AllowedPrivatePrefixes: runtimeConfig.Directory.AllowedPrivatePrefixes,
 	})
@@ -216,6 +217,13 @@ func run(ctx context.Context, arguments []string, environ map[string]string) err
 		return fmt.Errorf("configure IAM TOTP verifier: %w", err)
 	}
 	iamRepository := iam.NewPostgresRepository(pool)
+	humanVerifier, err := iam.NewActiveOIDCVerifier(iam.ActiveOIDCVerifierConfig{Repository: iamRepository, Trusts: oidcTrusts})
+	if err != nil {
+		return fmt.Errorf("configure active human OIDC identity: %w", err)
+	}
+	if err := humanVerifier.Validate(ctx); err != nil {
+		return fmt.Errorf("validate active human OIDC identity: %w", err)
+	}
 	localAuthenticator, err := iam.NewLocalAuthService(iam.LocalAuthConfig{
 		Repository: iamRepository, Auditor: auditor, Passwords: iamPasswords, MFA: mfaVerifier,
 		DummyPassword: dummyPassword, Policy: runtimeConfig.LocalAuth.Policy, Clock: time.Now,

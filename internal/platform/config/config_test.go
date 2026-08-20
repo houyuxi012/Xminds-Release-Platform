@@ -87,6 +87,9 @@ func TestLoadParsesValidatedConfiguration(t *testing.T) {
 	if got.APIListen != "127.0.0.1:8080" {
 		t.Fatalf("APIListen = %q", got.APIListen)
 	}
+	if got.WorkloadOIDCIssuer != environ["XMINDS_RELEASE_OIDC_ISSUER"] || got.WorkloadOIDCAudience != environ["XMINDS_RELEASE_OIDC_AUDIENCE"] {
+		t.Fatalf("workload OIDC configuration = %q / %q", got.WorkloadOIDCIssuer, got.WorkloadOIDCAudience)
+	}
 }
 
 func validTestEnvironment() map[string]string {

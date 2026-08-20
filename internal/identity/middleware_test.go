@@ -2,6 +2,7 @@ package identity
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -159,15 +160,20 @@ func TestManagementVerifierRoutesLocalSessionsWithoutAnyFallback(t *testing.T) {
 	}
 }
 
-func TestManagementVerifierFallsBackOnlyForWorkloadTokenUse(t *testing.T) {
+func TestManagementVerifierDispatchesJWTOnlyByExactTokenUseWithoutFallback(t *testing.T) {
 	t.Parallel()
 
+	human := Principal{Subject: "alice", Kind: PrincipalKindHuman}
 	workload := Principal{Subject: "github-runner", Kind: PrincipalKindWorkload}
+	humanCalls := 0
+	workloadCalls := 0
 	verifier, err := NewManagementVerifier(
 		verifierFunc(func(context.Context, string) (Principal, error) {
-			return Principal{}, ErrTokenUseInvalid
+			humanCalls++
+			return human, nil
 		}),
 		verifierFunc(func(context.Context, string) (Principal, error) {
+			workloadCalls++
 			return workload, nil
 		}),
 		verifierFunc(func(context.Context, string) (Principal, error) {
@@ -179,23 +185,21 @@ func TestManagementVerifierFallsBackOnlyForWorkloadTokenUse(t *testing.T) {
 		t.Fatalf("NewManagementVerifier() error = %v", err)
 	}
 
-	principal, err := verifier.Verify(context.Background(), "signed-workload-token")
+	principal, err := verifier.Verify(context.Background(), managementJWT(`{"token_use":"workload"}`))
 	if err != nil {
 		t.Fatalf("Verify() error = %v", err)
 	}
-	if principal.Subject != workload.Subject || principal.Kind != PrincipalKindWorkload {
-		t.Fatalf("principal = %#v", principal)
+	if principal.Subject != workload.Subject || principal.Kind != PrincipalKindWorkload || humanCalls != 0 || workloadCalls != 1 {
+		t.Fatalf("principal = %#v, human calls = %d, workload calls = %d", principal, humanCalls, workloadCalls)
 	}
 
 	verificationFailure := errors.New("signature verification failed")
-	workloadCalled := false
 	strictVerifier, err := NewManagementVerifier(
 		verifierFunc(func(context.Context, string) (Principal, error) {
 			return Principal{}, verificationFailure
 		}),
 		verifierFunc(func(context.Context, string) (Principal, error) {
-			workloadCalled = true
-			return workload, nil
+			return Principal{}, errors.New("wrong workload signature")
 		}),
 		verifierFunc(func(context.Context, string) (Principal, error) {
 			return Principal{}, ErrAPITokenInvalid
@@ -205,12 +209,52 @@ func TestManagementVerifierFallsBackOnlyForWorkloadTokenUse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewManagementVerifier() error = %v", err)
 	}
-	if _, err := strictVerifier.Verify(context.Background(), "invalid-token"); !errors.Is(err, verificationFailure) {
+	if _, err := strictVerifier.Verify(context.Background(), managementJWT(`{"token_use":"human"}`)); !errors.Is(err, verificationFailure) {
 		t.Fatalf("Verify() error = %v, want %v", err, verificationFailure)
 	}
-	if workloadCalled {
-		t.Fatal("workload verifier accepted fallback after a signature failure")
+}
+
+func TestManagementVerifierRejectsAmbiguousOrMalformedTokenUseBeforeAnyOIDCVerifier(t *testing.T) {
+	t.Parallel()
+
+	for name, token := range map[string]string{
+		"missing":         managementJWT(`{"sub":"alice"}`),
+		"duplicate":       managementJWT(`{"token_use":"human","token_use":"workload"}`),
+		"case alias":      managementJWT(`{"token_use":"human","Token_Use":"workload"}`),
+		"unknown":         managementJWT(`{"token_use":"service"}`),
+		"non string":      managementJWT(`{"token_use":1}`),
+		"two segments":    "e30.e30",
+		"four segments":   "e30.e30.c2ln.extra",
+		"invalid payload": "e30.@@@.c2ln",
+		"oversized":       strings.Repeat("a", maximumBearerTokenLength+1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			calls := 0
+			unexpected := verifierFunc(func(context.Context, string) (Principal, error) {
+				calls++
+				return Principal{Subject: "unexpected", Kind: PrincipalKindHuman}, nil
+			})
+			verifier, err := NewManagementVerifier(
+				unexpected,
+				unexpected,
+				verifierFunc(func(context.Context, string) (Principal, error) { return Principal{}, ErrAPITokenInvalid }),
+				verifierFunc(func(context.Context, string) (Principal, error) { return Principal{}, ErrAuthenticationFailed }),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := verifier.Verify(context.Background(), token); !errors.Is(err, ErrTokenUseInvalid) {
+				t.Fatalf("Verify() error = %v, want %v", err, ErrTokenUseInvalid)
+			}
+			if calls != 0 {
+				t.Fatalf("malformed token reached %d OIDC verifiers", calls)
+			}
+		})
 	}
+}
+
+func managementJWT(payload string) string {
+	return "e30." + base64.RawURLEncoding.EncodeToString([]byte(payload)) + ".c2ln"
 }
 
 func TestManagementVerifierRejectsIncompleteConfiguration(t *testing.T) {

@@ -611,6 +611,9 @@ func (service *Service) EnableSSO(ctx context.Context, actor identity.Principal,
 	if preflightSource.Version != expectedVersion {
 		return ErrIAMConflict
 	}
+	if preflightSource.Kind != IdentitySourceOIDC {
+		return ErrSSOPreconditionFailed
+	}
 	if err := service.consumeHighRisk(ctx, actor, string(ReauthenticationOperationSSOEnable), proof, request); err != nil {
 		return err
 	}
@@ -630,7 +633,7 @@ func (service *Service) EnableSSO(ctx context.Context, actor identity.Principal,
 		if source.Version != expectedVersion {
 			return ErrIAMConflict
 		}
-		if source.Status != IdentitySourceStatusVerified || source.VerifiedAt.IsZero() || source.PreviewedAt.IsZero() ||
+		if source.Kind != IdentitySourceOIDC || source.Status != IdentitySourceStatusVerified || source.VerifiedAt.IsZero() || source.PreviewedAt.IsZero() ||
 			!source.RequiredMappingsComplete {
 			return ErrSSOPreconditionFailed
 		}

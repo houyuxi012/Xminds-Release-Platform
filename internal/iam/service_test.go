@@ -38,6 +38,27 @@ func TestEnableSSORequiresVerifiedSourceMappingPreviewAndEmergencyAccount(t *tes
 	}
 }
 
+func TestEnableSSORejectsSCIMSourceBeforeConsumingProof(t *testing.T) {
+	t.Parallel()
+
+	harness := newIAMHarness(t)
+	source := harness.repository.sources[harness.sourceID]
+	source.Kind = IdentitySourceSCIM
+	harness.repository.sources[harness.sourceID] = source
+
+	err := harness.service.EnableSSO(context.Background(), harness.admin, harness.sourceID, 1, harness.proof(), harness.request)
+
+	if !errors.Is(err, ErrSSOPreconditionFailed) {
+		t.Fatalf("EnableSSO(SCIM) error = %v, want %v", err, ErrSSOPreconditionFailed)
+	}
+	if len(harness.highRisk.operations) != 0 {
+		t.Fatalf("SCIM static type rejection consumed proof: %+v", harness.highRisk.operations)
+	}
+	if harness.repository.login.Mode != LoginModeLocal || harness.repository.sources[harness.sourceID].Status != IdentitySourceStatusVerified {
+		t.Fatalf("SCIM rejection changed state: login=%+v source=%+v", harness.repository.login, harness.repository.sources[harness.sourceID])
+	}
+}
+
 func TestFaultDoesNotEnableRegularLocalLogin(t *testing.T) {
 	t.Parallel()
 

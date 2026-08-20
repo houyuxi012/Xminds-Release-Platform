@@ -4,7 +4,7 @@ info:
   version: 0.1.0-p0
   description: |
     Xminds Release Platform 管理面与工作负载 API 基础契约。
-    管理操作使用 OIDC Bearer Token，自动化工作负载使用独立工作负载令牌。
+    管理人员使用当前启用 IAM OIDC 来源签发的 Bearer Token，自动化工作负载使用独立发行者与令牌。
   license:
     name: Apache-2.0
     identifier: Apache-2.0
@@ -1806,12 +1806,12 @@ components:
       type: http
       scheme: bearer
       bearerFormat: OIDC-JWT
-      description: 面向控制台用户的企业 OIDC 身份令牌；Issuer 通过部署配置提供。
+      description: 面向控制台用户的企业 OIDC 身份令牌；Issuer 来自当前 iam_login_state 精确指向的 enabled OIDC 来源，token_use 必须精确为 human。
     workloadBearer:
       type: http
       scheme: bearer
       bearerFormat: JWT
-      description: 面向 CI/CD、客户端与同步执行器的短期工作负载令牌。
+      description: 面向 CI/CD、客户端与同步执行器的短期工作负载令牌；使用独立静态受信发行者，token_use 必须精确为 workload，不与人员验签互相回退。
   responses:
     CatalogMetadata:
       description: 已签名的 TUF 元数据封装

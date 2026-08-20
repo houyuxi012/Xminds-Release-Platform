@@ -52,6 +52,7 @@ var (
 
 type SecretBackedDirectoryAdapterConfig struct {
 	Secrets                SecretResolver
+	OIDCTrusts             *OIDCTrustFactory
 	Resolver               egress.IPResolver
 	Dialer                 egress.Dialer
 	RequestTimeout         time.Duration
@@ -63,6 +64,7 @@ type SecretBackedDirectoryAdapterConfig struct {
 
 type SecretBackedDirectoryAdapter struct {
 	secrets                SecretResolver
+	oidcTrusts             *OIDCTrustFactory
 	resolver               egress.IPResolver
 	dialer                 egress.Dialer
 	requestTimeout         time.Duration
@@ -183,8 +185,18 @@ func NewSecretBackedDirectoryAdapter(config SecretBackedDirectoryAdapterConfig) 
 		config.Resolver == nil || config.Dialer == nil {
 		return nil, ErrDirectoryConfigurationInvalid
 	}
+	if config.OIDCTrusts == nil {
+		var err error
+		config.OIDCTrusts, err = NewOIDCTrustFactory(OIDCTrustFactoryConfig{
+			Secrets: config.Secrets, Resolver: config.Resolver, Dialer: config.Dialer, RequestTimeout: config.RequestTimeout,
+			AllowLoopbackHTTP: config.AllowLoopbackHTTP, AllowedPrivatePrefixes: config.AllowedPrivatePrefixes,
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
 	return &SecretBackedDirectoryAdapter{
-		secrets: config.Secrets, resolver: config.Resolver, dialer: config.Dialer,
+		secrets: config.Secrets, oidcTrusts: config.OIDCTrusts, resolver: config.Resolver, dialer: config.Dialer,
 		requestTimeout: config.RequestTimeout, maximumPages: config.MaximumPages,
 		maximumObjects: config.MaximumObjects, allowLoopbackHTTP: config.AllowLoopbackHTTP,
 		allowedPrivatePrefixes: append([]netip.Prefix(nil), config.AllowedPrivatePrefixes...),
@@ -297,23 +309,15 @@ func (adapter *SecretBackedDirectoryAdapter) operationContext(parent context.Con
 }
 
 func (adapter *SecretBackedDirectoryAdapter) verifyOIDC(ctx context.Context, source IdentitySource) (CapabilityReport, error) {
-	configuration, client, err := adapter.loadOIDC(ctx, source)
+	if adapter == nil || adapter.oidcTrusts == nil {
+		return CapabilityReport{}, ErrDirectoryConfigurationInvalid
+	}
+	material, err := adapter.oidcTrusts.resolve(ctx, source)
 	if err != nil {
 		return CapabilityReport{}, err
 	}
-	var discovery oidcDiscoveryDocument
-	if err := adapter.getJSON(ctx, client, configuration.Issuer+"/.well-known/openid-configuration", "", &discovery); err != nil {
+	if _, _, err := adapter.oidcTrusts.prepare(ctx, material); err != nil {
 		return CapabilityReport{}, err
-	}
-	if discovery.Issuer != configuration.Issuer || !safeRelatedURL(discovery.JWKSURI, configuration.Issuer, adapter.allowLoopbackHTTP) {
-		return CapabilityReport{}, ErrDirectoryResponseInvalid
-	}
-	var keySet oidcJWKSet
-	if err := adapter.getJSON(ctx, client, discovery.JWKSURI, "", &keySet); err != nil {
-		return CapabilityReport{}, err
-	}
-	if !validOIDCKeySet(keySet, configuration.SigningAlgorithms) {
-		return CapabilityReport{}, ErrDirectoryResponseInvalid
 	}
 	return CapabilityReport{
 		Reachable: true, RequiredAttributes: []string{"subject", "display_name", "email", "roles", "product_ids"},
@@ -387,22 +391,6 @@ func (adapter *SecretBackedDirectoryAdapter) collectSCIMResourceTypes(ctx contex
 	return nil, ErrDirectoryLimitExceeded
 }
 
-func (adapter *SecretBackedDirectoryAdapter) loadOIDC(ctx context.Context, source IdentitySource) (oidcDirectorySecret, *http.Client, error) {
-	contents, err := adapter.secrets.Resolve(ctx, source.SecretReference)
-	if err != nil {
-		return oidcDirectorySecret{}, nil, ErrDirectoryConfigurationInvalid
-	}
-	var configuration oidcDirectorySecret
-	if err := decodeStrictJSON(contents, &configuration); err != nil || strings.TrimSpace(configuration.Audience) == "" ||
-		!validClaimName(configuration.RolesClaim) || !validClaimName(configuration.ProductIDsClaim) || !validClaimName(configuration.TokenUseClaim) ||
-		!validSigningAlgorithms(configuration.SigningAlgorithms) || !safeBaseURL(configuration.Issuer, adapter.allowLoopbackHTTP) {
-		return oidcDirectorySecret{}, nil, ErrDirectoryConfigurationInvalid
-	}
-	configuration.Issuer = strings.TrimSuffix(strings.TrimSpace(configuration.Issuer), "/")
-	client, err := adapter.newHTTPClient(ctx, configuration.CAReference, configuration.Issuer)
-	return configuration, client, err
-}
-
 func (adapter *SecretBackedDirectoryAdapter) loadSCIM(ctx context.Context, source IdentitySource) (scimDirectorySecret, string, *http.Client, error) {
 	contents, err := adapter.secrets.Resolve(ctx, source.SecretReference)
 	if err != nil {
@@ -468,6 +456,10 @@ func (adapter *SecretBackedDirectoryAdapter) newHTTPClient(ctx context.Context, 
 }
 
 func (adapter *SecretBackedDirectoryAdapter) getJSON(ctx context.Context, client *http.Client, endpoint, bearer string, target any) error {
+	return getDirectoryJSON(ctx, client, endpoint, bearer, target)
+}
+
+func getDirectoryJSON(ctx context.Context, client *http.Client, endpoint, bearer string, target any) error {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return ErrDirectoryConfigurationInvalid

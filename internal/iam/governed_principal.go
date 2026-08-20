@@ -40,12 +40,18 @@ func (resolver *GovernedPrincipalResolver) ResolvePrincipal(ctx context.Context,
 	var err error
 	switch principal.Kind {
 	case identity.PrincipalKindHuman:
-		state, stateErr := resolver.repository.GetLoginState(ctx, nil)
-		if stateErr != nil || state.Mode != LoginModeSSO || state.ActiveSourceID == uuid.Nil {
+		verifiedSourceID, parseErr := uuid.Parse(strings.TrimSpace(principal.IdentitySourceID))
+		if parseErr != nil || verifiedSourceID == uuid.Nil {
 			return identity.Principal{}, ErrGovernedPrincipalUnavailable
 		}
+		state, source, snapshotErr := resolver.repository.GetActiveOIDCSnapshot(ctx)
+		if snapshotErr != nil || state.Mode != LoginModeSSO || state.ActiveSourceID != verifiedSourceID ||
+			source.ID != verifiedSourceID || source.Kind != IdentitySourceOIDC || source.Status != IdentitySourceStatusEnabled {
+			return identity.Principal{}, ErrGovernedPrincipalUnavailable
+		}
+		sourceStatus = &source.Status
 		user, err = scanUser(resolver.repository.pool.QueryRow(ctx, userSelect+`
-WHERE user_record.identity_source_id = $1 AND user_record.external_subject = $2`, state.ActiveSourceID, strings.TrimSpace(principal.Subject)))
+WHERE user_record.identity_source_id = $1 AND user_record.external_subject = $2`, verifiedSourceID, strings.TrimSpace(principal.Subject)))
 	case identity.PrincipalKindLocal:
 		user, err = scanUser(resolver.repository.pool.QueryRow(ctx, userSelect+`
 WHERE lower(user_record.username) = lower($1) AND user_record.user_kind IN ('local', 'emergency')`, strings.TrimSpace(principal.Subject)))
@@ -55,7 +61,7 @@ WHERE lower(user_record.username) = lower($1) AND user_record.user_kind IN ('loc
 	if err != nil {
 		return identity.Principal{}, ErrGovernedPrincipalUnavailable
 	}
-	if user.IdentitySourceID != uuid.Nil {
+	if user.IdentitySourceID != uuid.Nil && sourceStatus == nil {
 		var status IdentitySourceStatus
 		if err := resolver.repository.pool.QueryRow(ctx, `SELECT status FROM identity_sources WHERE id = $1`, user.IdentitySourceID).Scan(&status); err != nil {
 			return identity.Principal{}, ErrGovernedPrincipalUnavailable

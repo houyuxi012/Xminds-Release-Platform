@@ -42,13 +42,14 @@ Xminds Release Platform 是面向企业软件交付场景的多产品可信发�
 - `endpoint.sync.v1` 五角色目录与引用制品复制、目标端回读 SHA-256 校验和三次失败摘除；
 - 独立公网监听端口、默认产品兼容目录路径、产品/通道隔离目录路径和支持单段 Range 的内容寻址制品下载。
 - 基于受信任 Secret 根的 OIDC discovery/JWKS 与 SCIM 2.0 连接验证，并强制非对称签名算法、可用公钥材料、同源 JWKS、TLS 1.2+、禁用环境代理与重定向；
+- 基于当前 `iam_login_state.active_source_id` 的活动人员 OIDC 验签，来源切换、状态变更或 Secret/CA 原子轮换后立即失效旧信任；
 - SCIM Users/Groups 分页归一化、有界对象计数与持久化 preview/apply 作业，支持 Worker 崩溃后从服务端游标幂等恢复；
 - 目录来源字段所有权、本地角色/补充成员关系保留、full snapshot 终页停用及冲突对象最后安全状态保留。
 - 基于 React 19、Ant Design 6 与 Ant Design Pro Components 的发布管理控制台；
 - 白色管理台导航与详情抽屉、产品注册、断点续传、职责分离审批、SCM 能力探测、端点健康和审计证据主流程；
 - 真实 Chromium 组件测试与 Playwright 端到端主流程验收。
 
-当前管理 API 运行时已挂载产品、制品、Release、分发端点、审计查询/导出和 IAM 治理路由。业务路由统一位于 OIDC 人工身份、OIDC 工作负载身份和 Argon2id API Token 组合验证边界之后；任一验证器缺失都会拒绝启动或对业务路由 fail closed。角色变更、用户启停/会话撤销和 SSO 切换还必须消费与 actor、operation 及完成 Bearer token ID 精确绑定的服务端一次性重认证 evidence；工作负载和 API Token 不具备 human reauthentication 能力。存活、就绪和版本端点保持匿名可用。分发端点激活使用 DNS 解析地址固定、禁用环境代理和重定向的 TLS 探测，私有 CA 仅能通过受控 Secret 目录中的单文件引用；私有端点网段必须通过 `XMINDS_RELEASE_ENDPOINT_ALLOWED_PRIVATE_CIDRS` 以最小 RFC1918/ULA CIDR 显式授权，未配置时只允许公开可路由地址。独立 Public API 只挂载公开目录和制品读取路由，不包含管理操作。Worker 已挂载目录发布、目录撤销、审计导出和版本化身份目录同步处理器；端点同步的具体目标写入适配器仍需在部署组合根注入。统一日志中心属于后续任务。所有签名材料、IAM Secret 与对象存储凭据必须在启动时显式注入，否则拒绝运行。
+当前管理 API 运行时已挂载产品、制品、Release、分发端点、审计查询/导出和 IAM 治理路由。业务路由统一位于活动来源 OIDC 人员身份、静态受信工作负载 OIDC、Argon2id API Token 和本地持久会话的组合验证边界之后；未受信 JWT payload 中精确名称的 `token_use` 只用于选择唯一验签器，缺失、重复、大小写别名、未知值或任一验签失败都不会跨身份类型回退。角色变更、用户启停/会话撤销和 SSO 切换还必须消费与 actor、operation 及完成 Bearer token ID 精确绑定的服务端一次性重认证 evidence；工作负载和 API Token 不具备 human reauthentication 能力。存活、就绪和版本端点保持匿名可用。分发端点激活使用 DNS 解析地址固定、禁用环境代理和重定向的 TLS 探测，私有 CA 仅能通过受控 Secret 目录中的单文件引用；私有端点网段必须通过 `XMINDS_RELEASE_ENDPOINT_ALLOWED_PRIVATE_CIDRS` 以最小 RFC1918/ULA CIDR 显式授权，未配置时只允许公开可路由地址。独立 Public API 只挂载公开目录和制品读取路由，不包含管理操作。Worker 已挂载目录发布、目录撤销、审计导出和版本化身份目录同步处理器；端点同步的具体目标写入适配器仍需在部署组合根注入。统一日志中心属于后续任务。所有签名材料、IAM Secret 与对象存储凭据必须在启动时显式注入，否则拒绝运行。
 
 ## P0 能力范围
 
@@ -131,7 +132,7 @@ go run ./apps/release-worker
 
 上述 3 个认证入口不要求现有 Bearer，重认证挑战创建/完成和其他管理 API 仍在统一认证中间件之后。所有环境都必须配置绝对路径 `XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY`；生产、测试和预发环境还必须配置指向非可写 SHA-1/SHA-256 摘要文件的 `XMINDS_RELEASE_IAM_BREACH_CORPUS`，缺失时服务拒绝启动。仅显式 `development` 环境可通过 `XMINDS_RELEASE_IAM_USE_DEVELOPMENT_BREACH_CORPUS=true` 单独启用内置最小语料库；缺省环境、其他环境或与外部语料库同时配置时均拒绝启动。锁定阶段可通过 `XMINDS_RELEASE_IAM_LOCKOUT_STAGES=5:5m,8:30m,10:24h` 配置，次数和时长必须严格递增且满足运行时安全上下界。高风险挑战 TTL、evidence TTL、OIDC 新鲜度/时钟偏差、终态保留期和有界清理批次可通过 `.env.example` 中的 `XMINDS_RELEASE_IAM_REAUTH_*` 变量调整；越过安全边界的配置会导致服务拒绝启动。
 
-### 目录连接与异步同步
+### 目录连接、活动 OIDC 与异步同步
 
 `XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY` 是 API 与 Worker 共享的受信任 IAM Secret 根（变量名为兼容已有部署保留）。目录必须是无符号链接的绝对路径，Secret 文件不得对 group/other 开放权限，单文件上限 4 KiB。数据库只保存 `secret://iam/<name>` 引用，不保存 Bearer、CA 或 Secret 内容。OIDC 来源 Secret 为严格 JSON：
 
@@ -146,6 +147,10 @@ go run ./apps/release-worker
   "ca_reference": "secret://iam/corporate-ca"
 }
 ```
+
+`token_use_claim` 必须精确为 `token_use`，以与管理令牌分派器的固定协议一致。当登录模式为 `sso` 时，API 每次人员认证都重读当前登录状态与活动来源；只有精确指向的 `enabled` OIDC 来源可继续。验签器缓存最多保留 16 个信任版本，键绑定来源 ID、数据库版本及 OIDC Secret 与 CA 内容摘要，并发首访仅构建一次。令牌完整验签后还会再次核对活动来源和 Secret 摘要，因此切换来源、进入 fault/local、停用来源或原子轮换 Secret/CA 不会继续接受旧信任。启动时若数据库已处于 SSO 而活动 Secret、CA、DNS/TLS 或 discovery 不可用，API 拒绝启动；`local|configuring|fault` 保持可启动以便运维恢复。
+
+`XMINDS_RELEASE_OIDC_ISSUER` 与 `XMINDS_RELEASE_OIDC_AUDIENCE` 仅配置独立的工作负载 OIDC 发行者，不用于人员认证。人员 OIDC 只来自上述 IAM 来源 Secret；两者不会在验签失败时互相回退。
 
 SCIM 来源 Secret 只引用另一个 Bearer 文件，禁止将 Token 直接写入来源 JSON：
 

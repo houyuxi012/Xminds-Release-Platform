@@ -40,6 +40,7 @@ type OIDCVerifierConfig struct {
 	WorkloadProviderClaim string
 	SigningAlgorithms     []string
 	HTTPClient            *http.Client
+	JWKSURL               string
 }
 
 type idTokenVerifier interface {
@@ -67,14 +68,21 @@ func newTokenVerifier(ctx context.Context, config OIDCVerifierConfig, kind Princ
 		return nil, err
 	}
 	clientContext := oidc.ClientContext(ctx, normalized.HTTPClient)
-	provider, err := oidc.NewProvider(clientContext, normalized.Issuer)
-	if err != nil {
-		return nil, fmt.Errorf("discover OIDC provider: %w", err)
-	}
-	tokenVerifier := provider.VerifierContext(clientContext, &oidc.Config{
+	verifierConfig := &oidc.Config{
 		ClientID:             normalized.Audience,
 		SupportedSigningAlgs: normalized.SigningAlgorithms,
-	})
+	}
+	var tokenVerifier idTokenVerifier
+	if normalized.JWKSURL == "" {
+		provider, err := oidc.NewProvider(clientContext, normalized.Issuer)
+		if err != nil {
+			return nil, fmt.Errorf("discover OIDC provider: %w", err)
+		}
+		tokenVerifier = provider.VerifierContext(clientContext, verifierConfig)
+	} else {
+		keys := oidc.NewRemoteKeySet(clientContext, normalized.JWKSURL)
+		tokenVerifier = oidc.NewVerifier(normalized.Issuer, keys, verifierConfig)
+	}
 	return &OIDCVerifier{
 		tokens:                  tokenVerifier,
 		rolesClaim:              normalized.RolesClaim,
@@ -200,6 +208,13 @@ func normalizeOIDCConfig(config OIDCVerifierConfig) (OIDCVerifierConfig, error) 
 	}
 	if issuerURL.Scheme != "https" && !(issuerURL.Scheme == "http" && isLoopbackHost(issuerURL.Hostname())) {
 		return OIDCVerifierConfig{}, ErrOIDCConfigurationInvalid
+	}
+	if config.JWKSURL = strings.TrimSpace(config.JWKSURL); config.JWKSURL != "" {
+		jwksURL, jwksErr := url.Parse(config.JWKSURL)
+		if jwksErr != nil || jwksURL.Host == "" || jwksURL.User != nil || jwksURL.Fragment != "" || jwksURL.RawQuery != "" || jwksURL.RawPath != "" ||
+			jwksURL.Scheme != issuerURL.Scheme || !strings.EqualFold(jwksURL.Host, issuerURL.Host) {
+			return OIDCVerifierConfig{}, ErrOIDCConfigurationInvalid
+		}
 	}
 	if config.RolesClaim = strings.TrimSpace(config.RolesClaim); config.RolesClaim == "" {
 		config.RolesClaim = defaultRolesClaim

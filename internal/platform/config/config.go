@@ -48,31 +48,31 @@ var (
 )
 
 type Config struct {
-	Environment    string
-	APIListen      string
-	PublicListen   string
-	DatabaseURL    string
-	ObjectStoreURL string
-	ObjectBucket   string
-	OIDCIssuer     string
-	OIDCAudience   string
-	LocalAdmin     bool
-	WorkerID       string
-	JobLease       time.Duration
+	Environment          string
+	APIListen            string
+	PublicListen         string
+	DatabaseURL          string
+	ObjectStoreURL       string
+	ObjectBucket         string
+	WorkloadOIDCIssuer   string
+	WorkloadOIDCAudience string
+	LocalAdmin           bool
+	WorkerID             string
+	JobLease             time.Duration
 }
 
 func Load(environ map[string]string) (Config, error) {
 	configuration := Config{
-		Environment:    valueOrDefault(environ, "XMINDS_RELEASE_ENVIRONMENT", defaultEnvironment),
-		APIListen:      valueOrDefault(environ, "XMINDS_RELEASE_API_LISTEN", defaultAPIListen),
-		PublicListen:   valueOrDefault(environ, "XMINDS_RELEASE_PUBLIC_LISTEN", defaultPublicListen),
-		DatabaseURL:    value(environ, "XMINDS_RELEASE_DATABASE_URL"),
-		ObjectStoreURL: value(environ, "XMINDS_RELEASE_OBJECT_STORE_URL"),
-		ObjectBucket:   value(environ, "XMINDS_RELEASE_OBJECT_BUCKET"),
-		OIDCIssuer:     value(environ, "XMINDS_RELEASE_OIDC_ISSUER"),
-		OIDCAudience:   value(environ, "XMINDS_RELEASE_OIDC_AUDIENCE"),
-		WorkerID:       valueOrDefault(environ, "XMINDS_RELEASE_WORKER_ID", defaultWorkerID),
-		JobLease:       defaultJobLease,
+		Environment:          valueOrDefault(environ, "XMINDS_RELEASE_ENVIRONMENT", defaultEnvironment),
+		APIListen:            valueOrDefault(environ, "XMINDS_RELEASE_API_LISTEN", defaultAPIListen),
+		PublicListen:         valueOrDefault(environ, "XMINDS_RELEASE_PUBLIC_LISTEN", defaultPublicListen),
+		DatabaseURL:          value(environ, "XMINDS_RELEASE_DATABASE_URL"),
+		ObjectStoreURL:       value(environ, "XMINDS_RELEASE_OBJECT_STORE_URL"),
+		ObjectBucket:         value(environ, "XMINDS_RELEASE_OBJECT_BUCKET"),
+		WorkloadOIDCIssuer:   value(environ, "XMINDS_RELEASE_OIDC_ISSUER"),
+		WorkloadOIDCAudience: value(environ, "XMINDS_RELEASE_OIDC_AUDIENCE"),
+		WorkerID:             valueOrDefault(environ, "XMINDS_RELEASE_WORKER_ID", defaultWorkerID),
+		JobLease:             defaultJobLease,
 	}
 	configuration.Environment = strings.ToLower(configuration.Environment)
 
@@ -113,10 +113,10 @@ func Load(environ map[string]string) (Config, error) {
 		if configuration.ObjectBucket == "" {
 			return Config{}, ErrObjectBucketRequired
 		}
-		if configuration.OIDCIssuer == "" {
+		if configuration.WorkloadOIDCIssuer == "" {
 			return Config{}, ErrOIDCIssuerRequired
 		}
-		if configuration.OIDCAudience == "" {
+		if configuration.WorkloadOIDCAudience == "" {
 			return Config{}, ErrOIDCAudienceRequired
 		}
 		if value(environ, "XMINDS_RELEASE_WORKER_ID") == "" {
@@ -127,8 +127,8 @@ func Load(environ map[string]string) (Config, error) {
 	if err := validateServiceURL(configuration.ObjectStoreURL); err != nil {
 		return Config{}, fmt.Errorf("object store URL: %w", err)
 	}
-	if err := validateServiceURL(configuration.OIDCIssuer); err != nil {
-		return Config{}, fmt.Errorf("OIDC issuer: %w", err)
+	if err := validateServiceURL(configuration.WorkloadOIDCIssuer); err != nil {
+		return Config{}, fmt.Errorf("workload OIDC issuer: %w", err)
 	}
 
 	return configuration, nil

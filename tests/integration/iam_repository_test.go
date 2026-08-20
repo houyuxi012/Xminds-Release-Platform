@@ -1800,9 +1800,9 @@ INSERT INTO role_bindings (
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolveHuman := func(subject string) (identity.Principal, error) {
+	resolveHuman := func(sourceID uuid.UUID, subject string) (identity.Principal, error) {
 		return resolver.ResolvePrincipal(ctx, identity.Principal{
-			Subject: subject, Kind: identity.PrincipalKindHuman,
+			Subject: subject, Kind: identity.PrincipalKindHuman, IdentitySourceID: sourceID.String(),
 			Roles: []identity.Role{identity.RoleAdmin}, ProductIDs: []string{"untrusted-product"},
 		})
 	}
@@ -1820,7 +1820,7 @@ INSERT INTO role_bindings (
 	}
 
 	t.Run("active source selects only its duplicate subject", func(t *testing.T) {
-		resolved, resolveErr := resolveHuman("shared-subject")
+		resolved, resolveErr := resolveHuman(sourceAID, "shared-subject")
 		if resolveErr != nil {
 			t.Fatalf("ResolvePrincipal() error = %v", resolveErr)
 		}
@@ -1828,7 +1828,7 @@ INSERT INTO role_bindings (
 	})
 
 	t.Run("subject from wrong source fails closed", func(t *testing.T) {
-		_, resolveErr := resolveHuman("wrong-source-only")
+		_, resolveErr := resolveHuman(sourceAID, "wrong-source-only")
 		assertUnavailable(t, resolveErr)
 	})
 
@@ -1836,18 +1836,23 @@ INSERT INTO role_bindings (
 		if _, updateErr := pool.Exec(ctx, `UPDATE iam_login_state SET active_source_id=$1, version=version+1, updated_at=$2 WHERE singleton=TRUE`, sourceBID, now.Add(time.Minute)); updateErr != nil {
 			t.Fatal(updateErr)
 		}
-		resolved, resolveErr := resolveHuman("shared-subject")
+		resolved, resolveErr := resolveHuman(sourceBID, "shared-subject")
 		if resolveErr != nil {
 			t.Fatalf("ResolvePrincipal() error = %v", resolveErr)
 		}
 		assertOnlyRole(t, resolved, identity.RolePublisher)
 	})
 
+	t.Run("verified source binding cannot replay across active source switch", func(t *testing.T) {
+		_, resolveErr := resolveHuman(sourceAID, "shared-subject")
+		assertUnavailable(t, resolveErr)
+	})
+
 	t.Run("disabled active source fails closed", func(t *testing.T) {
 		if _, updateErr := pool.Exec(ctx, `UPDATE identity_sources SET status='disabled', version=version+1, updated_at=$2 WHERE id=$1`, sourceBID, now.Add(2*time.Minute)); updateErr != nil {
 			t.Fatal(updateErr)
 		}
-		_, resolveErr := resolveHuman("shared-subject")
+		_, resolveErr := resolveHuman(sourceBID, "shared-subject")
 		assertUnavailable(t, resolveErr)
 	})
 
@@ -1855,7 +1860,7 @@ INSERT INTO role_bindings (
 		if _, updateErr := pool.Exec(ctx, `UPDATE iam_login_state SET active_source_id=$1, version=version+1, updated_at=$2 WHERE singleton=TRUE`, sourceAID, now.Add(3*time.Minute)); updateErr != nil {
 			t.Fatal(updateErr)
 		}
-		_, resolveErr := resolveHuman("disabled-user")
+		_, resolveErr := resolveHuman(sourceAID, "disabled-user")
 		assertUnavailable(t, resolveErr)
 	})
 
