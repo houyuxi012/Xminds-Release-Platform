@@ -32,6 +32,8 @@ type boundedOIDCKeySet struct {
 	algorithms []jose.SignatureAlgorithm
 	allowed    map[string]struct{}
 	now        func() time.Time
+	// refreshTimeout bounds the shared refresh independently of any waiter.
+	refreshTimeout time.Duration
 
 	mu                 sync.RWMutex
 	keys               map[string]oidcVerificationKey
@@ -53,8 +55,8 @@ type oidcKeyRefresh struct {
 	err  error
 }
 
-func newBoundedOIDCKeySet(client *http.Client, jwksURL string, algorithms []string, initial oidcJWKSet) (*boundedOIDCKeySet, error) {
-	if client == nil || strings.TrimSpace(jwksURL) == "" || len(algorithms) == 0 {
+func newBoundedOIDCKeySet(client *http.Client, jwksURL string, algorithms []string, initial oidcJWKSet, refreshTimeout time.Duration) (*boundedOIDCKeySet, error) {
+	if client == nil || strings.TrimSpace(jwksURL) == "" || len(algorithms) == 0 || refreshTimeout <= 0 {
 		return nil, errOIDCKeySetRejected
 	}
 	allowed, err := oidcAllowedAlgorithms(algorithms)
@@ -71,7 +73,7 @@ func newBoundedOIDCKeySet(client *http.Client, jwksURL string, algorithms []stri
 	}
 	return &boundedOIDCKeySet{
 		client: client, jwksURL: jwksURL, algorithms: joseAlgorithms, allowed: allowed, now: time.Now,
-		keys: keys, negative: make(map[string]time.Time), refreshJitter: randomOIDCRefreshJitter,
+		refreshTimeout: refreshTimeout, keys: keys, negative: make(map[string]time.Time), refreshJitter: randomOIDCRefreshJitter,
 	}, nil
 }
 
@@ -96,6 +98,9 @@ func (keySet *boundedOIDCKeySet) VerifySignature(ctx context.Context, rawJWT str
 	if keySet == nil || keySet.client == nil || ctx == nil || len(rawJWT) == 0 {
 		return nil, errOIDCKeySetRejected
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	signature, err := jose.ParseSigned(rawJWT, keySet.algorithms)
 	if err != nil || len(signature.Signatures) != 1 {
 		return nil, errOIDCKeySetRejected
@@ -105,22 +110,22 @@ func (keySet *boundedOIDCKeySet) VerifySignature(ctx context.Context, rawJWT str
 	if len(keyID) == 0 || len(keyID) > maximumOIDCKeyIDBytes {
 		return nil, errOIDCKeySetRejected
 	}
-	if payload, found, verified := keySet.verifyCached(signature, keyID, header.Algorithm); found {
-		if verified {
-			return payload, nil
-		}
-		return nil, errOIDCKeySetRejected
-	}
-	if keySet.negativeCached(keyID) {
-		return nil, errOIDCKeySetRejected
-	}
-	if err := keySet.refresh(ctx, keyID); err != nil {
-		return nil, err
-	}
-	if payload, found, verified := keySet.verifyCached(signature, keyID, header.Algorithm); found && verified {
+	payload, found, verified := keySet.verifyCached(signature, keyID, header.Algorithm)
+	if found && verified {
 		return payload, nil
 	}
-	keySet.rememberNegative(keyID)
+	if !found && keySet.negativeCached(keyID) {
+		return nil, errOIDCKeySetRejected
+	}
+	if err := keySet.refresh(ctx, keyID, found); err != nil {
+		return nil, err
+	}
+	if payload, found, verified = keySet.verifyCached(signature, keyID, header.Algorithm); found && verified {
+		return payload, nil
+	}
+	if !found {
+		keySet.rememberNegative(keyID)
+	}
 	return nil, errOIDCKeySetRejected
 }
 
@@ -154,9 +159,12 @@ func (keySet *boundedOIDCKeySet) negativeCached(keyID string) bool {
 	return true
 }
 
-func (keySet *boundedOIDCKeySet) refresh(ctx context.Context, wantedKeyID string) error {
+func (keySet *boundedOIDCKeySet) refresh(ctx context.Context, wantedKeyID string, force bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	keySet.mu.Lock()
-	if _, available := keySet.keys[wantedKeyID]; available {
+	if _, available := keySet.keys[wantedKeyID]; available && !force {
 		keySet.mu.Unlock()
 		return nil
 	}
@@ -176,7 +184,13 @@ func (keySet *boundedOIDCKeySet) refresh(ctx context.Context, wantedKeyID string
 	refresh := &oidcKeyRefresh{done: make(chan struct{})}
 	keySet.refreshing = refresh
 	keySet.mu.Unlock()
+	go keySet.executeRefresh(refresh)
+	return waitForOIDCKeyRefresh(ctx, refresh)
+}
 
+func (keySet *boundedOIDCKeySet) executeRefresh(refresh *oidcKeyRefresh) {
+	ctx, cancel := context.WithTimeout(context.Background(), keySet.refreshTimeout)
+	defer cancel()
 	keys, err := keySet.fetch(ctx)
 
 	keySet.mu.Lock()
@@ -196,7 +210,15 @@ func (keySet *boundedOIDCKeySet) refresh(ctx context.Context, wantedKeyID string
 	keySet.refreshing = nil
 	close(refresh.done)
 	keySet.mu.Unlock()
-	return err
+}
+
+func waitForOIDCKeyRefresh(ctx context.Context, refresh *oidcKeyRefresh) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-refresh.done:
+		return refresh.err
+	}
 }
 
 func (keySet *boundedOIDCKeySet) refreshDelay(base time.Duration) time.Duration {

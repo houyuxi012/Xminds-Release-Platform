@@ -145,7 +145,7 @@ func (factory *OIDCTrustFactory) humanVerifier(ctx context.Context, material oid
 		return nil, err
 	}
 	configuration := material.configuration
-	keySet, err := newBoundedOIDCKeySet(client, jwksURL, configuration.SigningAlgorithms, prefetchedKeys)
+	keySet, err := newBoundedOIDCKeySet(client, jwksURL, configuration.SigningAlgorithms, prefetchedKeys, factory.requestTimeout)
 	if err != nil {
 		return nil, ErrDirectoryResponseInvalid
 	}

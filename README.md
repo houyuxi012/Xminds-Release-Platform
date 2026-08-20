@@ -148,7 +148,7 @@ go run ./apps/release-worker
 }
 ```
 
-`token_use_claim` 必须精确为 `token_use`，以与管理令牌分派器的固定协议一致。当登录模式为 `sso` 时，API 每次人员认证都重读当前登录状态与活动来源；只有精确指向的 `enabled` OIDC 来源可继续。验签器缓存最多保留 16 个信任版本，键绑定来源 ID、数据库版本及 OIDC Secret 与 CA 内容摘要，并发首访仅构建一次。JWKS 首次预取会直接作为验签缓存，单次响应严格限制为 2 MiB、最多 128 个 key、单个 `kid` 最多 128 字节；合法轮换只触发一次共享刷新，未知 `kid` 使用最多 128 项短期负缓存及 KeySet 级全局刷新冷却，刷新失败按 1–30 秒上限指数退避并添加有界抖动，成功响应但未包含所需 `kid` 同样进入冷却；冷却到期后仍允许合法密钥轮换刷新。所有等待和刷新都服从同一调用方总 deadline。令牌完整验签后还会再次核对活动来源和 Secret 摘要，因此切换来源、进入 fault/local、停用来源或原子轮换 Secret/CA 不会继续接受旧信任。启动时若数据库已处于 SSO 而活动 Secret、CA、DNS/TLS 或 discovery 不可用，API 拒绝启动；`local|configuring|fault` 保持可启动以便运维恢复。
+`token_use_claim` 必须精确为 `token_use`，以与管理令牌分派器的固定协议一致。当登录模式为 `sso` 时，API 每次人员认证都重读当前登录状态与活动来源；只有精确指向的 `enabled` OIDC 来源可继续。验签器缓存最多保留 16 个信任版本，键绑定来源 ID、数据库版本及 OIDC Secret 与 CA 内容摘要，并发首访仅构建一次。JWKS 首次预取会直接作为验签缓存，单次响应严格限制为 2 MiB、最多 128 个 key、单个 `kid` 最多 128 字节；合法轮换只触发一次共享刷新，未知 `kid` 使用最多 128 项短期负缓存及 KeySet 级全局刷新冷却，刷新失败按 1–30 秒上限指数退避并添加有界抖动，成功响应但未包含所需 `kid` 同样进入冷却；冷却到期后允许 unknown-`kid` 与 same-`kid` 公钥轮换进行同一受限刷新，已缓存且验签成功的 key 绝不触发出站。每个调用方只在自身总 deadline 内等待，取消某个 waiter 不会污染 issuer 失败退避；共享刷新由同一 `XMINDS_RELEASE_IAM_DIRECTORY_REQUEST_TIMEOUT` 配置的独立硬截止边界终止，即使所有 waiter 都已离开也不会无界运行。令牌完整验签后还会再次核对活动来源和 Secret 摘要，因此切换来源、进入 fault/local、停用来源或原子轮换 Secret/CA 不会继续接受旧信任。启动时若数据库已处于 SSO 而活动 Secret、CA、DNS/TLS 或 discovery 不可用，API 拒绝启动；`local|configuring|fault` 保持可启动以便运维恢复。
 
 `XMINDS_RELEASE_OIDC_ISSUER` 与 `XMINDS_RELEASE_OIDC_AUDIENCE` 仅配置独立的工作负载 OIDC 发行者，不用于人员认证。人员 OIDC 只来自上述 IAM 来源 Secret；两者不会在验签失败时互相回退。
 
