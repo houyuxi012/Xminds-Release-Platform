@@ -148,13 +148,17 @@ func (service *Service) ListRoleBindings(ctx context.Context, actor identity.Pri
 }
 
 func (service *Service) DeleteRoleBinding(ctx context.Context, actor identity.Principal, bindingID uuid.UUID, expectedVersion int64, proof HighRiskProof, request RequestContext) error {
+	if service.sessions == nil {
+		return ErrIAMConfiguration
+	}
 	if err := service.requireHighRisk(ctx, actor, "identity.role_binding.delete", proof); err != nil {
 		return err
 	}
 	if bindingID == uuid.Nil || expectedVersion < 1 {
 		return ErrRoleBindingInvalid
 	}
-	return service.repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
+	var removed RoleBinding
+	err := service.repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
 		binding, err := service.repository.GetRoleBinding(ctx, tx, bindingID)
 		if err != nil {
 			return err
@@ -165,9 +169,19 @@ func (service *Service) DeleteRoleBinding(ctx context.Context, actor identity.Pr
 		if err := service.repository.DeleteRoleBinding(ctx, tx, bindingID, expectedVersion); err != nil {
 			return err
 		}
+		removed = binding
 		_, err = service.auditor.Append(ctx, tx, audit.AppendCommand{Actor: actor, Action: "identity.role_binding.delete", ResourceType: "role_binding", ResourceID: binding.ID.String(), Outcome: audit.OutcomeSuccess, RequestID: request.RequestID, SourceIP: request.SourceIP, Metadata: map[string]any{"subject_type": binding.SubjectType, "subject_id": binding.SubjectID.String(), "role": binding.Role, "scope_type": binding.ScopeType, "effect": binding.Effect, "version": binding.Version}})
 		return err
 	})
+	if err != nil {
+		return err
+	}
+	if removed.SubjectType == SubjectTypeUser {
+		if err := service.sessions.RevokeSubject(ctx, removed.SubjectID, "role binding removed"); err != nil {
+			return fmt.Errorf("revoke sessions after role binding removal: %w", err)
+		}
+	}
+	return nil
 }
 
 func (service *Service) CreateIdentitySource(ctx context.Context, actor identity.Principal, command CreateIdentitySourceCommand, request RequestContext) (IdentitySource, error) {
@@ -355,10 +369,6 @@ func (service *Service) CreateLocalUser(ctx context.Context, actor identity.Prin
 	if err != nil {
 		return LocalUserProvisioning{}, err
 	}
-	password, err := service.passwords.Hash(ctx, activationToken)
-	if err != nil {
-		return LocalUserProvisioning{}, fmt.Errorf("hash initial local credential: %w", err)
-	}
 	now := service.clock().UTC().Truncate(time.Microsecond)
 	activationExpires := now.Add(localActivationLifetime)
 	activationDigest := sha256.Sum256([]byte(activationToken))
@@ -367,7 +377,7 @@ func (service *Service) CreateLocalUser(ctx context.Context, actor identity.Prin
 		Kind: UserKindLocal, Status: UserStatusPending, Version: 1, CreatedAt: now, UpdatedAt: now,
 	}
 	credential := LocalCredential{
-		UserID: user.ID, Password: password, PasswordChangedAt: now,
+		UserID:           user.ID,
 		ActivationDigest: hex.EncodeToString(activationDigest[:]), ActivationExpiresAt: activationExpires,
 	}
 	err = service.repository.WithinTransaction(ctx, func(tx pgx.Tx) error {

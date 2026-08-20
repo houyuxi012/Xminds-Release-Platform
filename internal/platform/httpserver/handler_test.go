@@ -157,6 +157,33 @@ func TestManagementHandlerFailsClosedWithoutAuthenticationMiddleware(t *testing.
 	}
 }
 
+func TestManagementHandlerKeepsPublicAuthenticationOutsideProtectedRoutes(t *testing.T) {
+	t.Parallel()
+	handler := NewManagementHandler(
+		healthCheckerFunc(func(context.Context) error { return nil }),
+		buildinfo.Current(),
+		identity.AuthenticationMiddleware(identityVerifierFunc(func(context.Context, string) (identity.Principal, error) {
+			return identity.Principal{}, identity.ErrAuthenticationFailed
+		})),
+		func(router chi.Router) {
+			router.Get("/api/v1/users", func(writer http.ResponseWriter, _ *http.Request) { writer.WriteHeader(http.StatusNoContent) })
+		},
+		func(router chi.Router) {
+			router.Post("/api/v1/auth/local/login", func(writer http.ResponseWriter, _ *http.Request) { writer.WriteHeader(http.StatusNoContent) })
+		},
+	)
+	publicResponse := httptest.NewRecorder()
+	handler.ServeHTTP(publicResponse, httptest.NewRequest(http.MethodPost, "/api/v1/auth/local/login", nil))
+	if publicResponse.Code != http.StatusNoContent || publicResponse.Header().Get("X-Request-ID") == "" {
+		t.Fatalf("public auth response = %d, request ID = %q", publicResponse.Code, publicResponse.Header().Get("X-Request-ID"))
+	}
+	protectedResponse := httptest.NewRecorder()
+	handler.ServeHTTP(protectedResponse, httptest.NewRequest(http.MethodGet, "/api/v1/users", nil))
+	if protectedResponse.Code != http.StatusUnauthorized {
+		t.Fatalf("protected IAM status = %d", protectedResponse.Code)
+	}
+}
+
 type identityVerifierFunc func(context.Context, string) (identity.Principal, error)
 
 func (function identityVerifierFunc) Verify(ctx context.Context, token string) (identity.Principal, error) {

@@ -42,6 +42,7 @@ type apiRuntimeConfig struct {
 	EndpointCADirectory  string
 	DefaultProductID     string
 	DefaultChannel       string
+	LocalAuth            iam.LocalAuthRuntimeConfig
 }
 
 func main() {
@@ -79,7 +80,7 @@ func run(ctx context.Context, arguments []string, environ map[string]string) err
 		}
 		return nil
 	}
-	runtimeConfig, err := loadAPIRuntimeConfig(environ)
+	runtimeConfig, err := loadAPIRuntimeConfig(environ, configuration.Environment)
 	if err != nil {
 		return err
 	}
@@ -119,15 +120,6 @@ func run(ctx context.Context, arguments []string, environ map[string]string) err
 	if err != nil {
 		return fmt.Errorf("configure workload OIDC identity: %w", err)
 	}
-	managementVerifier, err := identity.NewManagementVerifier(
-		humanVerifier,
-		workloadVerifier,
-		identity.NewAPITokenVerifier(identity.NewPostgresAPITokenStore(pool)),
-	)
-	if err != nil {
-		return fmt.Errorf("configure management identity: %w", err)
-	}
-
 	jobRepository := jobs.NewPostgresRepository(pool)
 	auditRepository := audit.NewPostgresRepository(pool)
 	auditor := audit.NewService(auditRepository, jobRepository)
@@ -172,17 +164,54 @@ func run(ctx context.Context, arguments []string, environ map[string]string) err
 	if err != nil {
 		return fmt.Errorf("configure distribution endpoint service: %w", err)
 	}
-	iamPasswords, err := iam.NewActivationCredentialManager()
+	var breachChecker iam.BreachChecker
+	if runtimeConfig.LocalAuth.UseDevelopmentBreachCorpus {
+		breachChecker, err = iam.NewDevelopmentBreachChecker()
+	} else {
+		breachChecker, err = iam.NewFileBreachChecker(runtimeConfig.LocalAuth.BreachCorpusPath)
+	}
 	if err != nil {
-		return fmt.Errorf("configure IAM activation credentials: %w", err)
+		return fmt.Errorf("configure breached-password corpus: %w", err)
+	}
+	iamPasswords, err := iam.NewPasswordManager(runtimeConfig.LocalAuth.Password, breachChecker)
+	if err != nil {
+		return fmt.Errorf("configure IAM password manager: %w", err)
+	}
+	secretResolver, err := iam.NewDirectorySecretResolver(runtimeConfig.LocalAuth.MFASecretDirectory)
+	if err != nil {
+		return fmt.Errorf("configure IAM secret resolver: %w", err)
+	}
+	mfaVerifier, err := iam.NewTOTPVerifier(runtimeConfig.LocalAuth.TOTP, secretResolver, time.Now)
+	if err != nil {
+		return fmt.Errorf("configure IAM TOTP verifier: %w", err)
 	}
 	iamRepository := iam.NewPostgresRepository(pool)
+	localAuthenticator, err := iam.NewLocalAuthService(iam.LocalAuthConfig{
+		Repository: iamRepository, Auditor: auditor, Passwords: iamPasswords, MFA: mfaVerifier,
+		Policy: runtimeConfig.LocalAuth.Policy, Clock: time.Now,
+	})
+	if err != nil {
+		return fmt.Errorf("configure local authentication service: %w", err)
+	}
+	sessionVerifier, err := iam.NewSessionVerifier(iamRepository, runtimeConfig.LocalAuth.Policy, time.Now)
+	if err != nil {
+		return fmt.Errorf("configure local session verifier: %w", err)
+	}
+	managementVerifier, err := identity.NewManagementVerifier(
+		humanVerifier,
+		workloadVerifier,
+		identity.NewAPITokenVerifier(identity.NewPostgresAPITokenStore(pool)),
+		sessionVerifier,
+	)
+	if err != nil {
+		return fmt.Errorf("configure management identity: %w", err)
+	}
 	governedResolver, err := iam.NewGovernedPrincipalResolver(iamRepository, time.Now)
 	if err != nil {
 		return fmt.Errorf("configure governed IAM principal resolver: %w", err)
 	}
 	iamService, err := iam.NewService(iam.ServiceConfig{
-		Repository: iamRepository, Auditor: auditor, Passwords: iamPasswords, Clock: time.Now,
+		Repository: iamRepository, Auditor: auditor, Sessions: iamRepository, Passwords: iamPasswords, Clock: time.Now,
 	})
 	if err != nil {
 		return fmt.Errorf("configure IAM service: %w", err)
@@ -205,6 +234,7 @@ func run(ctx context.Context, arguments []string, environ map[string]string) err
 				},
 				IAM: iamService,
 			}),
+			func(router chi.Router) { iam.RegisterPublicAuthRoutes(router, localAuthenticator) },
 		),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
@@ -261,7 +291,7 @@ func managementRoutes(applications managementApplications) httpserver.RouteRegis
 	}
 }
 
-func loadAPIRuntimeConfig(environ map[string]string) (apiRuntimeConfig, error) {
+func loadAPIRuntimeConfig(environ map[string]string, environment string) (apiRuntimeConfig, error) {
 	result := apiRuntimeConfig{
 		ObjectStoreAccessKey: strings.TrimSpace(environ["XMINDS_RELEASE_OBJECT_STORE_ACCESS_KEY"]),
 		ObjectStoreSecretKey: strings.TrimSpace(environ["XMINDS_RELEASE_OBJECT_STORE_SECRET_KEY"]),
@@ -274,6 +304,11 @@ func loadAPIRuntimeConfig(environ map[string]string) (apiRuntimeConfig, error) {
 	if result.ObjectStoreAccessKey == "" || result.ObjectStoreSecretKey == "" || result.DefaultProductID == "" || result.DefaultChannel == "" {
 		return apiRuntimeConfig{}, errAPIRuntimeConfiguration
 	}
+	localAuth, err := iam.LoadLocalAuthRuntimeConfig(environ, environment)
+	if err != nil {
+		return apiRuntimeConfig{}, fmt.Errorf("local authentication settings: %w", errAPIRuntimeConfiguration)
+	}
+	result.LocalAuth = localAuth
 	return result, nil
 }
 

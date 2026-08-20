@@ -39,10 +39,11 @@ func TestLoadAPIRuntimeConfigRejectsMissingPublicDistributionSettings(t *testing
 	t.Parallel()
 
 	base := map[string]string{
-		"XMINDS_RELEASE_OBJECT_STORE_ACCESS_KEY": "access-key",
-		"XMINDS_RELEASE_OBJECT_STORE_SECRET_KEY": "secret-key",
-		"XMINDS_RELEASE_DEFAULT_PRODUCT_ID":      "ngep",
-		"XMINDS_RELEASE_DEFAULT_CHANNEL":         "stable",
+		"XMINDS_RELEASE_OBJECT_STORE_ACCESS_KEY":  "access-key",
+		"XMINDS_RELEASE_OBJECT_STORE_SECRET_KEY":  "secret-key",
+		"XMINDS_RELEASE_DEFAULT_PRODUCT_ID":       "ngep",
+		"XMINDS_RELEASE_DEFAULT_CHANNEL":          "stable",
+		"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY": t.TempDir(),
 	}
 	for _, key := range []string{
 		"XMINDS_RELEASE_OBJECT_STORE_ACCESS_KEY",
@@ -56,10 +57,24 @@ func TestLoadAPIRuntimeConfigRejectsMissingPublicDistributionSettings(t *testing
 				environ[name] = value
 			}
 			delete(environ, key)
-			if _, err := loadAPIRuntimeConfig(environ); !errors.Is(err, errAPIRuntimeConfiguration) {
+			if _, err := loadAPIRuntimeConfig(environ, "development"); !errors.Is(err, errAPIRuntimeConfiguration) {
 				t.Fatalf("loadAPIRuntimeConfig() error = %v", err)
 			}
 		})
+	}
+}
+
+func TestLoadAPIRuntimeConfigRejectsMissingProductionLocalAuthenticationSecurity(t *testing.T) {
+	t.Parallel()
+	_, err := loadAPIRuntimeConfig(map[string]string{
+		"XMINDS_RELEASE_OBJECT_STORE_ACCESS_KEY":  "access-key",
+		"XMINDS_RELEASE_OBJECT_STORE_SECRET_KEY":  "secret-key",
+		"XMINDS_RELEASE_DEFAULT_PRODUCT_ID":       "ngep",
+		"XMINDS_RELEASE_DEFAULT_CHANNEL":          "stable",
+		"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY": t.TempDir(),
+	}, "production")
+	if !errors.Is(err, errAPIRuntimeConfiguration) {
+		t.Fatalf("loadAPIRuntimeConfig() error = %v", err)
 	}
 }
 
@@ -74,12 +89,13 @@ func TestLoadAPIRuntimeConfigParsesValidatedSettings(t *testing.T) {
 		"XMINDS_RELEASE_ENDPOINT_CA_DIRECTORY":      " /run/secrets/xminds-release/endpoint-cas ",
 		"XMINDS_RELEASE_DEFAULT_PRODUCT_ID":         " ngep ",
 		"XMINDS_RELEASE_DEFAULT_CHANNEL":            " stable ",
-	})
+		"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY":   " " + t.TempDir() + " ",
+	}, "development")
 	if err != nil {
 		t.Fatalf("loadAPIRuntimeConfig() error = %v", err)
 	}
 	if configuration.DefaultProductID != "ngep" || configuration.DefaultChannel != "stable" || configuration.Region != "cn-east-1" ||
-		configuration.EndpointCADirectory != "/run/secrets/xminds-release/endpoint-cas" {
+		configuration.EndpointCADirectory != "/run/secrets/xminds-release/endpoint-cas" || !configuration.LocalAuth.UseDevelopmentBreachCorpus {
 		t.Fatalf("configuration = %+v", configuration)
 	}
 }

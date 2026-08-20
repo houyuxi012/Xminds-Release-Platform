@@ -121,7 +121,12 @@ go run ./apps/release-worker
 
 - `GET /health/live`：进程存活检查；
 - `GET /health/ready`：PostgreSQL 就绪检查；
-- `GET /version`：构建版本信息。
+- `GET /version`：构建版本信息；
+- `POST /api/v1/auth/local/activate`：一次性激活本地账户；
+- `POST /api/v1/auth/local/login`：本地账户登录；
+- `POST /api/v1/auth/emergency/login`：强制 MFA 的应急账户登录。
+
+上述 3 个认证入口不要求现有 Bearer，其他管理 API 仍在统一认证中间件之后。所有环境都必须配置绝对路径 `XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY`；生产、测试和预发环境还必须配置指向非可写 SHA-1/SHA-256 摘要文件的 `XMINDS_RELEASE_IAM_BREACH_CORPUS`，缺失时服务拒绝启动。
 
 默认 Public API 监听 `127.0.0.1:8081`，只提供：
 

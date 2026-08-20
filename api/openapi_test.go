@@ -221,3 +221,39 @@ func TestOpenAPIDefinesReadOnlyRoleBindingsAndDraftIdentityGovernanceOperations(
 		t.Fatal("identity source read schema must not expose secret_reference")
 	}
 }
+
+func TestOpenAPIDefinesPublicLocalAuthenticationWithoutSensitiveResponseFields(t *testing.T) {
+	t.Parallel()
+	loader := openapi3.NewLoader()
+	document, err := loader.LoadFromFile("openapi.yaml")
+	if err != nil {
+		t.Fatalf("load OpenAPI contract: %v", err)
+	}
+	for _, path := range []string{
+		"/api/v1/auth/local/activate",
+		"/api/v1/auth/local/login",
+		"/api/v1/auth/emergency/login",
+	} {
+		item := document.Paths.Find(path)
+		if item == nil || item.Post == nil {
+			t.Fatalf("missing POST %s", path)
+		}
+		if item.Post.Security == nil || len(*item.Post.Security) != 0 {
+			t.Fatalf("POST %s must explicitly disable Bearer security", path)
+		}
+	}
+	login := document.Components.Schemas["LocalLoginResponse"]
+	if login == nil || login.Value == nil {
+		t.Fatal("LocalLoginResponse schema is missing")
+	}
+	for _, required := range []string{"access_token", "token_type", "expires_at", "subject"} {
+		if _, found := login.Value.Properties[required]; !found {
+			t.Fatalf("LocalLoginResponse.%s is missing", required)
+		}
+	}
+	for _, forbidden := range []string{"password", "activation_digest", "mfa_secret", "token_digest"} {
+		if _, found := login.Value.Properties[forbidden]; found {
+			t.Fatalf("LocalLoginResponse exposes %s", forbidden)
+		}
+	}
+}

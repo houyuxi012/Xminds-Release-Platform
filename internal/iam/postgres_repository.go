@@ -209,8 +209,9 @@ INSERT INTO local_credentials (
     user_id, algorithm, parameters, salt, derived_key, failed_attempts, locked_until,
     password_changed_at, activation_digest, activation_expires_at
 ) VALUES ($1, $2, $3, $4, $5, 0, NULL, $6, $7, $8)
-`, credential.UserID, credential.Password.Algorithm, credential.Password.Parameters, credential.Password.Salt,
-		credential.Password.DerivedKey, credential.PasswordChangedAt.UTC(), credential.ActivationDigest, credential.ActivationExpiresAt.UTC())
+`, credential.UserID, nullablePasswordString(credential.Password.Algorithm), nullablePasswordString(credential.Password.Parameters),
+		nullablePasswordBytes(credential.Password.Salt), nullablePasswordBytes(credential.Password.DerivedKey),
+		nullableTime(credential.PasswordChangedAt), credential.ActivationDigest, credential.ActivationExpiresAt.UTC())
 	if err != nil {
 		return fmt.Errorf("insert local credential: %w", err)
 	}
@@ -633,6 +634,20 @@ func nullableString(value string) any {
 		return nil
 	}
 	return strings.TrimSpace(value)
+}
+
+func nullablePasswordString(value string) any {
+	if value == "" {
+		return nil
+	}
+	return value
+}
+
+func nullablePasswordBytes(value []byte) any {
+	if len(value) == 0 {
+		return nil
+	}
+	return value
 }
 func pageLimit(page Page) (int, error) {
 	if !validIAMPage(page) {

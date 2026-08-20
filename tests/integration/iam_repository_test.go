@@ -2,7 +2,10 @@ package integration_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -14,6 +17,132 @@ import (
 	"xminds-release-platform/internal/platform/database"
 	"xminds-release-platform/migrations"
 )
+
+func TestIAMLocalAuthenticationPostgresLifecycle(t *testing.T) {
+	databaseURL := integrationDatabaseURL(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	pool, err := database.Open(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if err := database.ApplyMigrations(ctx, pool, migrations.FS); err != nil {
+		t.Fatalf("ApplyMigrations() error = %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+TRUNCATE TABLE local_sessions, local_auth_rate_limits, emergency_access_events, directory_sync_conflicts,
+directory_sync_jobs, role_bindings, organization_memberships, organization_units, local_password_history,
+local_credentials, user_principals, iam_login_state, identity_sources CASCADE;
+INSERT INTO iam_login_state (singleton, login_mode, version, updated_by, updated_at)
+VALUES (TRUE, 'local', 1, 'test:bootstrap', clock_timestamp())`); err != nil {
+		t.Fatalf("reset local authentication tables: %v", err)
+	}
+	now := time.Date(2026, 8, 20, 13, 0, 0, 0, time.UTC)
+	userID := uuid.MustParse("018f835d-7e4b-7abc-9f42-67a2f5f49201")
+	organizationID := uuid.MustParse("018f835d-7e4b-7abc-9f42-67a2f5f49202")
+	bindingValidFrom := time.Now().UTC().Add(-time.Hour)
+	activationToken := "postgres-activation-token-with-256-bits-minimum-entropy"
+	activationDigest := sha256.Sum256([]byte(activationToken))
+	if _, err := pool.Exec(ctx, `
+INSERT INTO user_principals (id, username, display_name, user_kind, status, version, created_at, updated_at)
+VALUES ($1, 'postgres.operator', 'Postgres Operator', 'local', 'pending', 1, $2, $2)`, userID, now.Add(-time.Hour)); err != nil {
+		t.Fatalf("seed pending local user principal: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+INSERT INTO local_credentials (
+    user_id, algorithm, parameters, salt, derived_key, failed_attempts, locked_until,
+    password_changed_at, activation_digest, activation_expires_at
+) VALUES ($1, NULL, NULL, NULL, NULL, 0, NULL, NULL, $2, $3)`,
+		userID, hex.EncodeToString(activationDigest[:]), now.Add(time.Hour)); err != nil {
+		t.Fatalf("seed pending local credential: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+INSERT INTO organization_units (
+    id, external_id, name, source_owned, status, version, created_at, updated_at
+) VALUES ($1, '', 'Platform Administrators', FALSE, 'active', 1, $2, $2)`, organizationID, now.Add(-time.Hour)); err != nil {
+		t.Fatalf("seed administrator organization: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+INSERT INTO organization_memberships (organization_id, user_id, source_owned, created_at)
+VALUES ($1, $2, FALSE, $3)`, organizationID, userID, now.Add(-time.Hour)); err != nil {
+		t.Fatalf("seed inherited administrator membership: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+INSERT INTO role_bindings (
+    id, subject_type, subject_id, role_name, scope_type, effect, valid_from,
+    created_by, version, created_at, updated_at
+) VALUES ($3, 'organization', $1, 'admin', 'platform', 'allow', $2,
+          'test:bootstrap', 1, $2, $2)`, organizationID, bindingValidFrom, uuid.New()); err != nil {
+		t.Fatalf("seed inherited platform administrator binding: %v", err)
+	}
+	repository := iam.NewPostgresRepository(pool)
+	passwords, err := iam.NewPasswordManager(iam.PasswordPolicyConfig{
+		MinimumLength: 16, MemoryKiB: 19 * 1024, Iterations: 1, Parallelism: 1, SaltBytes: 16, DerivedKeyBytes: 32,
+	}, integrationBreachChecker{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	authenticator, err := iam.NewLocalAuthService(iam.LocalAuthConfig{
+		Repository: repository, Auditor: audit.NewService(audit.NewPostgresRepository(pool)), Passwords: passwords,
+		MFA: &integrationMFAVerifier{}, Policy: iam.DefaultLocalAuthPolicy(), Clock: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := iam.RequestContext{RequestID: uuid.New().String(), SourceIP: "192.0.2.20"}
+	if err := authenticator.Activate(ctx, iam.ActivateLocalAccountCommand{
+		ActivationToken: activationToken, NewPassword: "Postgres-Strong-Password!",
+	}, request); !errors.Is(err, iam.ErrLocalAuthenticationFailed) {
+		t.Fatalf("Activate(inherited administrator without MFA) error = %v", err)
+	}
+	if err := authenticator.Activate(ctx, iam.ActivateLocalAccountCommand{
+		ActivationToken: activationToken, NewPassword: "Postgres-Strong-Password!",
+		MFASecretReference: "secret://iam/postgres-operator", MFAProof: "123456",
+	}, request); err != nil {
+		t.Fatalf("Activate() error = %v", err)
+	}
+	var status iam.UserStatus
+	var activation *string
+	var historyCount int
+	if err := pool.QueryRow(ctx, `
+SELECT user_record.status, credential.activation_digest,
+       (SELECT count(*) FROM local_password_history WHERE user_id = user_record.id)
+FROM user_principals user_record JOIN local_credentials credential ON credential.user_id=user_record.id
+WHERE user_record.id=$1`, userID).Scan(&status, &activation, &historyCount); err != nil {
+		t.Fatal(err)
+	}
+	if status != iam.UserStatusActive || activation != nil || historyCount != 1 {
+		t.Fatalf("activation state: status=%s digest=%v history=%d", status, activation, historyCount)
+	}
+	login, err := authenticator.LoginLocal(ctx, iam.LocalLoginCommand{
+		Username: "postgres.operator", Password: "Postgres-Strong-Password!", MFAProof: "123456",
+	}, request)
+	if err != nil {
+		t.Fatalf("LoginLocal() error = %v", err)
+	}
+	var storedDigest string
+	if err := pool.QueryRow(ctx, `SELECT token_digest FROM local_sessions WHERE subject_id=$1`, userID).Scan(&storedDigest); err != nil {
+		t.Fatal(err)
+	}
+	wantDigest := sha256.Sum256([]byte(login.AccessToken))
+	if storedDigest != hex.EncodeToString(wantDigest[:]) || storedDigest == login.AccessToken {
+		t.Fatalf("stored session digest = %q", storedDigest)
+	}
+	verifier, err := iam.NewSessionVerifier(repository, iam.DefaultLocalAuthPolicy(), func() time.Time { return now.Add(time.Minute) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := verifier.Verify(ctx, login.AccessToken); err != nil {
+		t.Fatalf("Verify(active session) error = %v", err)
+	}
+	if err := repository.RevokeSubject(ctx, userID, "integration-test"); err != nil {
+		t.Fatalf("RevokeSubject() error = %v", err)
+	}
+	if _, err := verifier.Verify(ctx, login.AccessToken); !errors.Is(err, identity.ErrAuthenticationFailed) {
+		t.Fatalf("Verify(revoked session) error = %v", err)
+	}
+}
 
 func TestIAMRepositoryEnablesSSOAtomicallyWithEmergencyAccessAndAudit(t *testing.T) {
 	databaseURL := integrationDatabaseURL(t)
@@ -255,7 +384,9 @@ VALUES (TRUE, 'local', 1, 'test:bootstrap', clock_timestamp())
 	}
 
 	now := time.Date(2026, 8, 20, 9, 0, 0, 0, time.UTC)
-	passwords, err := iam.NewActivationCredentialManager()
+	passwords, err := iam.NewPasswordManager(iam.PasswordPolicyConfig{
+		MinimumLength: 16, MemoryKiB: 19 * 1024, Iterations: 1, Parallelism: 1, SaltBytes: 16, DerivedKeyBytes: 32,
+	}, integrationBreachChecker{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -327,7 +458,9 @@ VALUES ($1, 'audit.reader', '审计阅读者', 'local', 'active', 1, $2, $2)`, u
 		t.Fatalf("seed local user: %v", err)
 	}
 	repository := iam.NewPostgresRepository(pool)
-	passwords, err := iam.NewActivationCredentialManager()
+	passwords, err := iam.NewPasswordManager(iam.PasswordPolicyConfig{
+		MinimumLength: 16, MemoryKiB: 19 * 1024, Iterations: 1, Parallelism: 1, SaltBytes: 16, DerivedKeyBytes: 32,
+	}, integrationBreachChecker{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -385,6 +518,12 @@ VALUES ($1, 'audit.reader', '审计阅读者', 'local', 'active', 1, $2, $2)`, u
 type integrationBreachChecker struct{}
 
 func (integrationBreachChecker) IsBreached(context.Context, string) (bool, error) { return false, nil }
+
+type integrationMFAVerifier struct{ counter atomic.Int64 }
+
+func (verifier *integrationMFAVerifier) Verify(context.Context, string, string) (iam.MFAAssertion, error) {
+	return iam.MFAAssertion{Counter: verifier.counter.Add(1)}, nil
+}
 
 type integrationSessionRevoker struct{}
 

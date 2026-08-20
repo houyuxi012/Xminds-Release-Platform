@@ -119,6 +119,7 @@ func TestManagementVerifierRoutesAPITokensWithoutOIDCFallback(t *testing.T) {
 			}
 			return Principal{Subject: "automation", Kind: PrincipalKindWorkload}, nil
 		}),
+		verifierFunc(func(context.Context, string) (Principal, error) { return Principal{}, ErrAuthenticationFailed }),
 	)
 	if err != nil {
 		t.Fatalf("NewManagementVerifier() error = %v", err)
@@ -130,6 +131,31 @@ func TestManagementVerifierRoutesAPITokensWithoutOIDCFallback(t *testing.T) {
 	}
 	if principal.Subject != "automation" || humanCalls != 0 || workloadCalls != 0 {
 		t.Fatalf("principal = %#v, human calls = %d, workload calls = %d", principal, humanCalls, workloadCalls)
+	}
+}
+
+func TestManagementVerifierRoutesLocalSessionsWithoutAnyFallback(t *testing.T) {
+	t.Parallel()
+	fallbackCalls := 0
+	fallback := verifierFunc(func(context.Context, string) (Principal, error) {
+		fallbackCalls++
+		return Principal{}, errors.New("fallback must not receive local session tokens")
+	})
+	localFailure := errors.New("local session revoked")
+	verifier, err := NewManagementVerifier(fallback, fallback, fallback, verifierFunc(func(_ context.Context, rawToken string) (Principal, error) {
+		if !strings.HasPrefix(rawToken, "xms_") {
+			return Principal{}, ErrTokenUseInvalid
+		}
+		return Principal{}, localFailure
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := verifier.Verify(context.Background(), "xms_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"); !errors.Is(err, localFailure) {
+		t.Fatalf("Verify(local) error = %v", err)
+	}
+	if fallbackCalls != 0 {
+		t.Fatalf("local failure used %d fallback verifiers", fallbackCalls)
 	}
 }
 
@@ -147,6 +173,7 @@ func TestManagementVerifierFallsBackOnlyForWorkloadTokenUse(t *testing.T) {
 		verifierFunc(func(context.Context, string) (Principal, error) {
 			return Principal{}, ErrAPITokenInvalid
 		}),
+		verifierFunc(func(context.Context, string) (Principal, error) { return Principal{}, ErrAuthenticationFailed }),
 	)
 	if err != nil {
 		t.Fatalf("NewManagementVerifier() error = %v", err)
@@ -173,6 +200,7 @@ func TestManagementVerifierFallsBackOnlyForWorkloadTokenUse(t *testing.T) {
 		verifierFunc(func(context.Context, string) (Principal, error) {
 			return Principal{}, ErrAPITokenInvalid
 		}),
+		verifierFunc(func(context.Context, string) (Principal, error) { return Principal{}, ErrAuthenticationFailed }),
 	)
 	if err != nil {
 		t.Fatalf("NewManagementVerifier() error = %v", err)
@@ -192,12 +220,13 @@ func TestManagementVerifierRejectsIncompleteConfiguration(t *testing.T) {
 		return Principal{}, ErrAuthenticationFailed
 	})
 	for name, verifiers := range map[string][]Verifier{
-		"human":     {nil, valid, valid},
-		"workload":  {valid, nil, valid},
-		"api token": {valid, valid, nil},
+		"human":         {nil, valid, valid, valid},
+		"workload":      {valid, nil, valid, valid},
+		"api token":     {valid, valid, nil, valid},
+		"local session": {valid, valid, valid, nil},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if _, err := NewManagementVerifier(verifiers[0], verifiers[1], verifiers[2]); !errors.Is(err, ErrManagementVerifierConfiguration) {
+			if _, err := NewManagementVerifier(verifiers[0], verifiers[1], verifiers[2], verifiers[3]); !errors.Is(err, ErrManagementVerifierConfiguration) {
 				t.Fatalf("NewManagementVerifier() error = %v", err)
 			}
 		})

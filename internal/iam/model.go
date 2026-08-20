@@ -104,6 +104,9 @@ var (
 	ErrRoleBindingInvalid           = errors.New("role binding input is invalid")
 	ErrIdentitySourceInputInvalid   = errors.New("identity source input is invalid")
 	ErrDirectoryAdapterUnavailable  = errors.New("directory adapter is unavailable")
+	ErrLocalAuthenticationFailed    = errors.New("local authentication failed")
+	ErrLocalAuthenticationLimited   = errors.New("local authentication rate limit exceeded")
+	ErrPasswordRecentlyUsed         = errors.New("password was recently used")
 )
 
 type LoginState struct {
@@ -193,7 +196,65 @@ type LocalCredential struct {
 	PasswordChangedAt   time.Time
 	ActivationDigest    string
 	ActivationExpiresAt time.Time
+	MFASecretReference  string
+	MFALastCounter      int64
 }
+
+type ActivateLocalAccountCommand struct {
+	ActivationToken    string
+	NewPassword        string
+	MFASecretReference string
+	MFAProof           string
+}
+
+type LocalLoginCommand struct {
+	Username string
+	Password string
+	MFAProof string
+}
+
+type AuthenticationMethod string
+
+const (
+	AuthenticationMethodLocal     AuthenticationMethod = "local_password"
+	AuthenticationMethodEmergency AuthenticationMethod = "emergency_password"
+)
+
+type Session struct {
+	ID                   uuid.UUID
+	TokenDigest          string
+	SubjectID            uuid.UUID
+	AuthenticationMethod AuthenticationMethod
+	MFALevel             int
+	AuthenticatedAt      time.Time
+	LastUsedAt           time.Time
+	AbsoluteExpiresAt    time.Time
+	IdleExpiresAt        time.Time
+	RevokedAt            time.Time
+	RevocationReason     string
+	Version              int64
+}
+
+type AuthenticatedSubject struct {
+	ID          uuid.UUID `json:"id"`
+	Username    string    `json:"username"`
+	DisplayName string    `json:"display_name"`
+	Kind        UserKind  `json:"kind"`
+}
+
+type LoginResult struct {
+	AccessToken string
+	TokenType   string
+	ExpiresAt   time.Time
+	Subject     AuthenticatedSubject
+}
+
+type RateLimitScope string
+
+const (
+	RateLimitScopeAccount RateLimitScope = "account"
+	RateLimitScopeIP      RateLimitScope = "ip"
+)
 
 // HighRiskProof contains opaque verifier-bound material. It intentionally has
 // no client-supplied time: freshness is established only by the authority.

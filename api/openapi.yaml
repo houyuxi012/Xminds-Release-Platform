@@ -30,6 +30,8 @@ tags:
     description: 分发端点注册、目录摘要探测与健康状态管理
   - name: Identity Governance
     description: 组织单元、角色绑定及身份源草稿的受控管理
+  - name: Local Authentication
+    description: 本地账户一次性激活、本地登录与独立应急登录
   - name: Public Distribution
     description: 无需登录的 TUF 元数据兼容下载与产品范围制品下载
 paths:
@@ -90,6 +92,85 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/BuildInfo'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /api/v1/auth/local/activate:
+    post:
+      operationId: activateLocalAccount
+      summary: 消费一次性激活令牌并设置本地密码
+      tags: [Local Authentication]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ActivateLocalAccountRequest'
+      responses:
+        '204':
+          description: 账户已激活，无响应体
+        '400':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /api/v1/auth/local/login:
+    post:
+      operationId: loginLocalAccount
+      summary: 使用普通本地账户登录
+      tags: [Local Authentication]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LocalLoginRequest'
+      responses:
+        '200':
+          description: 一次性返回不透明持久会话令牌
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LocalLoginResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          description: 账号或来源 IP 超过固定窗口限制
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /api/v1/auth/emergency/login:
+    post:
+      operationId: loginEmergencyAccount
+      summary: 使用独立应急入口和 MFA 登录
+      tags: [Local Authentication]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LocalLoginRequest'
+      responses:
+        '200':
+          description: 一次性返回短时应急会话令牌
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LocalLoginResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          description: 账号或来源 IP 超过固定窗口限制
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
         '500':
           $ref: '#/components/responses/InternalError'
   /api/v1/products:
@@ -2438,6 +2519,70 @@ components:
           type: array
           items: {$ref: '#/components/schemas/IdentitySource'}
         next_cursor: {type: string}
+    ActivateLocalAccountRequest:
+      type: object
+      additionalProperties: false
+      required: [activation_token, new_password]
+      properties:
+        activation_token:
+          type: string
+          minLength: 32
+          maxLength: 1024
+          writeOnly: true
+        new_password:
+          type: string
+          minLength: 12
+          maxLength: 1024
+          writeOnly: true
+        mfa_secret_reference:
+          type: string
+          minLength: 1
+          maxLength: 256
+          writeOnly: true
+        mfa_proof:
+          type: string
+          pattern: '^[0-9]{6,8}$'
+          writeOnly: true
+    LocalLoginRequest:
+      type: object
+      additionalProperties: false
+      required: [username, password]
+      properties:
+        username:
+          type: string
+          minLength: 3
+          maxLength: 128
+        password:
+          type: string
+          minLength: 1
+          maxLength: 1024
+          writeOnly: true
+        mfa_proof:
+          type: string
+          pattern: '^[0-9]{6,8}$'
+          writeOnly: true
+    LocalAuthenticatedSubject:
+      type: object
+      additionalProperties: false
+      required: [id, username, display_name, kind]
+      properties:
+        id: {type: string, format: uuid}
+        username: {type: string}
+        display_name: {type: string}
+        kind: {type: string, enum: [local, emergency]}
+    LocalLoginResponse:
+      type: object
+      additionalProperties: false
+      required: [access_token, token_type, expires_at, subject]
+      properties:
+        access_token:
+          type: string
+          pattern: '^xms_[A-Za-z0-9_-]{43}$'
+        token_type:
+          type: string
+          const: Bearer
+        expires_at: {type: string, format: date-time}
+        subject: {$ref: '#/components/schemas/LocalAuthenticatedSubject'}
     ProblemDetails:
       type: object
       additionalProperties: false

@@ -113,8 +113,11 @@ func TestCreateLocalUserStoresOnlyActivationDigestAndAuditsProvisioning(t *testi
 	if credential.ActivationDigest != hex.EncodeToString(wantDigest[:]) {
 		t.Fatalf("activation digest = %q", credential.ActivationDigest)
 	}
-	if credential.ActivationDigest == provisioning.ActivationToken || string(credential.Password.DerivedKey) == provisioning.ActivationToken {
+	if credential.ActivationDigest == provisioning.ActivationToken {
 		t.Fatal("activation token was stored in plaintext")
+	}
+	if credential.Password.Algorithm != "" || len(credential.Password.Salt) != 0 || len(credential.Password.DerivedKey) != 0 || !credential.PasswordChangedAt.IsZero() {
+		t.Fatalf("pending credential contains a login password: %+v", credential)
 	}
 	if len(harness.auditor.commands) != 1 || harness.auditor.commands[0].Action != "identity.local_user.create" {
 		t.Fatalf("audit commands = %+v", harness.auditor.commands)
@@ -170,7 +173,7 @@ func TestRoleBindingCreateAndDeleteAreAuditedAndOptimistic(t *testing.T) {
 	binding, err := harness.service.CreateRoleBinding(context.Background(), harness.admin, CreateRoleBindingCommand{
 		SubjectType: SubjectTypeUser,
 		SubjectID:   harness.emergencyAdminID,
-		Role:        identity.RoleAuditor,
+		Role:        identity.RoleAdmin,
 		ScopeType:   ScopeTypePlatform,
 		Effect:      BindingEffectAllow,
 	}, harness.proof(), harness.request)
@@ -188,6 +191,9 @@ func TestRoleBindingCreateAndDeleteAreAuditedAndOptimistic(t *testing.T) {
 	}
 	if len(harness.auditor.commands) != 2 || harness.auditor.commands[1].Action != "identity.role_binding.delete" {
 		t.Fatalf("audit commands = %+v", harness.auditor.commands)
+	}
+	if len(harness.sessions.subjects) != 1 || harness.sessions.subjects[0] != harness.emergencyAdminID {
+		t.Fatalf("revoked session subjects = %+v", harness.sessions.subjects)
 	}
 }
 
@@ -244,6 +250,7 @@ type iamHarness struct {
 	system           identity.Principal
 	request          RequestContext
 	auditor          *iamAuditRecorder
+	sessions         *iamSessionRecorder
 }
 
 func newIAMHarness(t *testing.T) *iamHarness {
@@ -265,8 +272,9 @@ func newIAMHarness(t *testing.T) *iamHarness {
 		roleBindings:  make(map[uuid.UUID]RoleBinding),
 	}
 	auditor := &iamAuditRecorder{}
+	sessions := &iamSessionRecorder{}
 	service, err := NewService(ServiceConfig{
-		Repository: repository, Auditor: auditor, Sessions: iamSessionRecorder{}, Passwords: deterministicPasswordManager{}, Directory: iamDirectoryAdapter{}, HighRisk: iamHighRiskAuthorizer{},
+		Repository: repository, Auditor: auditor, Sessions: sessions, Passwords: deterministicPasswordManager{}, Directory: iamDirectoryAdapter{}, HighRisk: iamHighRiskAuthorizer{},
 		Clock: func() time.Time { return now },
 	})
 	if err != nil {
@@ -274,7 +282,7 @@ func newIAMHarness(t *testing.T) *iamHarness {
 	}
 	return &iamHarness{
 		service: service, repository: repository, now: now, sourceID: sourceID, emergencyAdminID: emergencyID,
-		auditor: auditor,
+		auditor: auditor, sessions: sessions,
 		admin:   identity.Principal{Subject: "admin", Kind: identity.PrincipalKindHuman, Roles: []identity.Role{identity.RoleAdmin}, TokenID: "admin-token"},
 		system:  identity.Principal{Subject: "identity-monitor", Kind: identity.PrincipalKindWorkload, Roles: []identity.Role{identity.RoleAdmin}, TokenID: "monitor-token", Provider: identity.WorkloadProviderAPIToken},
 		request: RequestContext{RequestID: "018f835d-7e4b-7abc-9f42-67a2f5f48e13", SourceIP: "127.0.0.1"},
@@ -466,9 +474,14 @@ func (recorder *iamAuditRecorder) Append(_ context.Context, _ pgx.Tx, command au
 	return audit.Event{}, nil
 }
 
-type iamSessionRecorder struct{}
+type iamSessionRecorder struct {
+	subjects []uuid.UUID
+}
 
-func (iamSessionRecorder) RevokeSubject(context.Context, uuid.UUID, string) error { return nil }
+func (recorder *iamSessionRecorder) RevokeSubject(_ context.Context, subject uuid.UUID, _ string) error {
+	recorder.subjects = append(recorder.subjects, subject)
+	return nil
+}
 
 type iamHighRiskAuthorizer struct{}
 

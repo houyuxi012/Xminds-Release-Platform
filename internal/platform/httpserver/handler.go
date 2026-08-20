@@ -29,16 +29,36 @@ type RouteRegistrar func(chi.Router)
 // NewManagementHandler keeps operational endpoints available without a token
 // while placing every registered business route behind one fail-closed
 // authentication boundary.
-func NewManagementHandler(healthChecker HealthChecker, info buildinfo.Info, authentication Middleware, register RouteRegistrar) http.Handler {
-	return newHandler(healthChecker, info, authentication, register)
+func NewManagementHandler(healthChecker HealthChecker, info buildinfo.Info, authentication Middleware, register RouteRegistrar, publicRegisters ...RouteRegistrar) http.Handler {
+	return newHandler(healthChecker, info, authentication, register, publicRegisters...)
 }
 
-func newHandler(healthChecker HealthChecker, info buildinfo.Info, authentication Middleware, register RouteRegistrar) http.Handler {
+func newHandler(healthChecker HealthChecker, info buildinfo.Info, authentication Middleware, register RouteRegistrar, publicRegisters ...RouteRegistrar) http.Handler {
 	router := chi.NewRouter()
 	router.Use(securityHeaders)
 	router.Use(requestID)
 	router.Use(recoverPanics)
+	registerOperationalRoutes(router, healthChecker, info)
+	for _, publicRegister := range publicRegisters {
+		if publicRegister != nil {
+			publicRegister(router)
+		}
+	}
+	if register != nil {
+		router.Group(func(protected chi.Router) {
+			if authentication == nil {
+				protected.Use(authenticationUnavailable)
+			} else {
+				protected.Use(authentication)
+			}
+			register(protected)
+		})
+	}
+	registerFallbackRoutes(router)
+	return otelhttp.NewHandler(router, "xminds-release-platform.http")
+}
 
+func registerOperationalRoutes(router chi.Router, healthChecker HealthChecker, info buildinfo.Info) {
 	router.Get("/health/live", func(writer http.ResponseWriter, _ *http.Request) {
 		writeJSON(writer, http.StatusOK, map[string]string{"status": "ok"})
 	})
@@ -56,16 +76,9 @@ func newHandler(healthChecker HealthChecker, info buildinfo.Info, authentication
 	router.Get("/version", func(writer http.ResponseWriter, _ *http.Request) {
 		writeJSON(writer, http.StatusOK, info)
 	})
-	if register != nil {
-		router.Group(func(protected chi.Router) {
-			if authentication == nil {
-				protected.Use(authenticationUnavailable)
-			} else {
-				protected.Use(authentication)
-			}
-			register(protected)
-		})
-	}
+}
+
+func registerFallbackRoutes(router chi.Router) {
 	router.NotFound(func(writer http.ResponseWriter, request *http.Request) {
 		httpx.WriteProblem(writer, httpx.NewProblem(
 			http.StatusNotFound,
@@ -82,8 +95,6 @@ func newHandler(healthChecker HealthChecker, info buildinfo.Info, authentication
 			nil,
 		).WithRequestID(httpx.RequestIDFromContext(request.Context())).WithInstance(request.URL.Path))
 	})
-
-	return otelhttp.NewHandler(router, "xminds-release-platform.http")
 }
 
 func authenticationUnavailable(next http.Handler) http.Handler {
