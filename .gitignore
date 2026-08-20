@@ -27,6 +27,9 @@ node_modules/
 apps/release-console/dist/
 apps/release-console/playwright-report/
 apps/release-console/test-results/
+apps/release-console/.vitest-attachments/
+apps/release-console/*.tsbuildinfo
+apps/release-console/src/test/__screenshots__/
 
 # Editors
 .idea/

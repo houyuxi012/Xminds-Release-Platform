@@ -41,6 +41,9 @@ Xminds Release Platform 是面向企业软件交付场景的多产品可信发�
 - origin、CDN 与私有分发端点的产品范围注册、HTTPS 摘要校验、优先级和连续失败健康状态；
 - `endpoint.sync.v1` 五角色目录与引用制品复制、目标端回读 SHA-256 校验和三次失败摘除；
 - 独立公网监听端口、默认产品兼容目录路径、产品/通道隔离目录路径和支持单段 Range 的内容寻址制品下载。
+- 基于 React 19、Ant Design 6 与 Ant Design Pro Components 的发布管理控制台；
+- 白色管理台导航与详情抽屉、产品注册、断点续传、职责分离审批、SCM 能力探测、端点健康和审计证据主流程；
+- 真实 Chromium 组件测试与 Playwright 端到端主流程验收。
 
 当前管理 API 运行时只开放存活、就绪和版本端点。产品、制品、Release 与分发端点 HTTP 适配器已经完成并强制从请求上下文获取已验证身份；在 API 组合根完成 OIDC/工作负载身份配置前不会挂载业务路由，避免暴露未受保护的管理接口。独立 Public API 只挂载公开目录和制品读取路由，不包含管理操作。Worker 已挂载目录发布、目录撤销和审计导出处理器；端点同步处理器已完成，待具体分发目标传输适配器在部署组合根注入。所有签名材料与对象存储凭据必须在启动时显式注入，否则拒绝运行。
 
@@ -84,10 +87,25 @@ make lint
 make test
 make test-integration
 make build
+make console-verify
+make console-e2e
 make verify
 ```
 
-`make verify` 会执行格式、Go Vet、竞态测试、双二进制构建、仓库边界检查和 macOS 元数据污染检查。
+`make verify` 会执行格式、Go Vet、竞态测试、双二进制构建、仓库边界检查、macOS 元数据污染检查，以及 Console 的静态检查、类型检查、真实浏览器组件测试和生产构建。`make console-e2e` 单独执行产品创建、制品续传、职责分离发布、SCM、端点和审计证据主流程。
+
+## 管理控制台
+
+控制台位于 `apps/release-console`。首次启动先安装锁定依赖：
+
+```bash
+make console-install
+cd apps/release-console
+npx playwright install chromium
+npm run dev
+```
+
+默认开发地址为 `http://127.0.0.1:4173`。开发环境提供确定性的演示数据用于交互验收；产品创建在生产构建中调用 `/api/v1/products`，后端仍是身份、授权、状态机和审计证据的唯一权威来源。当前 Console 交付 P0 核心可信发布管理流程，用户与组织、统一日志中心按后续实施任务接入，不在前端复制服务端安全策略。
 
 ## 本地启动
 

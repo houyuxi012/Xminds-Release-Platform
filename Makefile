@@ -1,7 +1,9 @@
 SHELL := /bin/sh
 
 GO ?= go
+NPM ?= npm
 GOCACHE ?= $(CURDIR)/.cache/go-build
+CONSOLE_DIR := apps/release-console
 VERSION ?= 0.1.0-p0
 COMMIT ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null || printf 'development')
 BUILD_TIME ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
@@ -13,7 +15,7 @@ LDFLAGS := -s -w \
 	-X '$(BUILDINFO_PACKAGE).buildTime=$(BUILD_TIME)'
 GO_FILES := $(shell find apps internal tests -type f -name '*.go' 2>/dev/null)
 
-.PHONY: fmt fmt-check lint golangci test test-integration build boundary-check metadata-check verify clean
+.PHONY: fmt fmt-check lint golangci test test-integration build boundary-check metadata-check console-install console-lint console-typecheck console-test console-build console-e2e console-verify verify clean
 
 fmt:
 	gofmt -w $(GO_FILES)
@@ -57,7 +59,27 @@ boundary-check:
 metadata-check:
 	./scripts/check-macos-metadata.sh
 
-verify: lint test build boundary-check metadata-check
+console-install:
+	cd $(CONSOLE_DIR) && $(NPM) ci
+
+console-lint:
+	cd $(CONSOLE_DIR) && $(NPM) run lint
+
+console-typecheck:
+	cd $(CONSOLE_DIR) && $(NPM) run typecheck
+
+console-test:
+	cd $(CONSOLE_DIR) && $(NPM) run test:run
+
+console-build:
+	cd $(CONSOLE_DIR) && $(NPM) run build
+
+console-e2e:
+	cd $(CONSOLE_DIR) && $(NPM) run e2e
+
+console-verify: console-lint console-typecheck console-test console-build
+
+verify: lint test build boundary-check metadata-check console-verify
 
 clean:
 	$(GO) clean -cache -testcache

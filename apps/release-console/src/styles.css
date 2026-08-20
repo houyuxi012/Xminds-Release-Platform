@@ -1,0 +1,222 @@
+:root {
+  font-family:
+    Inter, "PingFang SC", "Microsoft YaHei", -apple-system, BlinkMacSystemFont, "Segoe UI",
+    sans-serif;
+  color: #1f1f1f;
+  background: #f5f7fa;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  min-width: 1180px;
+  min-height: 100%;
+  margin: 0;
+}
+
+body {
+  min-height: 100vh;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+#root .ant-pro-layout .ant-layout-sider,
+#root .ant-pro-sider,
+#root .ant-pro-sider-logo,
+#root .ant-pro-layout-bg-list {
+  background: #ffffff;
+}
+
+#root .ant-pro-sider {
+  border-right: 1px solid #f0f0f0;
+}
+
+.ant-pro-global-header {
+  border-bottom: 1px solid #f0f0f0;
+  box-shadow: 0 1px 3px rgb(16 24 40 / 4%);
+}
+
+.ant-pro-base-menu .ant-menu-item-selected {
+  font-weight: 600;
+}
+
+.menu-link-button {
+  width: 100%;
+  padding: 0;
+  color: inherit;
+  text-align: left;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+}
+
+.brand-mark {
+  display: inline-grid;
+  width: 32px;
+  height: 32px;
+  color: #fff;
+  font-size: 18px;
+  font-weight: 800;
+  line-height: 1;
+  place-items: center;
+  background: #1677ff;
+  border-radius: 8px;
+  box-shadow: 0 4px 10px rgb(22 119 255 / 24%);
+}
+
+.header-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  white-space: nowrap;
+}
+
+.header-icon {
+  color: #667085;
+  font-size: 18px;
+}
+
+.principal-copy {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.25;
+  text-align: right;
+}
+
+.principal-copy .ant-typography:last-child {
+  font-size: 12px;
+}
+
+.console-content {
+  min-height: calc(100vh - 56px);
+}
+
+.page-summary {
+  max-width: 760px;
+  color: #667085;
+}
+
+.metric-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.content-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.5fr) minmax(320px, 0.8fr);
+  gap: 16px;
+}
+
+.mono {
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+.table-primary-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.table-primary-cell > :last-child {
+  color: #667085;
+  font-size: 12px;
+}
+
+.white-detail-drawer .ant-drawer-content,
+.white-detail-drawer .ant-drawer-header,
+.white-detail-drawer .ant-drawer-body,
+.white-detail-drawer .ant-drawer-footer {
+  background: #ffffff;
+}
+
+.page-card {
+  border: 1px solid #f0f0f0;
+  box-shadow: 0 1px 2px rgb(16 24 40 / 3%);
+}
+
+.release-wizard-summary {
+  padding: 16px;
+  background: #f8fafc;
+  border: 1px solid #eef2f6;
+  border-radius: 8px;
+}
+
+.upload-zone {
+  padding: 28px;
+  text-align: center;
+  background: #fafcff;
+  border: 1px dashed #91caff;
+  border-radius: 8px;
+}
+
+.risk-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.risk-list li {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  padding: 12px 0;
+  border-bottom: 1px solid #f0f0f0;
+}
+
+.risk-list li:last-child {
+  border-bottom: 0;
+}
+
+.overview-release-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.overview-release-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 64px;
+  border-bottom: 1px solid #f0f0f0;
+}
+
+.overview-release-list li:last-child {
+  border-bottom: 0;
+}
+
+.overview-release-meta {
+  margin-top: 4px;
+  color: #667085;
+  font-size: 13px;
+}
+
+.timeline-code {
+  color: #667085;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 12px;
+}
+
+@media (max-width: 1280px) {
+  .metric-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .content-grid {
+    grid-template-columns: 1fr;
+  }
+}
