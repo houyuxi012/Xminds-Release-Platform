@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"reflect"
 	"testing"
 
 	"github.com/google/uuid"
@@ -134,6 +135,196 @@ func TestGovernedChannelScopesControlProtectedReleaseCreate(t *testing.T) {
 	command.Channel = "beta"
 	if _, err := newTestReleaseService().Create(context.Background(), principal, command, testRequestContext()); !errors.Is(err, identity.ErrActionDenied) {
 		t.Fatalf("Create() different channel error = %v", err)
+	}
+}
+
+func TestGovernedSubjectWithoutProductOrChannelPermissionCannotReplayPublication(t *testing.T) {
+	t.Parallel()
+
+	operations := []struct {
+		name string
+		kind AttemptKind
+		call func(*Service, identity.Principal, Release, string) (OperationResult, error)
+	}{
+		{
+			name: "publish",
+			kind: AttemptKindPublish,
+			call: func(service *Service, principal identity.Principal, record Release, key string) (OperationResult, error) {
+				return service.Publish(context.Background(), principal, record.ProductID, record.ID, record.LockVersion, key, testRequestContext())
+			},
+		},
+		{
+			name: "retry",
+			kind: AttemptKindRetry,
+			call: func(service *Service, principal identity.Principal, record Release, key string) (OperationResult, error) {
+				return service.Retry(context.Background(), principal, record.ProductID, record.ID, record.LockVersion, key, testRequestContext())
+			},
+		},
+	}
+	authorizations := []struct {
+		name         string
+		principal    identity.Principal
+		wantGetCalls int
+	}{
+		{
+			name: "no product permission",
+			principal: identity.Principal{
+				Subject: "governed-outsider", Kind: identity.PrincipalKindHuman, Governed: true,
+			},
+			wantGetCalls: 0,
+		},
+		{
+			name: "product permission but channel denied",
+			principal: identity.Principal{
+				Subject: "governed-channel-denied", Kind: identity.PrincipalKindHuman, Governed: true,
+				RoleScopes: []identity.RoleScope{
+					{Role: identity.RolePublisher, Effect: "allow", ScopeType: "product", ProductID: "ngep"},
+					{Role: identity.RoleApprover, Effect: "allow", ScopeType: "product", ProductID: "ngep"},
+					{Role: identity.RolePublisher, Effect: "deny", ScopeType: "channel", ProductID: "ngep", ChannelName: "stable"},
+					{Role: identity.RoleApprover, Effect: "deny", ScopeType: "channel", ProductID: "ngep", ChannelName: "stable"},
+				},
+			},
+			wantGetCalls: 1,
+		},
+	}
+
+	for _, operation := range operations {
+		t.Run(operation.name, func(t *testing.T) {
+			t.Parallel()
+			for _, authorization := range authorizations {
+				t.Run(authorization.name, func(t *testing.T) {
+					t.Parallel()
+					service := newTestReleaseService()
+					repository := service.repository.(*memoryReleaseRepository)
+					releaseID := uuid.New()
+					key := operation.name + "-replay-request-12345678"
+					record := Release{
+						ID: releaseID, ProductID: "ngep", Channel: "stable", Status: StatusPublishing, LockVersion: 8,
+					}
+					repository.releases[releaseID] = record
+					repository.attempts[releaseAttemptKey(releaseID, operation.kind, key)] = Attempt{
+						ID: uuid.New(), ReleaseID: releaseID, Kind: operation.kind, IdempotencyKey: key, Status: AttemptStatusPending,
+					}
+
+					result, err := operation.call(service, authorization.principal, record, key)
+					if !errors.Is(err, ErrReleaseNotFound) {
+						t.Fatalf("%s replay error = %v, want %v", operation.name, err, ErrReleaseNotFound)
+					}
+					if !reflect.DeepEqual(result, OperationResult{}) {
+						t.Fatalf("%s replay result = %#v, want empty result", operation.name, result)
+					}
+					if repository.getCalls != authorization.wantGetCalls || repository.findAttemptCalls != 0 {
+						t.Fatalf("%s replay queried release=%d attempt=%d, want release=%d attempt=0", operation.name, repository.getCalls, repository.findAttemptCalls, authorization.wantGetCalls)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestGovernedChannelDeniedAndMissingReleaseAreExternallyEquivalent(t *testing.T) {
+	t.Parallel()
+
+	type operationResult struct {
+		release Release
+		attempt Attempt
+		err     error
+	}
+	tests := []struct {
+		name   string
+		status Status
+		call   func(*Service, identity.Principal, Release, uuid.UUID) operationResult
+	}{
+		{name: "get", status: StatusDraft, call: func(service *Service, principal identity.Principal, record Release, releaseID uuid.UUID) operationResult {
+			releaseRecord, err := service.Get(context.Background(), principal, record.ProductID, releaseID)
+			return operationResult{release: releaseRecord, err: err}
+		}},
+		{name: "submit", status: StatusDraft, call: func(service *Service, principal identity.Principal, record Release, releaseID uuid.UUID) operationResult {
+			releaseRecord, err := service.Submit(context.Background(), principal, record.ProductID, releaseID, record.LockVersion, testRequestContext())
+			return operationResult{release: releaseRecord, err: err}
+		}},
+		{name: "approve", status: StatusSubmitted, call: func(service *Service, principal identity.Principal, record Release, releaseID uuid.UUID) operationResult {
+			releaseRecord, err := service.Approve(context.Background(), principal, record.ProductID, releaseID, record.LockVersion, testRequestContext())
+			return operationResult{release: releaseRecord, err: err}
+		}},
+		{name: "reject", status: StatusSubmitted, call: func(service *Service, principal identity.Principal, record Release, releaseID uuid.UUID) operationResult {
+			releaseRecord, err := service.Reject(context.Background(), principal, record.ProductID, releaseID, record.LockVersion, "policy rejection", testRequestContext())
+			return operationResult{release: releaseRecord, err: err}
+		}},
+		{name: "publish", status: StatusApproved, call: func(service *Service, principal identity.Principal, record Release, releaseID uuid.UUID) operationResult {
+			result, err := service.Publish(context.Background(), principal, record.ProductID, releaseID, record.LockVersion, "publish-invisible-12345678", testRequestContext())
+			return operationResult{release: result.Release, attempt: result.Attempt, err: err}
+		}},
+		{name: "retry", status: StatusFailed, call: func(service *Service, principal identity.Principal, record Release, releaseID uuid.UUID) operationResult {
+			result, err := service.Retry(context.Background(), principal, record.ProductID, releaseID, record.LockVersion, "retry-invisible-12345678", testRequestContext())
+			return operationResult{release: result.Release, attempt: result.Attempt, err: err}
+		}},
+		{name: "revoke", status: StatusPublished, call: func(service *Service, principal identity.Principal, record Release, releaseID uuid.UUID) operationResult {
+			result, err := service.Revoke(context.Background(), principal, record.ProductID, releaseID, record.LockVersion, "security revocation", "revoke-invisible-12345678", testRequestContext())
+			return operationResult{release: result.Release, attempt: result.Attempt, err: err}
+		}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			service := newTestReleaseService()
+			repository := service.repository.(*memoryReleaseRepository)
+			record := Release{
+				ID: uuid.New(), ProductID: "ngep", Channel: "stable", Status: test.status, LockVersion: 4,
+				SubmittedBy: "original-publisher",
+			}
+			repository.releases[record.ID] = record
+			principal := identity.Principal{
+				Subject: "governed-channel-denied", Kind: identity.PrincipalKindHuman, Governed: true,
+				RoleScopes: []identity.RoleScope{
+					{Role: identity.RolePublisher, Effect: "allow", ScopeType: "product", ProductID: "ngep"},
+					{Role: identity.RoleApprover, Effect: "allow", ScopeType: "product", ProductID: "ngep"},
+					{Role: identity.RolePublisher, Effect: "deny", ScopeType: "channel", ProductID: "ngep", ChannelName: "stable"},
+					{Role: identity.RoleApprover, Effect: "deny", ScopeType: "channel", ProductID: "ngep", ChannelName: "stable"},
+				},
+			}
+
+			existing := test.call(service, principal, record, record.ID)
+			missing := test.call(service, principal, record, uuid.New())
+			for outcomeName, outcome := range map[string]operationResult{"existing": existing, "missing": missing} {
+				if !errors.Is(outcome.err, ErrReleaseNotFound) {
+					t.Errorf("%s %s error = %v, want %v", test.name, outcomeName, outcome.err, ErrReleaseNotFound)
+				}
+				if !reflect.DeepEqual(outcome.release, Release{}) || !reflect.DeepEqual(outcome.attempt, Attempt{}) {
+					t.Errorf("%s %s leaked release=%#v attempt=%#v", test.name, outcomeName, outcome.release, outcome.attempt)
+				}
+			}
+			if existing.err != nil && missing.err != nil && existing.err.Error() != missing.err.Error() {
+				t.Errorf("%s errors differ: existing=%q missing=%q", test.name, existing.err, missing.err)
+			}
+			if stored := repository.releases[record.ID]; !reflect.DeepEqual(stored, record) {
+				t.Errorf("%s changed channel-denied release: got=%#v want=%#v", test.name, stored, record)
+			}
+		})
+	}
+}
+
+func TestGovernedChannelOnlyScopeCanReadMatchingRelease(t *testing.T) {
+	t.Parallel()
+
+	service := newTestReleaseService()
+	repository := service.repository.(*memoryReleaseRepository)
+	record := Release{ID: uuid.New(), ProductID: "ngep", Channel: "stable", Status: StatusDraft, LockVersion: 1}
+	repository.releases[record.ID] = record
+	principal := identity.Principal{
+		Subject: "governed-stable-viewer", Kind: identity.PrincipalKindHuman, Governed: true,
+		RoleScopes: []identity.RoleScope{{
+			Role: identity.RoleViewer, Effect: "allow", ScopeType: "channel", ProductID: "ngep", ChannelName: "stable",
+		}},
+	}
+
+	got, err := service.Get(context.Background(), principal, record.ProductID, record.ID)
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if !reflect.DeepEqual(got, record) {
+		t.Fatalf("Get() = %#v, want %#v", got, record)
 	}
 }
 
@@ -382,11 +573,14 @@ func (reader *memoryReleaseArtifactReader) Get(_ context.Context, _ identity.Pri
 }
 
 type memoryReleaseRepository struct {
-	releases map[uuid.UUID]Release
-	attempts map[string]Attempt
+	releases         map[uuid.UUID]Release
+	attempts         map[string]Attempt
+	getCalls         int
+	findAttemptCalls int
 }
 
 func (repository *memoryReleaseRepository) FindAttempt(_ context.Context, _ pgx.Tx, releaseID uuid.UUID, kind AttemptKind, idempotencyKey string) (Attempt, error) {
+	repository.findAttemptCalls++
 	attempt, found := repository.attempts[releaseAttemptKey(releaseID, kind, idempotencyKey)]
 	if !found {
 		return Attempt{}, ErrAttemptNotFound
@@ -446,6 +640,7 @@ func (repository *memoryReleaseRepository) Create(_ context.Context, _ pgx.Tx, r
 }
 
 func (repository *memoryReleaseRepository) Get(_ context.Context, productID string, releaseID uuid.UUID) (Release, error) {
+	repository.getCalls++
 	record, found := repository.releases[releaseID]
 	if !found || record.ProductID != productID {
 		return Release{}, ErrReleaseNotFound

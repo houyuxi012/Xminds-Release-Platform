@@ -130,6 +130,53 @@ func (authorizer *Authorizer) Allowed(principal Principal, action Action, produc
 	return authorizer.Require(principal, action, productID) == nil
 }
 
+// RequireProductReadCandidate performs the coarse authorization required before
+// loading a product-scoped resource whose persisted channel is not known yet.
+// A matching channel allow is sufficient to cross the product boundary, while
+// platform and product denies still fail closed. The caller must immediately
+// follow a successful resource lookup with RequireInChannel.
+func (authorizer *Authorizer) RequireProductReadCandidate(principal Principal, productID string) error {
+	if err := principal.Validate(); err != nil {
+		return err
+	}
+	if !principal.Governed {
+		return authorizer.Require(principal, ActionProductRead, productID)
+	}
+	productID = strings.TrimSpace(productID)
+	if productID == "" {
+		return ErrProductIDRequired
+	}
+	allowed := false
+	for _, scope := range principal.RoleScopes {
+		if _, permits := authorizer.permissions[scope.Role][ActionProductRead]; !permits {
+			continue
+		}
+		switch scope.ScopeType {
+		case "platform":
+			if scope.Effect == "deny" {
+				return ErrActionDenied
+			}
+			allowed = allowed || scope.Effect == "allow"
+		case "product":
+			if scope.ProductID != productID {
+				continue
+			}
+			if scope.Effect == "deny" {
+				return ErrActionDenied
+			}
+			allowed = allowed || scope.Effect == "allow"
+		case "channel":
+			if scope.ProductID == productID && scope.Effect == "allow" {
+				allowed = true
+			}
+		}
+	}
+	if !allowed {
+		return ErrActionDenied
+	}
+	return nil
+}
+
 func (authorizer *Authorizer) RequireInChannel(principal Principal, action Action, productID, channel string) error {
 	if err := principal.Validate(); err != nil {
 		return err

@@ -2,6 +2,7 @@ package integration_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -97,6 +98,126 @@ INSERT INTO user_principals (
 	if auditCount != 1 {
 		t.Fatalf("SSO enable audit count = %d", auditCount)
 	}
+}
+
+func TestIAMGovernedPrincipalResolverIsolatesPostgresIdentitySources(t *testing.T) {
+	databaseURL := integrationDatabaseURL(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool, err := database.Open(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if err := database.ApplyMigrations(ctx, pool, migrations.FS); err != nil {
+		t.Fatalf("ApplyMigrations() error = %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+TRUNCATE TABLE emergency_access_events, directory_sync_conflicts, directory_sync_jobs,
+role_bindings, organization_memberships, organization_units, local_password_history,
+local_credentials, user_principals, iam_login_state, identity_sources CASCADE;
+`); err != nil {
+		t.Fatalf("reset IAM test tables: %v", err)
+	}
+
+	now := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
+	sourceAID := uuid.New()
+	sourceBID := uuid.New()
+	sourceAUserID := uuid.New()
+	sourceBUserID := uuid.New()
+	wrongSourceUserID := uuid.New()
+	disabledUserID := uuid.New()
+	if _, err := pool.Exec(ctx, `
+INSERT INTO identity_sources (id, name, source_kind, status, version, created_at, updated_at)
+VALUES ($1, 'Source A', 'oidc', 'enabled', 1, $3, $3),
+       ($2, 'Source B', 'oidc', 'enabled', 1, $3, $3);
+INSERT INTO iam_login_state (singleton, login_mode, active_source_id, version, updated_by, updated_at)
+VALUES (TRUE, 'sso', $1, 1, 'test:bootstrap', $3);
+INSERT INTO user_principals (
+    id, identity_source_id, external_subject, username, display_name, user_kind, status,
+    version, created_at, updated_at, disabled_at, disabled_reason
+) VALUES
+    ($4, $1, 'shared-subject', 'source-a-user', 'Source A User', 'external', 'active', 1, $3, $3, NULL, ''),
+    ($5, $2, 'shared-subject', 'source-b-user', 'Source B User', 'external', 'active', 1, $3, $3, NULL, ''),
+    ($6, $2, 'wrong-source-only', 'wrong-source-user', 'Wrong Source User', 'external', 'active', 1, $3, $3, NULL, ''),
+    ($7, $1, 'disabled-user', 'disabled-source-a-user', 'Disabled Source A User', 'external', 'disabled', 1, $3, $3, $3, 'directory disabled');
+INSERT INTO role_bindings (
+    id, subject_type, subject_id, role_name, scope_type, effect, valid_from,
+    created_by, version, created_at, updated_at
+) VALUES
+    ($8, 'user', $4, 'viewer', 'platform', 'allow', $3, 'test:bootstrap', 1, $3, $3),
+    ($9, 'user', $5, 'publisher', 'platform', 'allow', $3, 'test:bootstrap', 1, $3, $3);
+`, sourceAID, sourceBID, now, sourceAUserID, sourceBUserID, wrongSourceUserID, disabledUserID, uuid.New(), uuid.New()); err != nil {
+		t.Fatalf("seed governed principals: %v", err)
+	}
+
+	resolver, err := iam.NewGovernedPrincipalResolver(iam.NewPostgresRepository(pool), func() time.Time { return now.Add(time.Hour) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolveHuman := func(subject string) (identity.Principal, error) {
+		return resolver.ResolvePrincipal(ctx, identity.Principal{
+			Subject: subject, Kind: identity.PrincipalKindHuman,
+			Roles: []identity.Role{identity.RoleAdmin}, ProductIDs: []string{"untrusted-product"},
+		})
+	}
+	assertOnlyRole := func(t *testing.T, principal identity.Principal, role identity.Role) {
+		t.Helper()
+		if !principal.Governed || len(principal.Roles) != 0 || len(principal.ProductIDs) != 0 || len(principal.RoleScopes) != 1 || principal.RoleScopes[0].Role != role {
+			t.Fatalf("resolved principal = %+v, want only governed %q scope", principal, role)
+		}
+	}
+	assertUnavailable := func(t *testing.T, err error) {
+		t.Helper()
+		if !errors.Is(err, iam.ErrGovernedPrincipalUnavailable) {
+			t.Fatalf("ResolvePrincipal() error = %v, want %v", err, iam.ErrGovernedPrincipalUnavailable)
+		}
+	}
+
+	t.Run("active source selects only its duplicate subject", func(t *testing.T) {
+		resolved, resolveErr := resolveHuman("shared-subject")
+		if resolveErr != nil {
+			t.Fatalf("ResolvePrincipal() error = %v", resolveErr)
+		}
+		assertOnlyRole(t, resolved, identity.RoleViewer)
+	})
+
+	t.Run("subject from wrong source fails closed", func(t *testing.T) {
+		_, resolveErr := resolveHuman("wrong-source-only")
+		assertUnavailable(t, resolveErr)
+	})
+
+	t.Run("switching active source selects the other duplicate subject", func(t *testing.T) {
+		if _, updateErr := pool.Exec(ctx, `UPDATE iam_login_state SET active_source_id=$1, version=version+1, updated_at=$2 WHERE singleton=TRUE`, sourceBID, now.Add(time.Minute)); updateErr != nil {
+			t.Fatal(updateErr)
+		}
+		resolved, resolveErr := resolveHuman("shared-subject")
+		if resolveErr != nil {
+			t.Fatalf("ResolvePrincipal() error = %v", resolveErr)
+		}
+		assertOnlyRole(t, resolved, identity.RolePublisher)
+	})
+
+	t.Run("disabled active source fails closed", func(t *testing.T) {
+		if _, updateErr := pool.Exec(ctx, `UPDATE identity_sources SET status='disabled', version=version+1, updated_at=$2 WHERE id=$1`, sourceBID, now.Add(2*time.Minute)); updateErr != nil {
+			t.Fatal(updateErr)
+		}
+		_, resolveErr := resolveHuman("shared-subject")
+		assertUnavailable(t, resolveErr)
+	})
+
+	t.Run("disabled active-source user fails closed", func(t *testing.T) {
+		if _, updateErr := pool.Exec(ctx, `UPDATE iam_login_state SET active_source_id=$1, version=version+1, updated_at=$2 WHERE singleton=TRUE`, sourceAID, now.Add(3*time.Minute)); updateErr != nil {
+			t.Fatal(updateErr)
+		}
+		_, resolveErr := resolveHuman("disabled-user")
+		assertUnavailable(t, resolveErr)
+	})
+
+	t.Run("local principal cannot match external username", func(t *testing.T) {
+		_, resolveErr := resolver.ResolvePrincipal(ctx, identity.Principal{Subject: "source-a-user", Kind: identity.PrincipalKindLocal})
+		assertUnavailable(t, resolveErr)
+	})
 }
 
 func TestIAMRepositoryCreatesAndPaginatesLocalUsersWithoutPlaintextActivationToken(t *testing.T) {
