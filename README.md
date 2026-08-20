@@ -48,7 +48,7 @@ Xminds Release Platform 是面向企业软件交付场景的多产品可信发�
 - 白色管理台导航与详情抽屉、产品注册、断点续传、职责分离审批、SCM 能力探测、端点健康和审计证据主流程；
 - 真实 Chromium 组件测试与 Playwright 端到端主流程验收。
 
-当前管理 API 运行时已挂载产品、制品、Release、分发端点、审计查询/导出和 IAM 治理路由。业务路由统一位于 OIDC 人工身份、OIDC 工作负载身份和 Argon2id API Token 组合验证边界之后；任一验证器缺失都会拒绝启动或对业务路由 fail closed。角色变更、用户启停/会话撤销和 SSO 切换还必须消费与 actor、operation 及完成 Bearer token ID 精确绑定的服务端一次性重认证 evidence；工作负载和 API Token 不具备 human reauthentication 能力。存活、就绪和版本端点保持匿名可用。分发端点激活使用 DNS 解析地址固定、禁用环境代理和重定向的 TLS 探测，私有 CA 仅能通过受控 Secret 目录中的单文件引用。独立 Public API 只挂载公开目录和制品读取路由，不包含管理操作。Worker 已挂载目录发布、目录撤销、审计导出和版本化身份目录同步处理器；端点同步的具体目标写入适配器仍需在部署组合根注入。统一日志中心属于后续任务。所有签名材料、IAM Secret 与对象存储凭据必须在启动时显式注入，否则拒绝运行。
+当前管理 API 运行时已挂载产品、制品、Release、分发端点、审计查询/导出和 IAM 治理路由。业务路由统一位于 OIDC 人工身份、OIDC 工作负载身份和 Argon2id API Token 组合验证边界之后；任一验证器缺失都会拒绝启动或对业务路由 fail closed。角色变更、用户启停/会话撤销和 SSO 切换还必须消费与 actor、operation 及完成 Bearer token ID 精确绑定的服务端一次性重认证 evidence；工作负载和 API Token 不具备 human reauthentication 能力。存活、就绪和版本端点保持匿名可用。分发端点激活使用 DNS 解析地址固定、禁用环境代理和重定向的 TLS 探测，私有 CA 仅能通过受控 Secret 目录中的单文件引用；私有端点网段必须通过 `XMINDS_RELEASE_ENDPOINT_ALLOWED_PRIVATE_CIDRS` 以最小 RFC1918/ULA CIDR 显式授权，未配置时只允许公开可路由地址。独立 Public API 只挂载公开目录和制品读取路由，不包含管理操作。Worker 已挂载目录发布、目录撤销、审计导出和版本化身份目录同步处理器；端点同步的具体目标写入适配器仍需在部署组合根注入。统一日志中心属于后续任务。所有签名材料、IAM Secret 与对象存储凭据必须在启动时显式注入，否则拒绝运行。
 
 ## P0 能力范围
 
@@ -158,9 +158,11 @@ SCIM 来源 Secret 只引用另一个 Bearer 文件，禁止将 Token 直接写�
 }
 ```
 
-`POST .../verify` 使用必填来源版本验证真实 OIDC discovery/JWKS 或 SCIM ServiceProviderConfig/ResourceTypes。SCIM 必须声明支持分页，ResourceTypes 会按严格 ListResponse 不变量有界收齐；Users/Groups 每个资源必须包含对应 core schema，后续页 `totalResults` 与首页不一致时立即 fail closed。`POST .../sync-preview` 和 `POST .../sync` 返回 `202 Accepted` 及作业 `Location`，作业通过现有 Outbox 由 `release-worker` 执行。只有 SCIM 来源支持 apply；OIDC 来源只支持连接验证和空快照预览。Worker 持久化每页游标，最终页才会在来源 ID 与本次 run marker 边界内停用缺失对象和清理来源成员关系。重复稳定标识、邮箱/规范用户名冲突、组织循环或缺失/冲突父组织会生成可分页查询的冲突记录，相关对象保留最后安全状态，不会自动猜测、覆盖本地字段或删除角色绑定。每个实际 apply batch 的业务变更、进度和无 PII/Secret 不可变审计在同一事务中提交；审计不可用时整批回滚并可恢复重试。冲突分页游标由独立 Secret-backed AES-256-GCM 密钥加密认证，并将路由、来源、schema 版本、filter 和页大小直接纳入 AEAD 附加认证数据，同时绑定有效期，禁止篡改或跨上下文重放。轮换时原子替换 Secret 并重启 API，旧游标立即 fail closed，客户端按默认 15 分钟短有效期契约从首页重新分页。
+`POST .../verify` 使用必填来源版本验证真实 OIDC discovery/JWKS 或 SCIM ServiceProviderConfig/ResourceTypes。SCIM 必须声明支持分页，ResourceTypes 会按严格 ListResponse 不变量有界收齐；Users/Groups 每个资源必须包含对应 core schema，后续页 `totalResults` 与首页不一致时立即 fail closed。`POST .../sync-preview` 和 `POST .../sync` 返回 `202 Accepted` 及作业 `Location`，作业通过现有 Outbox 由 `release-worker` 执行。只有 SCIM 来源支持 apply；OIDC 来源只支持连接验证和空快照预览。Worker 持久化每页游标，最终页才会在来源 ID 与本次 run marker 边界内停用缺失对象和清理来源成员关系。重复稳定标识、邮箱/规范用户名冲突、组织循环或缺失/冲突父组织会生成可分页查询的冲突记录，相关对象保留最后安全状态，不会自动猜测、覆盖本地字段或删除角色绑定。每个实际 apply batch 的业务变更、进度和无 PII/Secret 不可变审计在同一事务中提交；审计不可用时整批回滚并可恢复重试。冲突分页游标由独立 Secret-backed AES-256-GCM 密钥加密认证，并将路由、来源、schema 版本、filter 和页大小直接纳入 AEAD 附加认证数据，同时绑定有效期，禁止篡改或跨上下文重放。密钥 Secret 必须保存 32 字节随机值的无填充 base64url 文本（固定 43 字符），禁止保存随机原始字节；轮换时原子替换 Secret 并重启 API，旧游标立即 fail closed，客户端按默认 15 分钟短有效期契约从首页重新分页。
 
-目录请求总超时可在 1–30 秒范围内调整，总页数上限为 10000，用户、组织、成员和层级关系总数上限为 100000。出站连接在解析后固定 IPv4/IPv6 地址并在拨号层校验目标 host，默认拒绝 loopback、link-local/metadata、unspecified、multicast 和私网地址，禁用环境代理与重定向。只有 `development`/`test` 可通过兼容变量 `XMINDS_RELEASE_IAM_DIRECTORY_ALLOW_LOOPBACK_HTTP=true` 显式允许 loopback HTTP/HTTPS；企业私网必须经审核后显式设置 `XMINDS_RELEASE_IAM_DIRECTORY_ALLOW_PRIVATE_NETWORKS=true`，且仍强制 TLS 1.2+、正确 ServerName 与受控 CA。具体变量与默认值见 [`.env.example`](.env.example)。
+目录请求总超时可在 1–30 秒范围内调整，该预算从操作入口开始，覆盖 Secret 读取、DNS、全部分页和 HTTP；单次拨号、TLS 与请求仍受更短上限约束。总页数上限为 10000，用户、组织、成员和层级关系总数上限为 100000。出站连接在解析后固定 IPv4/IPv6 地址并在拨号层校验目标 host，默认仅允许可公开路由地址，拒绝 loopback、link-local/metadata、CGNAT、文档/基准测试网段、unspecified、multicast 和其他特殊用途地址。拒绝表依据 IANA IPv4/IPv6 Special-Purpose Address Registry 的 2025-10-09 快照审核，并采用更保守的安全策略：`2001::/23` 整段均被拒绝，包括 IANA 标记为 globally reachable 的更具体例外，因此该策略不等同于 IANA `Globally Reachable` 属性。只有 `development`/`test` 可通过兼容变量 `XMINDS_RELEASE_IAM_DIRECTORY_ALLOW_LOOPBACK_HTTP=true` 显式允许 loopback HTTP/HTTPS；企业 RFC1918/ULA 私网必须经审核后通过 `XMINDS_RELEASE_IAM_DIRECTORY_ALLOWED_PRIVATE_CIDRS` 仅列出规范化、无主机位且确需访问的 CIDR，例如 `10.42.7.0/24,fd12:3456:789a::/48`。每个获准网段中的任一地址都可能接收目录 Bearer，因此必须遵循最小网段并纳入配置变更审计；即便配置私网 allowlist，仍强制 TLS 1.2+、正确 ServerName、DNS 固定与受控 CA，且不能放行 metadata、CGNAT、link-local 等特殊用途地址。具体变量与默认值见 [`.env.example`](.env.example)。
+
+迁移文件一经发布不得改写。`*.pre.sql` companion 仅用于让历史数据满足对应不可变迁移的前置条件：迁移框架在同一 PostgreSQL 事务中执行 companion 与目标 migration，并分别记录稳定名称和 SHA-256；目标失败时 companion 变更与两条记录全部回滚。已经记录目标 migration 的数据库不会补跑该 companion，后续修正必须使用新的顺序迁移。
 
 默认 Public API 监听 `127.0.0.1:8081`，只提供：
 

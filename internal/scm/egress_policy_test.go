@@ -27,7 +27,7 @@ func TestResolveConnectionPinsStableAddressesAndRejectsLinkLocalResults(t *testi
 	connection := Connection{APIBaseURL: "https://gitlab.corp.example/api/v4"}
 	resolved, err := ResolveConnection(context.Background(), connection, fixedResolver{addresses: []netip.Addr{
 		netip.MustParseAddr("10.20.30.41"), netip.MustParseAddr("10.20.30.40"), netip.MustParseAddr("10.20.30.40"),
-	}})
+	}}, netip.MustParsePrefix("10.20.30.0/24"))
 	if err != nil {
 		t.Fatal(err)
 	}

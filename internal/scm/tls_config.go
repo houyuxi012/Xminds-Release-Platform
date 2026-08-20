@@ -25,8 +25,9 @@ type ContextDialer interface {
 }
 
 type HTTPClientOptions struct {
-	Dialer        ContextDialer
-	AllowLoopback bool
+	Dialer                 ContextDialer
+	AllowLoopback          bool
+	AllowedPrivatePrefixes []netip.Prefix
 }
 
 func BuildTLSConfig(serverName string, enterpriseCABundlePEM []byte) (*tls.Config, error) {
@@ -56,7 +57,7 @@ func NewHTTPClient(connection Connection, options HTTPClientOptions) (*http.Clie
 	if err != nil || connection.ID == [16]byte{} || connection.Status != ConnectionStatusActive {
 		return nil, ErrEgressConfigurationInvalid
 	}
-	pinned, err := validatePinnedAddresses(connection.ResolvedAddresses, options.AllowLoopback)
+	pinned, err := validatePinnedAddresses(connection.ResolvedAddresses, options.AllowLoopback, options.AllowedPrivatePrefixes)
 	if err != nil {
 		return nil, err
 	}
@@ -83,7 +84,7 @@ func NewHTTPClient(connection Connection, options HTTPClientOptions) (*http.Clie
 			return nil, err
 		}
 		proxyHost = strings.ToLower(strings.TrimSuffix(proxyURL.Hostname(), "."))
-		proxyPinned, err = validatePinnedAddresses(connection.ProxyResolvedAddresses, options.AllowLoopback)
+		proxyPinned, err = validatePinnedAddresses(connection.ProxyResolvedAddresses, options.AllowLoopback, options.AllowedPrivatePrefixes)
 		if err != nil {
 			return nil, err
 		}
@@ -166,7 +167,7 @@ func parseExplicitProxyURL(raw string) (*url.URL, error) {
 	return parsed, nil
 }
 
-func validatePinnedAddresses(raw []string, allowLoopback bool) ([]netip.Addr, error) {
+func validatePinnedAddresses(raw []string, allowLoopback bool, allowedPrivatePrefixes []netip.Prefix) ([]netip.Addr, error) {
 	if len(raw) == 0 {
 		return nil, ErrEgressConfigurationInvalid
 	}
@@ -178,7 +179,7 @@ func validatePinnedAddresses(raw []string, allowLoopback bool) ([]netip.Addr, er
 		}
 		parsed = append(parsed, address)
 	}
-	result, err := platformegress.NormalizeAddresses(parsed, platformegress.Policy{AllowLoopback: allowLoopback, AllowPrivate: true})
+	result, err := platformegress.NormalizeAddresses(parsed, platformegress.Policy{AllowLoopback: allowLoopback, AllowedPrivatePrefixes: allowedPrivatePrefixes})
 	if err != nil || len(result) != len(raw) {
 		return nil, ErrEgressConfigurationInvalid
 	}

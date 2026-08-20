@@ -136,7 +136,7 @@ func run(ctx context.Context, environ map[string]string) error {
 	directoryAdapter, err := iam.NewSecretBackedDirectoryAdapter(iam.SecretBackedDirectoryAdapterConfig{
 		Secrets: directorySecrets, RequestTimeout: runtimeConfig.Directory.RequestTimeout,
 		MaximumPages: runtimeConfig.Directory.MaximumPages, MaximumObjects: runtimeConfig.Directory.MaximumObjects,
-		AllowLoopbackHTTP: runtimeConfig.Directory.AllowLoopbackHTTP, AllowPrivateNetworks: runtimeConfig.Directory.AllowPrivateNetworks,
+		AllowLoopbackHTTP: runtimeConfig.Directory.AllowLoopbackHTTP, AllowedPrivatePrefixes: runtimeConfig.Directory.AllowedPrivatePrefixes,
 	})
 	if err != nil {
 		return fmt.Errorf("configure IAM directory adapter: %w", err)
@@ -149,7 +149,7 @@ func run(ctx context.Context, environ map[string]string) error {
 		return fmt.Errorf("configure IAM directory sync executor: %w", err)
 	}
 	directoryHandler, err := iam.NewDirectorySyncHandler(iam.DirectorySyncHandlerConfig{
-		Executor: directoryExecutor, Directory: directoryAdapter,
+		Executor: directoryExecutor, Directory: directoryAdapter, OperationTimeout: runtimeConfig.Directory.RequestTimeout,
 	})
 	if err != nil {
 		return fmt.Errorf("configure IAM directory sync handler: %w", err)
@@ -173,7 +173,8 @@ func run(ctx context.Context, environ map[string]string) error {
 	}
 	worker, err := jobs.NewWorker(jobs.WorkerConfig{
 		Owner: configuration.WorkerID, Repository: jobs.NewPostgresRepository(pool), Handlers: handlers,
-		DeadLetters: deadLetters, LeaseDuration: configuration.JobLease, RenewInterval: renewInterval,
+		DeadLetters: deadLetters, RequiredTransactionalDeadLetterKinds: []string{iam.JobKindDirectorySync},
+		LeaseDuration: configuration.JobLease, RenewInterval: renewInterval,
 	})
 	if err != nil {
 		return fmt.Errorf("configure durable worker: %w", err)

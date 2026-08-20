@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"strings"
@@ -23,6 +24,7 @@ import (
 	"xminds-release-platform/internal/platform/buildinfo"
 	"xminds-release-platform/internal/platform/config"
 	"xminds-release-platform/internal/platform/database"
+	"xminds-release-platform/internal/platform/egress"
 	"xminds-release-platform/internal/platform/httpserver"
 	"xminds-release-platform/internal/platform/jobs"
 	"xminds-release-platform/internal/platform/objectstore"
@@ -35,15 +37,16 @@ var errUsage = errors.New("usage: release-api <serve|migrate>")
 var errAPIRuntimeConfiguration = errors.New("API runtime configuration is invalid")
 
 type apiRuntimeConfig struct {
-	ObjectStoreAccessKey string
-	ObjectStoreSecretKey string
-	Region               string
-	SessionToken         string
-	EndpointCADirectory  string
-	DefaultProductID     string
-	DefaultChannel       string
-	LocalAuth            iam.LocalAuthRuntimeConfig
-	Directory            iam.DirectoryRuntimeConfig
+	ObjectStoreAccessKey           string
+	ObjectStoreSecretKey           string
+	Region                         string
+	SessionToken                   string
+	EndpointCADirectory            string
+	EndpointAllowedPrivatePrefixes []netip.Prefix
+	DefaultProductID               string
+	DefaultChannel                 string
+	LocalAuth                      iam.LocalAuthRuntimeConfig
+	Directory                      iam.DirectoryRuntimeConfig
 }
 
 func main() {
@@ -153,6 +156,7 @@ func run(ctx context.Context, arguments []string, environ map[string]string) err
 	}
 	endpointProbe, err := endpoint.NewHTTPProbe(endpoint.HTTPProbeConfig{
 		CABundles: endpointCABundles, AllowLoopback: configuration.Environment == "development",
+		AllowedPrivatePrefixes: runtimeConfig.EndpointAllowedPrivatePrefixes,
 	})
 	if err != nil {
 		return fmt.Errorf("configure distribution endpoint probe: %w", err)
@@ -187,7 +191,11 @@ func run(ctx context.Context, arguments []string, environ map[string]string) err
 		return fmt.Errorf("configure IAM secret resolver: %w", err)
 	}
 	defer secretResolver.Close()
-	directoryCursorKey, err := secretResolver.Resolve(ctx, runtimeConfig.Directory.ConflictCursorKeyReference)
+	directoryCursorKeySecret, err := secretResolver.Resolve(ctx, runtimeConfig.Directory.ConflictCursorKeyReference)
+	if err != nil {
+		return fmt.Errorf("configure IAM directory conflict cursor key: %w", err)
+	}
+	directoryCursorKey, err := iam.DecodeDirectoryConflictCursorKeySecret(directoryCursorKeySecret)
 	if err != nil {
 		return fmt.Errorf("configure IAM directory conflict cursor key: %w", err)
 	}
@@ -198,7 +206,7 @@ func run(ctx context.Context, arguments []string, environ map[string]string) err
 	directoryAdapter, err := iam.NewSecretBackedDirectoryAdapter(iam.SecretBackedDirectoryAdapterConfig{
 		Secrets: secretResolver, RequestTimeout: runtimeConfig.Directory.RequestTimeout,
 		MaximumPages: runtimeConfig.Directory.MaximumPages, MaximumObjects: runtimeConfig.Directory.MaximumObjects,
-		AllowLoopbackHTTP: runtimeConfig.Directory.AllowLoopbackHTTP, AllowPrivateNetworks: runtimeConfig.Directory.AllowPrivateNetworks,
+		AllowLoopbackHTTP: runtimeConfig.Directory.AllowLoopbackHTTP, AllowedPrivatePrefixes: runtimeConfig.Directory.AllowedPrivatePrefixes,
 	})
 	if err != nil {
 		return fmt.Errorf("configure IAM directory adapter: %w", err)
@@ -345,6 +353,11 @@ func loadAPIRuntimeConfig(environ map[string]string, environment string) (apiRun
 	if result.ObjectStoreAccessKey == "" || result.ObjectStoreSecretKey == "" || result.DefaultProductID == "" || result.DefaultChannel == "" {
 		return apiRuntimeConfig{}, errAPIRuntimeConfiguration
 	}
+	endpointAllowedPrivatePrefixes, err := egress.ParseAllowedPrivatePrefixes(environ["XMINDS_RELEASE_ENDPOINT_ALLOWED_PRIVATE_CIDRS"])
+	if err != nil {
+		return apiRuntimeConfig{}, errAPIRuntimeConfiguration
+	}
+	result.EndpointAllowedPrivatePrefixes = endpointAllowedPrivatePrefixes
 	localAuth, err := iam.LoadLocalAuthRuntimeConfig(environ, environment)
 	if err != nil {
 		return apiRuntimeConfig{}, fmt.Errorf("local authentication settings: %w", errAPIRuntimeConfiguration)

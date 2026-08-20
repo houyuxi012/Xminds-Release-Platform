@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"strings"
 	"testing"
@@ -105,6 +106,68 @@ func TestSecretBackedDirectoryAdapterRejectsOIDCSymmetricAlgorithms(t *testing.T
 	}
 }
 
+func TestDirectoryAdapterOperationDeadlineCoversBlockingSecretAndDNSSetup(t *testing.T) {
+	t.Run("secret", func(t *testing.T) {
+		adapter, err := NewSecretBackedDirectoryAdapter(SecretBackedDirectoryAdapterConfig{Secrets: blockingDirectorySecretResolver{}, RequestTimeout: time.Second})
+		if err != nil {
+			t.Fatal(err)
+		}
+		started := time.Now()
+		_, err = adapter.Verify(context.Background(), IdentitySource{ID: uuid.New(), Kind: IdentitySourceSCIM, SecretReference: "secret://iam/scim"})
+		if !errors.Is(err, ErrDirectoryConfigurationInvalid) || time.Since(started) > 1500*time.Millisecond {
+			t.Fatalf("Verify() error=%v elapsed=%v", err, time.Since(started))
+		}
+	})
+	t.Run("dns", func(t *testing.T) {
+		secrets := directorySecretMap{
+			"secret://iam/scim":  []byte(`{"base_url":"https://directory.example.com/scim/v2","bearer_token_reference":"secret://iam/token","page_size":100}`),
+			"secret://iam/token": []byte("directory-bearer"),
+		}
+		adapter, err := NewSecretBackedDirectoryAdapter(SecretBackedDirectoryAdapterConfig{Secrets: secrets, Resolver: blockingDirectoryIPResolver{}, RequestTimeout: time.Second})
+		if err != nil {
+			t.Fatal(err)
+		}
+		started := time.Now()
+		_, err = adapter.Verify(context.Background(), IdentitySource{ID: uuid.New(), Kind: IdentitySourceSCIM, SecretReference: "secret://iam/scim"})
+		if !errors.Is(err, ErrDirectoryConfigurationInvalid) || time.Since(started) > 1500*time.Millisecond {
+			t.Fatalf("Verify() error=%v elapsed=%v", err, time.Since(started))
+		}
+	})
+}
+
+func TestDirectoryAdapterOperationDeadlineDoesNotResetAcrossResourceTypePages(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/scim/v2/ServiceProviderConfig":
+			writeDirectoryTestJSON(t, writer, map[string]any{"schemas": []string{"urn:ietf:params:scim:schemas:core:2.0:ServiceProviderConfig"}, "pagination": map[string]any{"supported": true}})
+		case "/scim/v2/ResourceTypes":
+			time.Sleep(600 * time.Millisecond)
+			if request.URL.Query().Get("startIndex") == "1" {
+				writeDirectoryTestJSON(t, writer, directorySCIMList(2, 1, []map[string]any{{"schemas": []string{scimResourceTypeSchema}, "id": "User", "name": "User", "endpoint": "/Users", "schema": scimUserSchema}}))
+				return
+			}
+			writeDirectoryTestJSON(t, writer, directorySCIMList(2, 2, []map[string]any{{"schemas": []string{scimResourceTypeSchema}, "id": "Group", "name": "Group", "endpoint": "/Groups", "schema": scimGroupSchema}}))
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	t.Cleanup(server.Close)
+	secrets := directorySecretMap{
+		"secret://iam/scim":  []byte(fmt.Sprintf(`{"base_url":%q,"bearer_token_reference":"secret://iam/token","ca_reference":"secret://iam/ca","page_size":100}`, server.URL+"/scim/v2")),
+		"secret://iam/token": []byte("directory-bearer"),
+		"secret://iam/ca":    directoryTestServerCA(t, server),
+	}
+	adapter, err := NewSecretBackedDirectoryAdapter(SecretBackedDirectoryAdapterConfig{Secrets: secrets, RequestTimeout: time.Second, AllowLoopbackHTTP: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	_, err = adapter.Verify(context.Background(), IdentitySource{ID: uuid.New(), Kind: IdentitySourceSCIM, SecretReference: "secret://iam/scim"})
+	if (!errors.Is(err, ErrDirectoryUpstreamRejected) && !errors.Is(err, ErrDirectoryResponseInvalid)) || time.Since(started) > 1500*time.Millisecond {
+		t.Fatalf("Verify() error=%v elapsed=%v", err, time.Since(started))
+	}
+}
+
 func TestSecretBackedDirectoryAdapterRejectsUnknownSecretFields(t *testing.T) {
 	resolver := directorySecretMap{
 		"secret://iam/scim": []byte(`{"base_url":"https://id.example.com/scim/v2","bearer_token_reference":"secret://iam/token","page_size":100,"unexpected":"reject"}`),
@@ -131,6 +194,79 @@ func TestSecretBackedDirectoryAdapterRejectsDuplicateSecretMembers(t *testing.T)
 	_, _, _, err = adapter.loadSCIM(context.Background(), IdentitySource{ID: uuid.New(), Kind: IdentitySourceSCIM, SecretReference: "secret://iam/scim"})
 	if !errors.Is(err, ErrDirectoryConfigurationInvalid) {
 		t.Fatalf("Verify() error=%v, want duplicate secret rejection", err)
+	}
+}
+
+func TestSecretBackedDirectoryAdapterRejectsCaseFoldSecretAliases(t *testing.T) {
+	resolver := directorySecretMap{
+		"secret://iam/scim":  []byte(`{"base_url":"https://first.example.com/scim/v2","Base_URL":"https://second.example.com/scim/v2","bearer_token_reference":"secret://iam/token","page_size":100}`),
+		"secret://iam/token": []byte("directory-bearer"),
+	}
+	adapter, err := NewSecretBackedDirectoryAdapter(SecretBackedDirectoryAdapterConfig{Secrets: resolver})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, _, err = adapter.loadSCIM(context.Background(), IdentitySource{ID: uuid.New(), Kind: IdentitySourceSCIM, SecretReference: "secret://iam/scim"})
+	if !errors.Is(err, ErrDirectoryConfigurationInvalid) {
+		t.Fatalf("loadSCIM() error=%v, want case-fold alias rejection", err)
+	}
+}
+
+func TestSCIMNormalizationRejectsKnownFieldCaseAliases(t *testing.T) {
+	_, err := normalizeSCIMUsers([]json.RawMessage{json.RawMessage(`{"schemas":["urn:ietf:params:scim:schemas:core:2.0:User"],"id":"user-1","userName":"alice","UserName":"mallory"}`)})
+	if !errors.Is(err, ErrDirectoryResponseInvalid) {
+		t.Fatalf("normalizeSCIMUsers() error=%v", err)
+	}
+	_, _, _, err = normalizeSCIMGroups([]json.RawMessage{json.RawMessage(`{"schemas":["urn:ietf:params:scim:schemas:core:2.0:Group"],"id":"group-1","displayName":"Engineering","DisplayName":"Override"}`)})
+	if !errors.Is(err, ErrDirectoryResponseInvalid) {
+		t.Fatalf("normalizeSCIMGroups() error=%v", err)
+	}
+}
+
+func TestSCIMResourceTypesRequireCoreSchemaAndRejectDuplicateIDs(t *testing.T) {
+	valid := func(id, name, endpoint, schema string) json.RawMessage {
+		return json.RawMessage(fmt.Sprintf(`{"schemas":["urn:ietf:params:scim:schemas:core:2.0:ResourceType"],"id":%q,"name":%q,"endpoint":%q,"schema":%q}`, id, name, endpoint, schema))
+	}
+	user := valid("User", "User", "/Users", scimUserSchema)
+	group := valid("Group", "Group", "/Groups", scimGroupSchema)
+	for name, resources := range map[string][]json.RawMessage{
+		"missing core schema": {json.RawMessage(`{"id":"User","name":"User","endpoint":"/Users","schema":"urn:ietf:params:scim:schemas:core:2.0:User"}`), group},
+		"wrong core schema":   {json.RawMessage(`{"schemas":["urn:ietf:params:scim:schemas:core:2.0:User"],"id":"User","name":"User","endpoint":"/Users","schema":"urn:ietf:params:scim:schemas:core:2.0:User"}`), group},
+		"duplicate user id":   {user, user, group},
+		"duplicate group id":  {user, group, group},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if validSCIMResourceTypes(resources) {
+				t.Fatalf("validSCIMResourceTypes(%s)=true", name)
+			}
+		})
+	}
+	if !validSCIMResourceTypes([]json.RawMessage{user, group}) {
+		t.Fatal("valid ResourceTypes rejected")
+	}
+}
+
+func TestSCIMEmailNormalizationValidatesEveryValueAndOnlyOnePrimary(t *testing.T) {
+	for name, emails := range map[string][]struct {
+		Value   string `json:"value"`
+		Primary bool   `json:"primary"`
+	}{
+		"multiple primary":      {{Value: "first@example.com", Primary: true}, {Value: "second@example.com", Primary: true}},
+		"invalid after primary": {{Value: "first@example.com", Primary: true}, {Value: "not-an-email"}},
+		"empty primary":         {{Value: "", Primary: true}, {Value: "second@example.com"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := normalizedSCIMEmail(emails); !errors.Is(err, ErrDirectoryResponseInvalid) {
+				t.Fatalf("normalizedSCIMEmail() error=%v", err)
+			}
+		})
+	}
+	selected, err := normalizedSCIMEmail([]struct {
+		Value   string `json:"value"`
+		Primary bool   `json:"primary"`
+	}{{Value: "fallback@example.com"}, {Value: "primary@example.com", Primary: true}, {Value: "later@example.com"}})
+	if err != nil || selected != "primary@example.com" {
+		t.Fatalf("selected=%q error=%v", selected, err)
 	}
 }
 
@@ -218,8 +354,8 @@ func TestSecretBackedDirectoryAdapterRejectsIncompleteResourceTypesList(t *testi
 			writeDirectoryTestJSON(t, writer, map[string]any{
 				"schemas": []string{"urn:ietf:params:scim:api:messages:2.0:ListResponse"}, "totalResults": 3, "startIndex": 1, "itemsPerPage": 2,
 				"Resources": []map[string]any{
-					{"id": "User", "name": "User", "endpoint": "/Users", "schema": scimUserSchema},
-					{"id": "Group", "name": "Group", "endpoint": "/Groups", "schema": scimGroupSchema},
+					{"schemas": []string{scimResourceTypeSchema}, "id": "User", "name": "User", "endpoint": "/Users", "schema": scimUserSchema},
+					{"schemas": []string{scimResourceTypeSchema}, "id": "Group", "name": "Group", "endpoint": "/Groups", "schema": scimGroupSchema},
 				},
 			})
 		default:
@@ -257,11 +393,11 @@ func TestSecretBackedDirectoryAdapterCollectsPaginatedResourceTypesAndRequiresPa
 				t.Fatalf("ResourceTypes count=%q", request.URL.Query().Get("count"))
 			}
 			if start == "1" {
-				writeDirectoryTestJSON(t, writer, directorySCIMList(2, 1, []map[string]any{{"id": "User", "name": "User", "endpoint": "/Users", "schema": scimUserSchema}}))
+				writeDirectoryTestJSON(t, writer, directorySCIMList(2, 1, []map[string]any{{"schemas": []string{scimResourceTypeSchema}, "id": "User", "name": "User", "endpoint": "/Users", "schema": scimUserSchema}}))
 				return
 			}
 			if start == "2" {
-				writeDirectoryTestJSON(t, writer, directorySCIMList(2, 2, []map[string]any{{"id": "Group", "name": "Group", "endpoint": "/Groups", "schema": scimGroupSchema}}))
+				writeDirectoryTestJSON(t, writer, directorySCIMList(2, 2, []map[string]any{{"schemas": []string{scimResourceTypeSchema}, "id": "Group", "name": "Group", "endpoint": "/Groups", "schema": scimGroupSchema}}))
 				return
 			}
 			t.Fatalf("ResourceTypes startIndex=%q", start)
@@ -348,8 +484,8 @@ func TestSecretBackedDirectoryAdapterVerifiesSCIMAndPaginatesNormalizedSnapshot(
 				"startIndex":   1,
 				"itemsPerPage": 2,
 				"Resources": []map[string]any{
-					{"id": "User", "name": "User", "endpoint": "/Users", "schema": "urn:ietf:params:scim:schemas:core:2.0:User"},
-					{"id": "Group", "name": "Group", "endpoint": "/Groups", "schema": "urn:ietf:params:scim:schemas:core:2.0:Group"},
+					{"schemas": []string{scimResourceTypeSchema}, "id": "User", "name": "User", "endpoint": "/Users", "schema": "urn:ietf:params:scim:schemas:core:2.0:User"},
+					{"schemas": []string{scimResourceTypeSchema}, "id": "Group", "name": "Group", "endpoint": "/Groups", "schema": "urn:ietf:params:scim:schemas:core:2.0:Group"},
 				},
 			})
 		case "/scim/v2/Users":
@@ -500,6 +636,20 @@ func (secrets directorySecretMap) Resolve(_ context.Context, reference string) (
 		return nil, ErrSecretReferenceInvalid
 	}
 	return append([]byte(nil), value...), nil
+}
+
+type blockingDirectorySecretResolver struct{}
+
+func (blockingDirectorySecretResolver) Resolve(ctx context.Context, _ string) ([]byte, error) {
+	<-ctx.Done()
+	return nil, context.Cause(ctx)
+}
+
+type blockingDirectoryIPResolver struct{}
+
+func (blockingDirectoryIPResolver) LookupNetIP(ctx context.Context, _, _ string) ([]netip.Addr, error) {
+	<-ctx.Done()
+	return nil, context.Cause(ctx)
 }
 
 func directoryTestServerCA(t *testing.T, server *httptest.Server) []byte {

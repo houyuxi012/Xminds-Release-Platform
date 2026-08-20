@@ -26,7 +26,7 @@ type IPResolver interface {
 	LookupNetIP(ctx context.Context, network, host string) ([]netip.Addr, error)
 }
 
-func ResolveConnection(ctx context.Context, connection Connection, resolver IPResolver) (Connection, error) {
+func ResolveConnection(ctx context.Context, connection Connection, resolver IPResolver, allowedPrivatePrefixes ...netip.Prefix) (Connection, error) {
 	if resolver == nil {
 		return Connection{}, ErrEgressConfigurationInvalid
 	}
@@ -34,7 +34,7 @@ func ResolveConnection(ctx context.Context, connection Connection, resolver IPRe
 	if err != nil {
 		return Connection{}, err
 	}
-	addresses, err := platformegress.ResolvePinnedAddresses(ctx, resolver, parsed.Hostname(), platformegress.Policy{AllowPrivate: true})
+	addresses, err := platformegress.ResolvePinnedAddresses(ctx, resolver, parsed.Hostname(), platformegress.Policy{AllowedPrivatePrefixes: allowedPrivatePrefixes})
 	if err != nil {
 		if err == platformegress.ErrDestinationDenied {
 			return Connection{}, ErrEgressDestinationDenied

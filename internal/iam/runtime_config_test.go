@@ -2,6 +2,7 @@ package iam
 
 import (
 	"errors"
+	"net/netip"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -30,7 +31,7 @@ func TestLoadDirectoryRuntimeConfigUsesBoundedSharedSecretRoot(t *testing.T) {
 		"XMINDS_RELEASE_IAM_DIRECTORY_MAXIMUM_PAGES":                 "250",
 		"XMINDS_RELEASE_IAM_DIRECTORY_MAXIMUM_OBJECTS":               "25000",
 		"XMINDS_RELEASE_IAM_DIRECTORY_ALLOW_LOOPBACK_HTTP":           "true",
-		"XMINDS_RELEASE_IAM_DIRECTORY_ALLOW_PRIVATE_NETWORKS":        "true",
+		"XMINDS_RELEASE_IAM_DIRECTORY_ALLOWED_PRIVATE_CIDRS":         "10.20.30.0/24,fd00:1234::/48",
 		"XMINDS_RELEASE_IAM_DIRECTORY_CONFLICT_CURSOR_KEY_REFERENCE": "secret://iam/test-directory-cursor-key",
 		"XMINDS_RELEASE_IAM_DIRECTORY_CONFLICT_CURSOR_TTL":           "30m",
 	}, "test")
@@ -38,7 +39,8 @@ func TestLoadDirectoryRuntimeConfigUsesBoundedSharedSecretRoot(t *testing.T) {
 		t.Fatalf("LoadDirectoryRuntimeConfig() error = %v", err)
 	}
 	if configuration.SecretDirectory != filepath.Clean(secretDirectory) || configuration.RequestTimeout != 12*time.Second ||
-		configuration.MaximumPages != 250 || configuration.MaximumObjects != 25000 || !configuration.AllowLoopbackHTTP || !configuration.AllowPrivateNetworks ||
+		configuration.MaximumPages != 250 || configuration.MaximumObjects != 25000 || !configuration.AllowLoopbackHTTP ||
+		!reflect.DeepEqual(configuration.AllowedPrivatePrefixes, []netip.Prefix{netip.MustParsePrefix("10.20.30.0/24"), netip.MustParsePrefix("fd00:1234::/48")}) ||
 		configuration.ConflictCursorKeyReference != "secret://iam/test-directory-cursor-key" || configuration.ConflictCursorTTL != 30*time.Minute {
 		t.Fatalf("configuration = %+v", configuration)
 	}
@@ -58,7 +60,8 @@ func TestLoadDirectoryRuntimeConfigFailsClosedForUnsafeOverrides(t *testing.T) {
 		"too many objects":             {environment: "production", overrides: map[string]string{"XMINDS_RELEASE_IAM_DIRECTORY_MAXIMUM_OBJECTS": "100001"}},
 		"production loopback":          {environment: "production", overrides: map[string]string{"XMINDS_RELEASE_IAM_DIRECTORY_ALLOW_LOOPBACK_HTTP": "true"}},
 		"implicit test loopback":       {environment: "test", overrides: map[string]string{"XMINDS_RELEASE_IAM_DIRECTORY_ALLOW_LOOPBACK_HTTP": "yes"}},
-		"invalid private policy":       {environment: "production", overrides: map[string]string{"XMINDS_RELEASE_IAM_DIRECTORY_ALLOW_PRIVATE_NETWORKS": "yes"}},
+		"invalid private CIDR":         {environment: "production", overrides: map[string]string{"XMINDS_RELEASE_IAM_DIRECTORY_ALLOWED_PRIVATE_CIDRS": "100.64.0.0/10"}},
+		"unmasked private CIDR":        {environment: "production", overrides: map[string]string{"XMINDS_RELEASE_IAM_DIRECTORY_ALLOWED_PRIVATE_CIDRS": "10.20.30.7/24"}},
 		"invalid cursor key reference": {environment: "production", overrides: map[string]string{"XMINDS_RELEASE_IAM_DIRECTORY_CONFLICT_CURSOR_KEY_REFERENCE": "file:///tmp/key"}},
 		"short cursor ttl":             {environment: "production", overrides: map[string]string{"XMINDS_RELEASE_IAM_DIRECTORY_CONFLICT_CURSOR_TTL": "30s"}},
 		"long cursor ttl":              {environment: "production", overrides: map[string]string{"XMINDS_RELEASE_IAM_DIRECTORY_CONFLICT_CURSOR_TTL": "25h"}},

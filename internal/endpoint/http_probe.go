@@ -49,17 +49,19 @@ func (function CABundleLoaderFunc) Load(ctx context.Context, reference string) (
 }
 
 type HTTPProbeConfig struct {
-	Resolver      ProbeIPResolver
-	Dialer        ProbeDialer
-	CABundles     CABundleLoader
-	AllowLoopback bool
+	Resolver               ProbeIPResolver
+	Dialer                 ProbeDialer
+	CABundles              CABundleLoader
+	AllowLoopback          bool
+	AllowedPrivatePrefixes []netip.Prefix
 }
 
 type HTTPProbe struct {
-	resolver      ProbeIPResolver
-	dialer        ProbeDialer
-	caBundles     CABundleLoader
-	allowLoopback bool
+	resolver               ProbeIPResolver
+	dialer                 ProbeDialer
+	caBundles              CABundleLoader
+	allowLoopback          bool
+	allowedPrivatePrefixes []netip.Prefix
 }
 
 func NewHTTPProbe(config HTTPProbeConfig) (*HTTPProbe, error) {
@@ -74,6 +76,7 @@ func NewHTTPProbe(config HTTPProbeConfig) (*HTTPProbe, error) {
 	}
 	return &HTTPProbe{
 		resolver: config.Resolver, dialer: config.Dialer, caBundles: config.CABundles, allowLoopback: config.AllowLoopback,
+		allowedPrivatePrefixes: append([]netip.Prefix(nil), config.AllowedPrivatePrefixes...),
 	}, nil
 }
 
@@ -107,7 +110,7 @@ func (probe *HTTPProbe) Verify(ctx context.Context, endpoint Endpoint, current c
 }
 
 func (probe *HTTPProbe) client(ctx context.Context, baseURL *url.URL, caReference string) (*http.Client, error) {
-	addresses, err := resolveProbeAddresses(ctx, probe.resolver, baseURL.Hostname(), probe.allowLoopback)
+	addresses, err := resolveProbeAddresses(ctx, probe.resolver, baseURL.Hostname(), probe.allowLoopback, probe.allowedPrivatePrefixes)
 	if err != nil {
 		return nil, err
 	}
@@ -163,8 +166,8 @@ func (probe *HTTPProbe) client(ctx context.Context, baseURL *url.URL, caReferenc
 	}, nil
 }
 
-func resolveProbeAddresses(ctx context.Context, resolver ProbeIPResolver, host string, allowLoopback bool) ([]netip.Addr, error) {
-	addresses, err := egress.ResolvePinnedAddresses(ctx, resolver, host, egress.Policy{AllowLoopback: allowLoopback, AllowPrivate: true})
+func resolveProbeAddresses(ctx context.Context, resolver ProbeIPResolver, host string, allowLoopback bool, allowedPrivatePrefixes []netip.Prefix) ([]netip.Addr, error) {
+	addresses, err := egress.ResolvePinnedAddresses(ctx, resolver, host, egress.Policy{AllowLoopback: allowLoopback, AllowedPrivatePrefixes: allowedPrivatePrefixes})
 	if err != nil {
 		return nil, errors.Join(ErrHTTPProbeDestination, err)
 	}

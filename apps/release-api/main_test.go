@@ -92,6 +92,7 @@ func TestLoadAPIRuntimeConfigParsesValidatedSettings(t *testing.T) {
 		"XMINDS_RELEASE_OBJECT_STORE_REGION":               " cn-east-1 ",
 		"XMINDS_RELEASE_OBJECT_STORE_SESSION_TOKEN":        " session-token ",
 		"XMINDS_RELEASE_ENDPOINT_CA_DIRECTORY":             " /run/secrets/xminds-release/endpoint-cas ",
+		"XMINDS_RELEASE_ENDPOINT_ALLOWED_PRIVATE_CIDRS":    "10.42.7.0/24,fd12:3456:789a::/48",
 		"XMINDS_RELEASE_DEFAULT_PRODUCT_ID":                " ngep ",
 		"XMINDS_RELEASE_DEFAULT_CHANNEL":                   " stable ",
 		"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY":          " " + t.TempDir() + " ",
@@ -101,8 +102,24 @@ func TestLoadAPIRuntimeConfigParsesValidatedSettings(t *testing.T) {
 		t.Fatalf("loadAPIRuntimeConfig() error = %v", err)
 	}
 	if configuration.DefaultProductID != "ngep" || configuration.DefaultChannel != "stable" || configuration.Region != "cn-east-1" ||
-		configuration.EndpointCADirectory != "/run/secrets/xminds-release/endpoint-cas" || !configuration.LocalAuth.UseDevelopmentBreachCorpus {
+		configuration.EndpointCADirectory != "/run/secrets/xminds-release/endpoint-cas" || len(configuration.EndpointAllowedPrivatePrefixes) != 2 || !configuration.LocalAuth.UseDevelopmentBreachCorpus {
 		t.Fatalf("configuration = %+v", configuration)
+	}
+}
+
+func TestLoadAPIRuntimeConfigRejectsUnsafeEndpointPrivateCIDR(t *testing.T) {
+	t.Parallel()
+	_, err := loadAPIRuntimeConfig(map[string]string{
+		"XMINDS_RELEASE_OBJECT_STORE_ACCESS_KEY":           "access-key",
+		"XMINDS_RELEASE_OBJECT_STORE_SECRET_KEY":           "secret-key",
+		"XMINDS_RELEASE_DEFAULT_PRODUCT_ID":                "ngep",
+		"XMINDS_RELEASE_DEFAULT_CHANNEL":                   "stable",
+		"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY":          t.TempDir(),
+		"XMINDS_RELEASE_IAM_USE_DEVELOPMENT_BREACH_CORPUS": "true",
+		"XMINDS_RELEASE_ENDPOINT_ALLOWED_PRIVATE_CIDRS":    "100.64.0.0/10",
+	}, "development")
+	if !errors.Is(err, errAPIRuntimeConfiguration) {
+		t.Fatalf("loadAPIRuntimeConfig() error=%v", err)
 	}
 }
 

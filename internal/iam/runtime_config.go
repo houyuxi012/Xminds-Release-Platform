@@ -2,10 +2,13 @@ package iam
 
 import (
 	"errors"
+	"net/netip"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
+
+	"xminds-release-platform/internal/platform/egress"
 )
 
 var (
@@ -21,7 +24,7 @@ type DirectoryRuntimeConfig struct {
 	MaximumPages               int
 	MaximumObjects             int
 	AllowLoopbackHTTP          bool
-	AllowPrivateNetworks       bool
+	AllowedPrivatePrefixes     []netip.Prefix
 }
 
 type LocalAuthRuntimeConfig struct {
@@ -84,11 +87,10 @@ func LoadDirectoryRuntimeConfig(environ map[string]string, environment string) (
 		return DirectoryRuntimeConfig{}, ErrDirectoryRuntimeConfiguration
 	}
 	configuration.AllowLoopbackHTTP = loopback == "true"
-	privateNetworks := strings.ToLower(strings.TrimSpace(environ["XMINDS_RELEASE_IAM_DIRECTORY_ALLOW_PRIVATE_NETWORKS"]))
-	if privateNetworks != "" && privateNetworks != "true" && privateNetworks != "false" {
+	configuration.AllowedPrivatePrefixes, err = egress.ParseAllowedPrivatePrefixes(environ["XMINDS_RELEASE_IAM_DIRECTORY_ALLOWED_PRIVATE_CIDRS"])
+	if err != nil {
 		return DirectoryRuntimeConfig{}, ErrDirectoryRuntimeConfiguration
 	}
-	configuration.AllowPrivateNetworks = privateNetworks == "true"
 	environment = strings.ToLower(strings.TrimSpace(environment))
 	if configuration.RequestTimeout < minimumDirectoryRequestTimeout || configuration.RequestTimeout > maximumDirectoryRequestTimeout ||
 		configuration.MaximumPages < 1 || configuration.MaximumPages > defaultDirectoryMaximumPages ||

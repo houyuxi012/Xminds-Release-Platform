@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"net/mail"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -36,6 +37,7 @@ const (
 	maximumDirectoryStringBytes    = 512
 
 	scimListResponseSchema = "urn:ietf:params:scim:api:messages:2.0:ListResponse"
+	scimResourceTypeSchema = "urn:ietf:params:scim:schemas:core:2.0:ResourceType"
 	scimUserSchema         = "urn:ietf:params:scim:schemas:core:2.0:User"
 	scimGroupSchema        = "urn:ietf:params:scim:schemas:core:2.0:Group"
 )
@@ -49,25 +51,25 @@ var (
 )
 
 type SecretBackedDirectoryAdapterConfig struct {
-	Secrets              SecretResolver
-	Resolver             egress.IPResolver
-	Dialer               egress.Dialer
-	RequestTimeout       time.Duration
-	MaximumPages         int
-	MaximumObjects       int
-	AllowLoopbackHTTP    bool
-	AllowPrivateNetworks bool
+	Secrets                SecretResolver
+	Resolver               egress.IPResolver
+	Dialer                 egress.Dialer
+	RequestTimeout         time.Duration
+	MaximumPages           int
+	MaximumObjects         int
+	AllowLoopbackHTTP      bool
+	AllowedPrivatePrefixes []netip.Prefix
 }
 
 type SecretBackedDirectoryAdapter struct {
-	secrets              SecretResolver
-	resolver             egress.IPResolver
-	dialer               egress.Dialer
-	requestTimeout       time.Duration
-	maximumPages         int
-	maximumObjects       int
-	allowLoopbackHTTP    bool
-	allowPrivateNetworks bool
+	secrets                SecretResolver
+	resolver               egress.IPResolver
+	dialer                 egress.Dialer
+	requestTimeout         time.Duration
+	maximumPages           int
+	maximumObjects         int
+	allowLoopbackHTTP      bool
+	allowedPrivatePrefixes []netip.Prefix
 }
 
 type oidcDirectorySecret struct {
@@ -114,10 +116,11 @@ type scimServiceProviderConfig struct {
 }
 
 type scimResourceType struct {
-	ID       string `json:"id"`
-	Name     string `json:"name"`
-	Endpoint string `json:"endpoint"`
-	Schema   string `json:"schema"`
+	Schemas  []string `json:"schemas"`
+	ID       string   `json:"id"`
+	Name     string   `json:"name"`
+	Endpoint string   `json:"endpoint"`
+	Schema   string   `json:"schema"`
 }
 
 type scimListResponse struct {
@@ -184,7 +187,7 @@ func NewSecretBackedDirectoryAdapter(config SecretBackedDirectoryAdapterConfig) 
 		secrets: config.Secrets, resolver: config.Resolver, dialer: config.Dialer,
 		requestTimeout: config.RequestTimeout, maximumPages: config.MaximumPages,
 		maximumObjects: config.MaximumObjects, allowLoopbackHTTP: config.AllowLoopbackHTTP,
-		allowPrivateNetworks: config.AllowPrivateNetworks,
+		allowedPrivatePrefixes: append([]netip.Prefix(nil), config.AllowedPrivatePrefixes...),
 	}, nil
 }
 
@@ -192,6 +195,8 @@ func (adapter *SecretBackedDirectoryAdapter) Verify(ctx context.Context, source 
 	if adapter == nil || adapter.secrets == nil || source.ID == [16]byte{} {
 		return CapabilityReport{}, ErrDirectoryConfigurationInvalid
 	}
+	ctx, cancel := adapter.operationContext(ctx)
+	defer cancel()
 	switch source.Kind {
 	case IdentitySourceOIDC:
 		return adapter.verifyOIDC(ctx, source)
@@ -213,6 +218,8 @@ func (adapter *SecretBackedDirectoryAdapter) Sync(ctx context.Context, source Id
 	if adapter == nil || adapter.secrets == nil || source.Kind != IdentitySourceSCIM {
 		return SyncPage{}, ErrDirectoryConfigurationInvalid
 	}
+	ctx, cancel := adapter.operationContext(ctx)
+	defer cancel()
 	configuration, bearer, client, err := adapter.loadSCIM(ctx, source)
 	if err != nil {
 		return SyncPage{}, err
@@ -278,6 +285,15 @@ func (adapter *SecretBackedDirectoryAdapter) Sync(ctx context.Context, source Id
 	}
 	page.Complete = true
 	return page, nil
+}
+
+func (adapter *SecretBackedDirectoryAdapter) operationContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if parent == nil || adapter == nil || adapter.requestTimeout <= 0 {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		return ctx, func() {}
+	}
+	return context.WithTimeout(parent, adapter.requestTimeout)
 }
 
 func (adapter *SecretBackedDirectoryAdapter) verifyOIDC(ctx context.Context, source IdentitySource) (CapabilityReport, error) {
@@ -416,8 +432,8 @@ func (adapter *SecretBackedDirectoryAdapter) newHTTPClient(ctx context.Context, 
 	}
 	wantedHost := strings.ToLower(strings.TrimSuffix(parsedBase.Hostname(), "."))
 	addresses, err := egress.ResolvePinnedAddresses(ctx, adapter.resolver, wantedHost, egress.Policy{
-		AllowLoopback: adapter.allowLoopbackHTTP,
-		AllowPrivate:  adapter.allowPrivateNetworks,
+		AllowLoopback:          adapter.allowLoopbackHTTP,
+		AllowedPrivatePrefixes: adapter.allowedPrivatePrefixes,
 	})
 	if err != nil {
 		return nil, ErrDirectoryConfigurationInvalid
@@ -475,11 +491,7 @@ func (adapter *SecretBackedDirectoryAdapter) getJSON(ctx context.Context, client
 	}
 	limited := io.LimitReader(response.Body, maximumDirectoryResponseBytes+1)
 	contents, err := io.ReadAll(limited)
-	if err != nil || strictjson.ValidateObject(contents, maximumDirectoryResponseBytes) != nil {
-		return ErrDirectoryResponseInvalid
-	}
-	decoder := json.NewDecoder(bytes.NewReader(contents))
-	if err := decoder.Decode(target); err != nil {
+	if err != nil || strictjson.DecodeKnownBytes(contents, maximumDirectoryResponseBytes, target) != nil {
 		return ErrDirectoryResponseInvalid
 	}
 	return nil
@@ -597,11 +609,17 @@ func validClaimName(claim string) bool {
 
 func validSCIMResourceTypes(resources []json.RawMessage) bool {
 	foundUser, foundGroup := false, false
+	seenIDs := make(map[string]struct{}, len(resources))
 	for _, raw := range resources {
 		var resource scimResourceType
-		if json.Unmarshal(raw, &resource) != nil {
+		if strictjson.DecodeKnownBytes(raw, maximumDirectoryResponseBytes, &resource) != nil || !containsString(resource.Schemas, scimResourceTypeSchema) {
 			return false
 		}
+		resource.ID = strings.TrimSpace(resource.ID)
+		if _, duplicate := seenIDs[resource.ID]; resource.ID == "" || duplicate {
+			return false
+		}
+		seenIDs[resource.ID] = struct{}{}
 		switch {
 		case resource.ID == "User" && resource.Name == "User" && resource.Endpoint == "/Users" && resource.Schema == scimUserSchema:
 			foundUser = true
@@ -644,7 +662,7 @@ func normalizeSCIMUsers(resources []json.RawMessage) ([]DirectoryUser, error) {
 	users := make([]DirectoryUser, 0, len(resources))
 	for _, raw := range resources {
 		var external scimUser
-		if json.Unmarshal(raw, &external) != nil || !containsString(external.Schemas, scimUserSchema) {
+		if strictjson.DecodeKnownBytes(raw, maximumDirectoryResponseBytes, &external) != nil || !containsString(external.Schemas, scimUserSchema) {
 			return nil, ErrDirectoryResponseInvalid
 		}
 		external.ID = strings.TrimSpace(external.ID)
@@ -675,7 +693,7 @@ func normalizeSCIMGroups(resources []json.RawMessage) ([]DirectoryOrganization, 
 	parents := make([]DirectoryOrganizationParent, 0)
 	for _, raw := range resources {
 		var group scimGroup
-		if json.Unmarshal(raw, &group) != nil || !containsString(group.Schemas, scimGroupSchema) {
+		if strictjson.DecodeKnownBytes(raw, maximumDirectoryResponseBytes, &group) != nil || !containsString(group.Schemas, scimGroupSchema) {
 			return nil, nil, nil, ErrDirectoryResponseInvalid
 		}
 		group.ID = strings.TrimSpace(group.ID)
@@ -706,24 +724,35 @@ func normalizedSCIMEmail(emails []struct {
 	Value   string `json:"value"`
 	Primary bool   `json:"primary"`
 }) (string, error) {
-	selected := ""
+	first, primary := "", ""
+	primaryCount := 0
 	for _, candidate := range emails {
 		value := strings.ToLower(strings.TrimSpace(candidate.Value))
 		if value == "" {
+			if candidate.Primary {
+				return "", ErrDirectoryResponseInvalid
+			}
 			continue
 		}
 		address, err := mail.ParseAddress(value)
 		if err != nil || address.Address != value || len(value) > 320 {
 			return "", ErrDirectoryResponseInvalid
 		}
-		if selected == "" || candidate.Primary {
-			selected = value
+		if first == "" {
+			first = value
 		}
 		if candidate.Primary {
-			break
+			primaryCount++
+			primary = value
+			if primaryCount > 1 {
+				return "", ErrDirectoryResponseInvalid
+			}
 		}
 	}
-	return selected, nil
+	if primary != "" {
+		return primary, nil
+	}
+	return first, nil
 }
 
 func decodeSCIMCursor(encoded string) (scimCursor, error) {
