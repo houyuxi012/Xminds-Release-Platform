@@ -17,7 +17,6 @@ type Repository interface {
 	SetLoginState(ctx context.Context, tx pgx.Tx, state LoginState, expectedVersion int64) error
 	GetIdentitySource(ctx context.Context, tx pgx.Tx, id uuid.UUID) (IdentitySource, error)
 	SaveIdentitySource(ctx context.Context, tx pgx.Tx, source IdentitySource, expectedVersion int64) error
-	CountUsableEmergencyAdministrators(ctx context.Context, tx pgx.Tx, excluding uuid.UUID, at time.Time) (int, error)
 	GetUser(ctx context.Context, tx pgx.Tx, id uuid.UUID) (UserPrincipal, error)
 	SaveUser(ctx context.Context, tx pgx.Tx, user UserPrincipal, expectedVersion int64) error
 	UserCanBeEnabled(ctx context.Context, tx pgx.Tx, user UserPrincipal) (bool, error)
@@ -34,6 +33,22 @@ type Repository interface {
 	InsertIdentitySource(ctx context.Context, tx pgx.Tx, source IdentitySource) error
 	ListIdentitySources(ctx context.Context, page Page) (IdentitySourcePage, error)
 	UpdateIdentitySourceDraft(ctx context.Context, tx pgx.Tx, source IdentitySource, expectedVersion int64) error
+}
+
+// ScopeCatalogValidator is the authoritative catalog boundary for IAM role
+// scopes. Transactional callers pass their transaction so the validated
+// product/channel remains protected until the role binding is persisted.
+type ScopeCatalogValidator interface {
+	ValidateRoleBindingScope(ctx context.Context, tx pgx.Tx, scope CatalogScope) error
+}
+
+type BreakGlassInvariantRepository interface {
+	LockBreakGlassInvariant(ctx context.Context, tx pgx.Tx) error
+	CountUsableEmergencyAdministrators(ctx context.Context, tx pgx.Tx, at time.Time) (int, error)
+}
+
+type BreakGlassInvariant interface {
+	LockAndRequireUsableAdministrator(ctx context.Context, tx pgx.Tx, at time.Time) error
 }
 
 type AuditAppender interface {

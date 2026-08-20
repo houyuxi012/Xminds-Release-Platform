@@ -223,7 +223,7 @@ func run(ctx context.Context, arguments []string, environ map[string]string) err
 		return fmt.Errorf("configure governed IAM principal resolver: %w", err)
 	}
 	iamService, err := iam.NewService(iam.ServiceConfig{
-		Repository: iamRepository, Auditor: auditor, Sessions: iamRepository, Passwords: iamPasswords,
+		Repository: iamRepository, ScopeCatalog: iamRepository, BreakGlass: iam.NewBreakGlassInvariantAuthority(iamRepository), Auditor: auditor, Sessions: iamRepository, Passwords: iamPasswords,
 		HighRisk: reauthenticationService, Clock: time.Now,
 	})
 	if err != nil {

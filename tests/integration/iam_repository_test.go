@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"xminds-release-platform/internal/audit"
 	"xminds-release-platform/internal/iam"
@@ -215,7 +216,7 @@ INSERT INTO role_bindings (
 	}
 
 	failingService, err := iam.NewService(iam.ServiceConfig{
-		Repository: repository, Auditor: failingIAMAuditAppender{}, Sessions: repository, Passwords: passwords,
+		Repository: repository, ScopeCatalog: repository, BreakGlass: iam.NewBreakGlassInvariantAuthority(repository), Auditor: failingIAMAuditAppender{}, Sessions: repository, Passwords: passwords,
 		HighRisk: integrationHighRiskAuthorizer{}, Clock: func() time.Time { return now },
 	})
 	if err != nil {
@@ -480,6 +481,7 @@ INSERT INTO local_credentials (
 ) VALUES ($1, 'argon2id', 'm=19456,t=1,p=1', decode(repeat('11', 16), 'hex'), decode(repeat('22', 32), 'hex'), 0, $2)`, userID, now.Add(-time.Hour)); err != nil {
 		t.Fatalf("seed high-risk local credential: %v", err)
 	}
+	seedIntegrationUsableEmergencyAdministrator(t, ctx, pool, emergencyID, now)
 	insertSession := func(label string) uuid.UUID {
 		t.Helper()
 		sessionID := uuid.New()
@@ -511,7 +513,7 @@ INSERT INTO local_sessions (
 		t.Fatal(err)
 	}
 	service, err := iam.NewService(iam.ServiceConfig{
-		Repository: repository, Auditor: auditor, Sessions: repository, Passwords: passwords,
+		Repository: repository, ScopeCatalog: repository, BreakGlass: iam.NewBreakGlassInvariantAuthority(repository), Auditor: auditor, Sessions: repository, Passwords: passwords,
 		HighRisk: reauthentication, Clock: func() time.Time { return now },
 	})
 	if err != nil {
@@ -619,7 +621,7 @@ INSERT INTO local_sessions (
 	rollbackSession := insertSession("business-audit-rollback-session")
 	rollbackProof, rollbackRequest := proofFor(iam.ReauthenticationOperationUserRevokeSessions)
 	failingBusiness, err := iam.NewService(iam.ServiceConfig{
-		Repository: repository, Auditor: failingIAMAuditAppender{}, Sessions: repository, Passwords: passwords,
+		Repository: repository, ScopeCatalog: repository, BreakGlass: iam.NewBreakGlassInvariantAuthority(repository), Auditor: failingIAMAuditAppender{}, Sessions: repository, Passwords: passwords,
 		HighRisk: reauthentication, Clock: func() time.Time { return now },
 	})
 	if err != nil {
@@ -638,6 +640,453 @@ INSERT INTO local_sessions (
 	if err := service.RevokeUserSessions(ctx, actor, userID, 3, "replay after rollback", rollbackProof, iam.RequestContext{RequestID: uuid.NewString(), SourceIP: "192.0.2.103"}); !errors.Is(err, iam.ErrHighRiskConfirmationRequired) {
 		t.Fatalf("consumed proof replay error = %v", err)
 	}
+}
+
+func TestIAMPostgresRoleBindingCatalogScopeRejectsTOCTOUAndDirectGhostAuthorization(t *testing.T) {
+	databaseURL := integrationDatabaseURL(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	pool, err := database.Open(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if err := database.ApplyMigrations(ctx, pool, migrations.FS); err != nil {
+		t.Fatalf("ApplyMigrations() error = %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+TRUNCATE TABLE iam_reauthentication_challenges, local_sessions, local_auth_rate_limits, emergency_access_events,
+directory_sync_conflicts, directory_sync_jobs, role_bindings, organization_memberships, organization_units,
+local_password_history, local_credentials, user_principals, iam_login_state, identity_sources CASCADE;
+INSERT INTO iam_login_state (singleton, login_mode, version, updated_by, updated_at)
+VALUES (TRUE, 'local', 1, 'test:bootstrap', clock_timestamp())`); err != nil {
+		t.Fatalf("reset IAM/catalog tables: %v", err)
+	}
+
+	now := time.Date(2026, 8, 20, 20, 0, 0, 0, time.UTC)
+	userID := uuid.New()
+	if _, err := pool.Exec(ctx, `
+INSERT INTO user_principals (id, username, display_name, user_kind, status, version, created_at, updated_at)
+VALUES ($1, 'scope.target', 'Scope Target', 'local', 'active', 1, $2, $2)`, userID, now.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	passwords, err := iam.NewPasswordManager(iam.PasswordPolicyConfig{
+		MinimumLength: 16, MemoryKiB: 19 * 1024, Iterations: 1, Parallelism: 1, SaltBytes: 16, DerivedKeyBytes: 32,
+	}, integrationBreachChecker{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actor := identity.Principal{Subject: "scope.admin", Kind: identity.PrincipalKindHuman, Roles: []identity.Role{identity.RoleAdmin}, TokenID: "scope-admin-token"}
+
+	for name, scopeType := range map[string]iam.ScopeType{"product": iam.ScopeTypeProduct, "channel": iam.ScopeTypeChannel} {
+		t.Run(name+" disappears after preflight", func(t *testing.T) {
+			productID := "scope-" + name + "-" + uuid.NewString()
+			insertIntegrationProduct(t, ctx, pool, productID)
+			channelName := ""
+			if scopeType == iam.ScopeTypeChannel {
+				channelName = "stable"
+				if _, insertErr := pool.Exec(ctx, `
+INSERT INTO product_channels (product_id, name, display_name, position, created_at)
+VALUES ($1, $2, 'Stable', 0, $3)`, productID, channelName, now.Add(-time.Hour)); insertErr != nil {
+					t.Fatal(insertErr)
+				}
+			}
+			blockingProof := &blockingIntegrationHighRiskAuthorizer{reached: make(chan struct{}), release: make(chan struct{})}
+			repository := iam.NewPostgresRepository(pool)
+			service, serviceErr := iam.NewService(iam.ServiceConfig{
+				Repository: repository, ScopeCatalog: repository, BreakGlass: iam.NewBreakGlassInvariantAuthority(repository), Auditor: audit.NewService(audit.NewPostgresRepository(pool)), Sessions: repository,
+				Passwords: passwords, HighRisk: blockingProof, Clock: func() time.Time { return now },
+			})
+			if serviceErr != nil {
+				t.Fatal(serviceErr)
+			}
+			result := make(chan error, 1)
+			go func() {
+				_, createErr := service.CreateRoleBinding(ctx, actor, iam.CreateRoleBindingCommand{
+					SubjectType: iam.SubjectTypeUser, SubjectID: userID, SubjectVersion: 1,
+					Role: identity.RoleViewer, ScopeType: scopeType, ProductID: productID,
+					ChannelName: channelName, Effect: iam.BindingEffectAllow,
+				}, iam.HighRiskProof{Confirmed: true, ChallengeID: "scope", Evidence: "scope"}, iam.RequestContext{RequestID: uuid.NewString(), SourceIP: "192.0.2.120"})
+				result <- createErr
+			}()
+			select {
+			case <-blockingProof.reached:
+			case <-ctx.Done():
+				t.Fatal("role-binding create did not reach proof consumption")
+			}
+			if scopeType == iam.ScopeTypeChannel {
+				_, err = pool.Exec(ctx, `DELETE FROM product_channels WHERE product_id=$1 AND name=$2`, productID, channelName)
+			} else {
+				_, err = pool.Exec(ctx, `DELETE FROM products WHERE id=$1`, productID)
+			}
+			if err != nil {
+				t.Fatalf("remove preflight scope: %v", err)
+			}
+			close(blockingProof.release)
+			if createErr := <-result; !errors.Is(createErr, iam.ErrRoleBindingInvalid) {
+				t.Fatalf("CreateRoleBinding(after scope removal) error = %v", createErr)
+			}
+			if blockingProof.calls.Load() != 1 {
+				t.Fatalf("proof consumption calls = %d", blockingProof.calls.Load())
+			}
+			var bindingCount int
+			if err := pool.QueryRow(ctx, `SELECT count(*) FROM role_bindings WHERE product_id=$1`, productID).Scan(&bindingCount); err != nil {
+				t.Fatal(err)
+			}
+			if bindingCount != 0 {
+				t.Fatalf("ghost role bindings = %d", bindingCount)
+			}
+		})
+	}
+
+	databaseGuardProductID := "scope-db-" + uuid.NewString()
+	insertIntegrationProduct(t, ctx, pool, databaseGuardProductID)
+	ghostBindingID := uuid.New()
+	_, err = pool.Exec(ctx, `
+INSERT INTO role_bindings (
+    id, subject_type, subject_id, role_name, scope_type, product_id, channel_name,
+    effect, valid_from, created_by, version, created_at, updated_at
+) VALUES ($1, 'user', $2, 'viewer', 'channel', $3, 'ghost',
+          'allow', $4, 'database-bypass', 1, $4, $4)`, ghostBindingID, userID, databaseGuardProductID, now)
+	if err == nil {
+		_, _ = pool.Exec(ctx, `DELETE FROM role_bindings WHERE id=$1`, ghostBindingID)
+		t.Fatal("database accepted a channel-scoped ghost role binding")
+	}
+}
+
+func TestIAMPostgresBreakGlassInvariantUsesCredentialAndEffectiveAdministratorAccess(t *testing.T) {
+	databaseURL := integrationDatabaseURL(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	pool, err := database.Open(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if err := database.ApplyMigrations(ctx, pool, migrations.FS); err != nil {
+		t.Fatalf("ApplyMigrations() error = %v", err)
+	}
+	now := time.Date(2026, 8, 20, 21, 0, 0, 0, time.UTC)
+	passwords, err := iam.NewPasswordManager(iam.PasswordPolicyConfig{
+		MinimumLength: 16, MemoryKiB: 19 * 1024, Iterations: 1, Parallelism: 1, SaltBytes: 16, DerivedKeyBytes: 32,
+	}, integrationBreachChecker{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actor := identity.Principal{Subject: "breakglass.admin", Kind: identity.PrincipalKindHuman, Roles: []identity.Role{identity.RoleAdmin}, TokenID: "breakglass-admin-token"}
+
+	for _, test := range []struct {
+		name           string
+		credential     bool
+		inheritedAllow bool
+		directAllow    bool
+		directDeny     bool
+		expiredAllow   bool
+		wantError      bool
+	}{
+		{name: "credential missing", directAllow: true, wantError: true},
+		{name: "administrator binding missing", credential: true, wantError: true},
+		{name: "organization administrator allow", credential: true, inheritedAllow: true},
+		{name: "direct deny overrides organization allow", credential: true, inheritedAllow: true, directDeny: true, wantError: true},
+		{name: "expired administrator allow", credential: true, expiredAllow: true, wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, resetErr := pool.Exec(ctx, `
+TRUNCATE TABLE iam_reauthentication_challenges, local_sessions, local_auth_rate_limits, emergency_access_events,
+directory_sync_conflicts, directory_sync_jobs, role_bindings, organization_memberships, organization_units,
+local_password_history, local_credentials, user_principals, iam_login_state, identity_sources CASCADE;
+INSERT INTO iam_login_state (singleton, login_mode, version, updated_by, updated_at)
+VALUES (TRUE, 'local', 1, 'test:bootstrap', clock_timestamp())`); resetErr != nil {
+				t.Fatal(resetErr)
+			}
+			sourceID, emergencyID, organizationID := uuid.New(), uuid.New(), uuid.New()
+			if _, seedErr := pool.Exec(ctx, `
+INSERT INTO identity_sources (
+    id, name, source_kind, status, required_mappings_complete, verified_at, previewed_at,
+    version, created_at, updated_at
+) VALUES ($1, 'Break Glass OIDC', 'oidc', 'verified', TRUE, $2, $2, 1, $2, $2)`, sourceID, now.Add(-time.Hour)); seedErr != nil {
+				t.Fatal(seedErr)
+			}
+			if _, seedErr := pool.Exec(ctx, `
+INSERT INTO user_principals (
+    id, username, display_name, user_kind, status, mfa_enrolled, credential_rotated_at,
+    version, created_at, updated_at
+) VALUES ($1, 'effective.breakglass', 'Effective Break Glass', 'emergency', 'active', TRUE, $2, 1, $2, $2)`, emergencyID, now.Add(-time.Hour)); seedErr != nil {
+				t.Fatal(seedErr)
+			}
+			if test.credential {
+				if _, seedErr := pool.Exec(ctx, `
+INSERT INTO local_credentials (
+    user_id, algorithm, parameters, salt, derived_key, failed_attempts,
+    password_changed_at, mfa_secret_reference
+) VALUES ($1, 'argon2id', 'm=19456,t=1,p=1,l=32', decode(repeat('11', 16), 'hex'),
+          decode(repeat('22', 32), 'hex'), 0, $2, 'secret://mfa/effective-breakglass')`, emergencyID, now.Add(-time.Hour)); seedErr != nil {
+					t.Fatal(seedErr)
+				}
+			}
+			if test.inheritedAllow {
+				if _, seedErr := pool.Exec(ctx, `
+INSERT INTO organization_units (id, external_id, name, source_owned, status, version, created_at, updated_at)
+VALUES ($1, '', 'Emergency Administrators', FALSE, 'active', 1, $2, $2)`, organizationID, now.Add(-time.Hour)); seedErr != nil {
+					t.Fatal(seedErr)
+				}
+				if _, seedErr := pool.Exec(ctx, `
+INSERT INTO organization_memberships (organization_id, user_id, source_owned, created_at)
+VALUES ($1, $2, FALSE, $3)`, organizationID, emergencyID, now.Add(-time.Hour)); seedErr != nil {
+					t.Fatal(seedErr)
+				}
+				if _, seedErr := pool.Exec(ctx, `
+INSERT INTO role_bindings (
+    id, subject_type, subject_id, role_name, scope_type, effect, valid_from,
+    created_by, version, created_at, updated_at
+) VALUES ($3, 'organization', $1, 'admin', 'platform', 'allow', $2,
+          'test:bootstrap', 1, $2, $2)`, organizationID, now.Add(-time.Hour), uuid.New()); seedErr != nil {
+					t.Fatal(seedErr)
+				}
+			}
+			if test.directAllow || test.directDeny || test.expiredAllow {
+				effect := "allow"
+				validUntil := any(nil)
+				if test.directDeny {
+					effect = "deny"
+				}
+				if test.expiredAllow {
+					validUntil = now.Add(-time.Minute)
+				}
+				if _, seedErr := pool.Exec(ctx, `
+INSERT INTO role_bindings (
+    id, subject_type, subject_id, role_name, scope_type, effect, valid_from, valid_until,
+    created_by, version, created_at, updated_at
+) VALUES ($1, 'user', $2, 'admin', 'platform', $3, $4, $5,
+          'test:bootstrap', 1, $4, $4)`, uuid.New(), emergencyID, effect, now.Add(-time.Hour), validUntil); seedErr != nil {
+					t.Fatal(seedErr)
+				}
+			}
+			repository := iam.NewPostgresRepository(pool)
+			service, serviceErr := iam.NewService(iam.ServiceConfig{
+				Repository: repository, ScopeCatalog: repository, BreakGlass: iam.NewBreakGlassInvariantAuthority(repository), Auditor: audit.NewService(audit.NewPostgresRepository(pool)),
+				Sessions: integrationSessionRevoker{}, Passwords: passwords, HighRisk: integrationHighRiskAuthorizer{}, Clock: func() time.Time { return now },
+			})
+			if serviceErr != nil {
+				t.Fatal(serviceErr)
+			}
+			enableErr := service.EnableSSO(ctx, actor, sourceID, 1,
+				iam.HighRiskProof{Confirmed: true, ChallengeID: "effective", Evidence: "effective"},
+				iam.RequestContext{RequestID: uuid.NewString(), SourceIP: "192.0.2.121"})
+			if test.wantError && !errors.Is(enableErr, iam.ErrSSOPreconditionFailed) {
+				t.Fatalf("EnableSSO() error = %v", enableErr)
+			}
+			if !test.wantError && enableErr != nil {
+				t.Fatalf("EnableSSO() error = %v", enableErr)
+			}
+		})
+	}
+}
+
+func TestIAMPostgresBreakGlassInvariantSerializesConcurrentReductionsAndRollsBackAuditFailure(t *testing.T) {
+	databaseURL := integrationDatabaseURL(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	pool, err := database.Open(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if err := database.ApplyMigrations(ctx, pool, migrations.FS); err != nil {
+		t.Fatalf("ApplyMigrations() error = %v", err)
+	}
+	now := time.Date(2026, 8, 20, 22, 0, 0, 0, time.UTC)
+	passwords, err := iam.NewPasswordManager(iam.PasswordPolicyConfig{
+		MinimumLength: 16, MemoryKiB: 19 * 1024, Iterations: 1, Parallelism: 1, SaltBytes: 16, DerivedKeyBytes: 32,
+	}, integrationBreachChecker{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actor := identity.Principal{Subject: "concurrency.admin", Kind: identity.PrincipalKindHuman, Roles: []identity.Role{identity.RoleAdmin}, TokenID: "concurrency-admin-token"}
+	proof := iam.HighRiskProof{Confirmed: true, ChallengeID: "concurrency", Evidence: "concurrency"}
+	request := func() iam.RequestContext {
+		return iam.RequestContext{RequestID: uuid.NewString(), SourceIP: "192.0.2.122"}
+	}
+	reset := func(t *testing.T) {
+		t.Helper()
+		if _, resetErr := pool.Exec(ctx, `
+TRUNCATE TABLE iam_reauthentication_challenges, local_sessions, local_auth_rate_limits, emergency_access_events,
+directory_sync_conflicts, directory_sync_jobs, role_bindings, organization_memberships, organization_units,
+local_password_history, local_credentials, user_principals, iam_login_state, identity_sources CASCADE;
+INSERT INTO iam_login_state (singleton, login_mode, version, updated_by, updated_at)
+VALUES (TRUE, 'local', 1, 'test:bootstrap', clock_timestamp())`); resetErr != nil {
+			t.Fatal(resetErr)
+		}
+	}
+	seedEmergency := func(t *testing.T, username string) (uuid.UUID, uuid.UUID) {
+		t.Helper()
+		userID, bindingID := uuid.New(), uuid.New()
+		if _, seedErr := pool.Exec(ctx, `
+INSERT INTO user_principals (
+    id, username, display_name, user_kind, status, mfa_enrolled, credential_rotated_at,
+    version, created_at, updated_at
+) VALUES ($1, $2, $2, 'emergency', 'active', TRUE, $3, 1, $3, $3)`, userID, username, now.Add(-time.Hour)); seedErr != nil {
+			t.Fatal(seedErr)
+		}
+		if _, seedErr := pool.Exec(ctx, `
+INSERT INTO local_credentials (
+    user_id, algorithm, parameters, salt, derived_key, failed_attempts,
+    password_changed_at, mfa_secret_reference
+) VALUES ($1, 'argon2id', 'm=19456,t=1,p=1,l=32', decode(repeat('11', 16), 'hex'),
+          decode(repeat('22', 32), 'hex'), 0, $2, 'secret://mfa/concurrent-breakglass')`, userID, now.Add(-time.Hour)); seedErr != nil {
+			t.Fatal(seedErr)
+		}
+		if _, seedErr := pool.Exec(ctx, `
+INSERT INTO role_bindings (
+    id, subject_type, subject_id, role_name, scope_type, effect, valid_from,
+    created_by, version, created_at, updated_at
+) VALUES ($3, 'user', $1, 'admin', 'platform', 'allow', $2,
+          'test:bootstrap', 1, $2, $2)`, userID, now.Add(-time.Hour), bindingID); seedErr != nil {
+			t.Fatal(seedErr)
+		}
+		return userID, bindingID
+	}
+
+	t.Run("two user disables leave one usable emergency administrator", func(t *testing.T) {
+		reset(t)
+		firstID, _ := seedEmergency(t, "concurrent.breakglass.one")
+		secondID, _ := seedEmergency(t, "concurrent.breakglass.two")
+		repository := iam.NewPostgresRepository(pool)
+		auditor := newRendezvousIAMAuditor(audit.NewService(audit.NewPostgresRepository(pool)), "identity.user.disable")
+		service, serviceErr := iam.NewService(iam.ServiceConfig{
+			Repository: repository, ScopeCatalog: repository, BreakGlass: iam.NewBreakGlassInvariantAuthority(repository), Auditor: auditor, Sessions: integrationSessionRevoker{},
+			Passwords: passwords, HighRisk: integrationHighRiskAuthorizer{}, Clock: func() time.Time { return now },
+		})
+		if serviceErr != nil {
+			t.Fatal(serviceErr)
+		}
+		start := make(chan struct{})
+		results := make(chan error, 2)
+		for _, userID := range []uuid.UUID{firstID, secondID} {
+			userID := userID
+			go func() {
+				<-start
+				results <- service.DisableUser(ctx, actor, userID, 1, "concurrent response", proof, request())
+			}()
+		}
+		close(start)
+		successes, invariantFailures := 0, 0
+		for index := 0; index < 2; index++ {
+			resultErr := <-results
+			if resultErr == nil {
+				successes++
+			} else if errors.Is(resultErr, iam.ErrLastEmergencyAdministrator) {
+				invariantFailures++
+			} else {
+				t.Fatalf("DisableUser() error = %v", resultErr)
+			}
+		}
+		var active int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM user_principals WHERE user_kind='emergency' AND status='active'`).Scan(&active); err != nil {
+			t.Fatal(err)
+		}
+		if successes != 1 || invariantFailures != 1 || active != 1 {
+			t.Fatalf("concurrent disable results: success=%d invariant=%d active=%d", successes, invariantFailures, active)
+		}
+	})
+
+	t.Run("SSO enable and user disable cannot jointly remove break glass", func(t *testing.T) {
+		reset(t)
+		emergencyID, _ := seedEmergency(t, "sso.concurrent.breakglass")
+		fakeEmergencyID := uuid.New()
+		if _, seedErr := pool.Exec(ctx, `
+INSERT INTO user_principals (
+    id, username, display_name, user_kind, status, mfa_enrolled, credential_rotated_at,
+    version, created_at, updated_at
+) VALUES ($1, 'sso.concurrent.fake', 'SSO Concurrent Fake', 'emergency', 'active', TRUE, $2, 1, $2, $2)`, fakeEmergencyID, now.Add(-time.Hour)); seedErr != nil {
+			t.Fatal(seedErr)
+		}
+		sourceID := uuid.New()
+		if _, seedErr := pool.Exec(ctx, `
+INSERT INTO identity_sources (
+    id, name, source_kind, status, required_mappings_complete, verified_at, previewed_at,
+    version, created_at, updated_at
+) VALUES ($1, 'Concurrent OIDC', 'oidc', 'verified', TRUE, $2, $2, 1, $2, $2)`, sourceID, now.Add(-time.Hour)); seedErr != nil {
+			t.Fatal(seedErr)
+		}
+		repository := iam.NewPostgresRepository(pool)
+		auditor := newRendezvousIAMAuditor(audit.NewService(audit.NewPostgresRepository(pool)), "identity.user.disable", "identity.sso.enable")
+		service, serviceErr := iam.NewService(iam.ServiceConfig{
+			Repository: repository, ScopeCatalog: repository, BreakGlass: iam.NewBreakGlassInvariantAuthority(repository), Auditor: auditor, Sessions: integrationSessionRevoker{},
+			Passwords: passwords, HighRisk: integrationHighRiskAuthorizer{}, Clock: func() time.Time { return now },
+		})
+		if serviceErr != nil {
+			t.Fatal(serviceErr)
+		}
+		start := make(chan struct{})
+		enableResult, disableResult := make(chan error, 1), make(chan error, 1)
+		go func() {
+			<-start
+			enableResult <- service.EnableSSO(ctx, actor, sourceID, 1, proof, request())
+		}()
+		go func() {
+			<-start
+			disableResult <- service.DisableUser(ctx, actor, emergencyID, 1, "concurrent SSO transition", proof, request())
+		}()
+		close(start)
+		if enableErr := <-enableResult; enableErr != nil {
+			t.Fatalf("EnableSSO() error = %v", enableErr)
+		}
+		if disableErr := <-disableResult; !errors.Is(disableErr, iam.ErrLastEmergencyAdministrator) {
+			t.Fatalf("DisableUser() error = %v", disableErr)
+		}
+		var realStatus iam.UserStatus
+		if err := pool.QueryRow(ctx, `SELECT status FROM user_principals WHERE id=$1`, emergencyID).Scan(&realStatus); err != nil {
+			t.Fatal(err)
+		}
+		if realStatus != iam.UserStatusActive {
+			t.Fatalf("real emergency administrator status = %s", realStatus)
+		}
+	})
+
+	t.Run("deleting last binding fails and audit outage rolls back a safe deletion", func(t *testing.T) {
+		reset(t)
+		firstID, firstBindingID := seedEmergency(t, "delete.breakglass.one")
+		_, secondBindingID := seedEmergency(t, "delete.breakglass.two")
+		repository := iam.NewPostgresRepository(pool)
+		service, serviceErr := iam.NewService(iam.ServiceConfig{
+			Repository: repository, ScopeCatalog: repository, BreakGlass: iam.NewBreakGlassInvariantAuthority(repository), Auditor: failingIAMAuditAppender{}, Sessions: integrationSessionRevoker{},
+			Passwords: passwords, HighRisk: integrationHighRiskAuthorizer{}, Clock: func() time.Time { return now },
+		})
+		if serviceErr != nil {
+			t.Fatal(serviceErr)
+		}
+		if deleteErr := service.DeleteRoleBinding(ctx, actor, firstBindingID, 1, proof, request()); !errors.Is(deleteErr, errIntegrationAuditFailure) {
+			t.Fatalf("DeleteRoleBinding(audit failure) error = %v", deleteErr)
+		}
+		var firstBindingCount int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM role_bindings WHERE id=$1`, firstBindingID).Scan(&firstBindingCount); err != nil {
+			t.Fatal(err)
+		}
+		if firstBindingCount != 1 {
+			t.Fatal("audit failure committed administrator binding deletion")
+		}
+		realService, serviceErr := iam.NewService(iam.ServiceConfig{
+			Repository: repository, ScopeCatalog: repository, BreakGlass: iam.NewBreakGlassInvariantAuthority(repository), Auditor: audit.NewService(audit.NewPostgresRepository(pool)), Sessions: integrationSessionRevoker{},
+			Passwords: passwords, HighRisk: integrationHighRiskAuthorizer{}, Clock: func() time.Time { return now },
+		})
+		if serviceErr != nil {
+			t.Fatal(serviceErr)
+		}
+		if deleteErr := realService.DeleteRoleBinding(ctx, actor, firstBindingID, 1, proof, request()); deleteErr != nil {
+			t.Fatalf("DeleteRoleBinding(first of two) error = %v", deleteErr)
+		}
+		if deleteErr := realService.DeleteRoleBinding(ctx, actor, secondBindingID, 1, proof, request()); !errors.Is(deleteErr, iam.ErrLastEmergencyAdministrator) {
+			t.Fatalf("DeleteRoleBinding(last) error = %v", deleteErr)
+		}
+		var userStatus iam.UserStatus
+		if err := pool.QueryRow(ctx, `SELECT status FROM user_principals WHERE id=$1`, firstID).Scan(&userStatus); err != nil {
+			t.Fatal(err)
+		}
+		if userStatus != iam.UserStatusActive {
+			t.Fatalf("emergency user status = %s", userStatus)
+		}
+	})
 }
 
 func TestIAMSessionTouchAndModeSwitchUsePostgresLoginStateBarrier(t *testing.T) {
@@ -683,6 +1132,7 @@ INSERT INTO user_principals (
 ) VALUES ($1, 'barrier-emergency', 'Barrier Emergency', 'emergency', 'active', TRUE, $2, 1, $2, $2)`, emergencyID, now.Add(-time.Hour)); err != nil {
 		t.Fatalf("seed barrier emergency account: %v", err)
 	}
+	seedIntegrationUsableEmergencyAdministrator(t, ctx, pool, emergencyID, now)
 	if _, err := pool.Exec(ctx, `
 INSERT INTO local_sessions (
     id, token_digest, subject_id, authentication_method, mfa_level, authenticated_at,
@@ -716,7 +1166,7 @@ INSERT INTO local_sessions (
 		t.Fatal(err)
 	}
 	service, err := iam.NewService(iam.ServiceConfig{
-		Repository: repository, Auditor: audit.NewService(audit.NewPostgresRepository(pool)), Sessions: repository,
+		Repository: repository, ScopeCatalog: repository, BreakGlass: iam.NewBreakGlassInvariantAuthority(repository), Auditor: audit.NewService(audit.NewPostgresRepository(pool)), Sessions: repository,
 		Passwords: passwords, HighRisk: integrationHighRiskAuthorizer{}, Clock: func() time.Time { return now },
 	})
 	if err != nil {
@@ -916,6 +1366,7 @@ INSERT INTO user_principals (
 `, emergencyID, now.Add(-time.Hour)); err != nil {
 		t.Fatalf("seed emergency administrator: %v", err)
 	}
+	seedIntegrationUsableEmergencyAdministrator(t, ctx, pool, emergencyID, now)
 
 	repository := iam.NewPostgresRepository(pool)
 	auditor := audit.NewService(audit.NewPostgresRepository(pool))
@@ -926,7 +1377,7 @@ INSERT INTO user_principals (
 		t.Fatal(err)
 	}
 	service, err := iam.NewService(iam.ServiceConfig{
-		Repository: repository, Auditor: auditor, Sessions: integrationSessionRevoker{}, Passwords: passwords, HighRisk: integrationHighRiskAuthorizer{},
+		Repository: repository, ScopeCatalog: repository, BreakGlass: iam.NewBreakGlassInvariantAuthority(repository), Auditor: auditor, Sessions: integrationSessionRevoker{}, Passwords: passwords, HighRisk: integrationHighRiskAuthorizer{},
 		Clock: func() time.Time { return now },
 	})
 	if err != nil {
@@ -1123,7 +1574,7 @@ VALUES (TRUE, 'local', 1, 'test:bootstrap', clock_timestamp())
 	}
 	repository := iam.NewPostgresRepository(pool)
 	service, err := iam.NewService(iam.ServiceConfig{
-		Repository: repository, Auditor: audit.NewService(audit.NewPostgresRepository(pool)), Passwords: passwords, HighRisk: integrationHighRiskAuthorizer{},
+		Repository: repository, ScopeCatalog: repository, BreakGlass: iam.NewBreakGlassInvariantAuthority(repository), Auditor: audit.NewService(audit.NewPostgresRepository(pool)), Passwords: passwords, HighRisk: integrationHighRiskAuthorizer{},
 		Clock: func() time.Time { return now },
 	})
 	if err != nil {
@@ -1196,7 +1647,7 @@ VALUES ($1, 'audit.reader', '审计阅读者', 'local', 'active', 1, $2, $2)`, u
 		t.Fatal(err)
 	}
 	service, err := iam.NewService(iam.ServiceConfig{
-		Repository: repository, Auditor: audit.NewService(audit.NewPostgresRepository(pool)), Passwords: passwords, HighRisk: integrationHighRiskAuthorizer{},
+		Repository: repository, ScopeCatalog: repository, BreakGlass: iam.NewBreakGlassInvariantAuthority(repository), Auditor: audit.NewService(audit.NewPostgresRepository(pool)), Passwords: passwords, HighRisk: integrationHighRiskAuthorizer{},
 		Clock: func() time.Time { return now },
 	})
 	if err != nil {
@@ -1258,6 +1709,37 @@ func (failingIAMAuditAppender) Append(context.Context, pgx.Tx, audit.AppendComma
 	return audit.Event{}, errIntegrationAuditFailure
 }
 
+type rendezvousIAMAuditor struct {
+	delegate iam.AuditAppender
+	actions  map[string]struct{}
+	reached  atomic.Int64
+	ready    chan struct{}
+	once     sync.Once
+}
+
+func newRendezvousIAMAuditor(delegate iam.AuditAppender, actions ...string) *rendezvousIAMAuditor {
+	selected := make(map[string]struct{}, len(actions))
+	for _, action := range actions {
+		selected[action] = struct{}{}
+	}
+	return &rendezvousIAMAuditor{delegate: delegate, actions: selected, ready: make(chan struct{})}
+}
+
+func (auditor *rendezvousIAMAuditor) Append(ctx context.Context, tx pgx.Tx, command audit.AppendCommand) (audit.Event, error) {
+	if _, selected := auditor.actions[command.Action]; selected {
+		if auditor.reached.Add(1) == 2 {
+			auditor.once.Do(func() { close(auditor.ready) })
+		}
+		select {
+		case <-auditor.ready:
+		case <-time.After(500 * time.Millisecond):
+		case <-ctx.Done():
+			return audit.Event{}, ctx.Err()
+		}
+	}
+	return auditor.delegate.Append(ctx, tx, command)
+}
+
 type controlledMFAVerifier struct{ counter atomic.Int64 }
 
 func (verifier *controlledMFAVerifier) Verify(context.Context, string, string) (iam.MFAAssertion, error) {
@@ -1307,6 +1789,23 @@ func (integrationHighRiskAuthorizer) Authorize(context.Context, identity.Princip
 	return nil
 }
 
+type blockingIntegrationHighRiskAuthorizer struct {
+	reached chan struct{}
+	release chan struct{}
+	calls   atomic.Int64
+}
+
+func (authorizer *blockingIntegrationHighRiskAuthorizer) Authorize(ctx context.Context, _ identity.Principal, _ string, _ iam.HighRiskProof, _ iam.RequestContext) error {
+	authorizer.calls.Add(1)
+	close(authorizer.reached)
+	select {
+	case <-authorizer.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 type integrationLocalReauthenticator struct{}
 
 func (integrationLocalReauthenticator) Reauthenticate(context.Context, identity.Principal, iam.CompleteReauthenticationCommand, iam.RequestContext) error {
@@ -1316,4 +1815,28 @@ func (integrationLocalReauthenticator) Reauthenticate(context.Context, identity.
 func integrationSHA256Hex(value string) string {
 	digest := sha256.Sum256([]byte(value))
 	return hex.EncodeToString(digest[:])
+}
+
+func seedIntegrationUsableEmergencyAdministrator(t *testing.T, ctx context.Context, executor interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+}, userID uuid.UUID, now time.Time) uuid.UUID {
+	t.Helper()
+	if _, err := executor.Exec(ctx, `
+INSERT INTO local_credentials (
+    user_id, algorithm, parameters, salt, derived_key, failed_attempts,
+    password_changed_at, mfa_secret_reference
+) VALUES ($1, 'argon2id', 'm=19456,t=1,p=1,l=32', decode(repeat('11', 16), 'hex'),
+          decode(repeat('22', 32), 'hex'), 0, $2, $3)`, userID, now.Add(-time.Hour), "secret://mfa/"+userID.String()); err != nil {
+		t.Fatalf("seed usable emergency credential: %v", err)
+	}
+	bindingID := uuid.New()
+	if _, err := executor.Exec(ctx, `
+INSERT INTO role_bindings (
+    id, subject_type, subject_id, role_name, scope_type, effect, valid_from,
+    created_by, version, created_at, updated_at
+) VALUES ($1, 'user', $2, 'admin', 'platform', 'allow', $3,
+          'test:bootstrap', 1, $3, $3)`, bindingID, userID, now.Add(-time.Hour)); err != nil {
+		t.Fatalf("seed usable emergency administrator binding: %v", err)
+	}
+	return bindingID
 }

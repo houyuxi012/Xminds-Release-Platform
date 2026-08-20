@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -73,6 +74,23 @@ func TestCannotDisableLastUsableEmergencyAdministrator(t *testing.T) {
 	}
 	if harness.repository.users[harness.emergencyAdminID].Status != UserStatusActive {
 		t.Fatal("last emergency administrator was disabled")
+	}
+}
+
+func TestEnableSSORejectsEmergencyAccountWithoutCredentialAndEffectiveAdministratorBinding(t *testing.T) {
+	t.Parallel()
+
+	harness := newIAMHarness(t)
+	delete(harness.repository.credentials, harness.emergencyAdminID)
+	harness.repository.roleBindings = make(map[uuid.UUID]RoleBinding)
+
+	err := harness.service.EnableSSO(context.Background(), harness.admin, harness.sourceID, 1, harness.proof(), harness.request)
+
+	if !errors.Is(err, ErrSSOPreconditionFailed) {
+		t.Fatalf("EnableSSO() error = %v", err)
+	}
+	if harness.repository.login.Mode != LoginModeLocal {
+		t.Fatalf("login mode = %q", harness.repository.login.Mode)
 	}
 }
 
@@ -207,6 +225,64 @@ func TestRoleBindingCreateAndDeleteAreAuditedAndOptimistic(t *testing.T) {
 	}
 }
 
+func TestCreateRoleBindingRejectsUnknownOrOversizedCatalogScopeBeforeProofConsumption(t *testing.T) {
+	t.Parallel()
+
+	for name, scope := range map[string]struct {
+		scopeType   ScopeType
+		productID   string
+		channelName string
+	}{
+		"unknown product":   {scopeType: ScopeTypeProduct, productID: "missing-product"},
+		"unknown channel":   {scopeType: ScopeTypeChannel, productID: "ngep", channelName: "missing-channel"},
+		"oversized product": {scopeType: ScopeTypeProduct, productID: strings.Repeat("p", 129)},
+		"oversized channel": {scopeType: ScopeTypeChannel, productID: "ngep", channelName: strings.Repeat("c", 65)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			harness := newIAMHarness(t)
+			initialBindingCount := len(harness.repository.roleBindings)
+			_, err := harness.service.CreateRoleBinding(context.Background(), harness.admin, CreateRoleBindingCommand{
+				SubjectType: SubjectTypeUser, SubjectID: harness.emergencyAdminID, SubjectVersion: 1,
+				Role: identity.RoleViewer, ScopeType: scope.scopeType, ProductID: scope.productID,
+				ChannelName: scope.channelName, Effect: BindingEffectAllow,
+			}, harness.proof(), harness.request)
+			if !errors.Is(err, ErrRoleBindingInvalid) {
+				t.Fatalf("CreateRoleBinding() error = %v", err)
+			}
+			if len(harness.highRisk.operations) != 0 {
+				t.Fatalf("invalid catalog scope consumed proof: %+v", harness.highRisk.operations)
+			}
+			if len(harness.repository.roleBindings) != initialBindingCount {
+				t.Fatalf("invalid catalog scope persisted binding: %+v", harness.repository.roleBindings)
+			}
+		})
+	}
+}
+
+func TestDeleteLastEffectiveEmergencyAdministratorBindingRollsBack(t *testing.T) {
+	t.Parallel()
+
+	harness := newIAMHarness(t)
+	bindingID := uuid.MustParse("018f835d-7e4b-7abc-9f42-67a2f5f48e14")
+	harness.repository.roleBindings = map[uuid.UUID]RoleBinding{bindingID: {
+		ID: bindingID, SubjectType: SubjectTypeUser, SubjectID: harness.emergencyAdminID,
+		Role: identity.RoleAdmin, ScopeType: ScopeTypePlatform, Effect: BindingEffectAllow,
+		ValidFrom: harness.now.Add(-time.Hour), Version: 1,
+	}}
+
+	err := harness.service.DeleteRoleBinding(context.Background(), harness.admin, bindingID, 1, harness.proof(), harness.request)
+
+	if !errors.Is(err, ErrLastEmergencyAdministrator) {
+		t.Fatalf("DeleteRoleBinding() error = %v", err)
+	}
+	if _, exists := harness.repository.roleBindings[bindingID]; !exists {
+		t.Fatal("last emergency administrator binding was deleted")
+	}
+	if len(harness.highRisk.operations) != 1 {
+		t.Fatalf("business invariant did not consume proof: %+v", harness.highRisk.operations)
+	}
+}
+
 func TestHighRiskWritesFailClosedWithoutServerSideAuthority(t *testing.T) {
 	t.Parallel()
 	harness := newIAMHarness(t)
@@ -262,7 +338,7 @@ func TestUserDisableAndRoleRemovalRollBackWhenSessionRevocationFails(t *testing.
 	t.Run("disable user", func(t *testing.T) {
 		harness := newIAMHarness(t)
 		backupID := uuid.MustParse("018f835d-7e4b-7abc-9f42-67a2f5f48e15")
-		harness.repository.users[backupID] = UserPrincipal{ID: backupID, Username: "backup-break-glass", Kind: UserKindEmergency, Status: UserStatusActive, MFAEnrolled: true, Version: 1}
+		harness.repository.seedUsableEmergencyAdministrator(backupID, "backup-break-glass")
 		harness.sessions.err = revocationFailure
 		err := harness.service.DisableUser(context.Background(), harness.admin, harness.emergencyAdminID, 1, "security response", harness.proof(), harness.request)
 		if !errors.Is(err, revocationFailure) {
@@ -333,6 +409,7 @@ func TestOrganizationRoleRemovalRevokesCurrentMemberSessions(t *testing.T) {
 
 func TestDirectLocalAdministratorGrantRequiresMFAEnrollment(t *testing.T) {
 	harness := newIAMHarness(t)
+	initialBindingCount := len(harness.repository.roleBindings)
 	localID := uuid.MustParse("018f835d-7e4b-7abc-9f42-67a2f5f48e16")
 	harness.repository.users[localID] = UserPrincipal{
 		ID: localID, Username: "local.operator", Kind: UserKindLocal, Status: UserStatusActive, MFAEnrolled: false, Version: 1,
@@ -344,7 +421,7 @@ func TestDirectLocalAdministratorGrantRequiresMFAEnrollment(t *testing.T) {
 	if !errors.Is(err, ErrRoleBindingInvalid) {
 		t.Fatalf("CreateRoleBinding(local admin without MFA) error = %v", err)
 	}
-	if len(harness.repository.roleBindings) != 0 {
+	if len(harness.repository.roleBindings) != initialBindingCount {
 		t.Fatalf("unsafe administrator binding persisted: %+v", harness.repository.roleBindings)
 	}
 	if len(harness.highRisk.operations) != 1 || harness.highRisk.operations[0] != string(ReauthenticationOperationRoleBindingCreate) {
@@ -610,6 +687,7 @@ func newIAMHarness(t *testing.T) *iamHarness {
 	now := time.Date(2026, 8, 20, 8, 0, 0, 0, time.UTC)
 	sourceID := uuid.MustParse("018f835d-7e4b-7abc-9f42-67a2f5f48e11")
 	emergencyID := uuid.MustParse("018f835d-7e4b-7abc-9f42-67a2f5f48e12")
+	emergencyBindingID := uuid.MustParse("018f835d-7e4b-7abc-9f42-67a2f5f48e10")
 	repository := &memoryIAMRepository{
 		login: LoginState{Mode: LoginModeLocal, Version: 1, UpdatedAt: now},
 		sources: map[uuid.UUID]IdentitySource{sourceID: {
@@ -620,15 +698,24 @@ func newIAMHarness(t *testing.T) *iamHarness {
 			ID: emergencyID, Username: "break-glass", Kind: UserKindEmergency, Status: UserStatusActive,
 			MFAEnrolled: true, CredentialRotatedAt: now.Add(-24 * time.Hour), Version: 1,
 		}},
-		credentials:   make(map[uuid.UUID]LocalCredential),
+		credentials: map[uuid.UUID]LocalCredential{emergencyID: {
+			UserID: emergencyID, Password: PasswordDigest{
+				Algorithm: "argon2id", Parameters: "m=19456,t=1,p=1,l=32", Salt: make([]byte, 16), DerivedKey: make([]byte, 32),
+			}, PasswordChangedAt: now.Add(-24 * time.Hour), MFASecretReference: "secret://mfa/break-glass",
+		}},
 		organizations: make(map[uuid.UUID]OrganizationUnit),
-		roleBindings:  make(map[uuid.UUID]RoleBinding),
+		roleBindings: map[uuid.UUID]RoleBinding{emergencyBindingID: {
+			ID: emergencyBindingID, SubjectType: SubjectTypeUser, SubjectID: emergencyID, Role: identity.RoleAdmin,
+			ScopeType: ScopeTypePlatform, Effect: BindingEffectAllow, ValidFrom: now.Add(-24 * time.Hour), Version: 1,
+		}},
+		catalogScopes: map[string]map[string]bool{"ngep": {"stable": true}},
+		memberships:   make(map[uuid.UUID][]uuid.UUID),
 	}
 	auditor := &iamAuditRecorder{}
 	sessions := &iamSessionRecorder{}
 	highRisk := &recordingHighRiskAuthorizer{}
 	service, err := NewService(ServiceConfig{
-		Repository: repository, Auditor: auditor, Sessions: sessions, Passwords: deterministicPasswordManager{}, Directory: iamDirectoryAdapter{}, HighRisk: highRisk,
+		Repository: repository, ScopeCatalog: repository, BreakGlass: NewBreakGlassInvariantAuthority(repository), Auditor: auditor, Sessions: sessions, Passwords: deterministicPasswordManager{}, Directory: iamDirectoryAdapter{}, HighRisk: highRisk,
 		Clock: func() time.Time { return now },
 	})
 	if err != nil {
@@ -654,6 +741,8 @@ type memoryIAMRepository struct {
 	credentials   map[uuid.UUID]LocalCredential
 	organizations map[uuid.UUID]OrganizationUnit
 	roleBindings  map[uuid.UUID]RoleBinding
+	catalogScopes map[string]map[string]bool
+	memberships   map[uuid.UUID][]uuid.UUID
 }
 
 func (repository *memoryIAMRepository) WithinTransaction(_ context.Context, function func(pgx.Tx) error) error {
@@ -727,14 +816,50 @@ func (repository *memoryIAMRepository) SaveIdentitySource(_ context.Context, _ p
 	return nil
 }
 
-func (repository *memoryIAMRepository) CountUsableEmergencyAdministrators(_ context.Context, _ pgx.Tx, excluding uuid.UUID, _ time.Time) (int, error) {
+func (repository *memoryIAMRepository) LockBreakGlassInvariant(context.Context, pgx.Tx) error {
+	return nil
+}
+
+func (repository *memoryIAMRepository) CountUsableEmergencyAdministrators(_ context.Context, _ pgx.Tx, at time.Time) (int, error) {
 	count := 0
+	bindings := make([]RoleBinding, 0, len(repository.roleBindings))
+	for _, binding := range repository.roleBindings {
+		bindings = append(bindings, binding)
+	}
 	for id, user := range repository.users {
-		if id != excluding && user.Kind == UserKindEmergency && user.Status == UserStatusActive && user.MFAEnrolled {
+		credential, exists := repository.credentials[id]
+		if !exists || user.Kind != UserKindEmergency || user.Status != UserStatusActive || !user.MFAEnrolled ||
+			user.CredentialRotatedAt.IsZero() || user.CredentialRotatedAt.Before(at.Add(-emergencyCredentialMaximumAge)) ||
+			credential.PasswordChangedAt.IsZero() || credential.ActivationDigest != "" || credential.MFASecretReference == "" ||
+			(!credential.LockedUntil.IsZero() && credential.LockedUntil.After(at)) {
+			continue
+		}
+		if _, _, _, _, err := parsePasswordDigest(credential.Password); err != nil {
+			continue
+		}
+		if ResolveAccess(user, repository.memberships[id], bindings, at).Allowed(identity.RoleAdmin, "", "") {
 			count++
 		}
 	}
 	return count, nil
+}
+
+func (repository *memoryIAMRepository) seedUsableEmergencyAdministrator(id uuid.UUID, username string) {
+	repository.users[id] = UserPrincipal{
+		ID: id, Username: username, Kind: UserKindEmergency, Status: UserStatusActive, MFAEnrolled: true,
+		CredentialRotatedAt: time.Date(2026, 8, 19, 8, 0, 0, 0, time.UTC), Version: 1,
+	}
+	repository.credentials[id] = LocalCredential{
+		UserID: id, Password: PasswordDigest{
+			Algorithm: "argon2id", Parameters: "m=19456,t=1,p=1,l=32", Salt: make([]byte, 16), DerivedKey: make([]byte, 32),
+		}, PasswordChangedAt: time.Date(2026, 8, 19, 8, 0, 0, 0, time.UTC), MFASecretReference: "secret://mfa/" + username,
+	}
+	bindingID := uuid.NewSHA1(uuid.NameSpaceOID, []byte("test-break-glass:"+id.String()))
+	repository.roleBindings[bindingID] = RoleBinding{
+		ID: bindingID, SubjectType: SubjectTypeUser, SubjectID: id, Role: identity.RoleAdmin,
+		ScopeType: ScopeTypePlatform, Effect: BindingEffectAllow,
+		ValidFrom: time.Date(2026, 8, 19, 8, 0, 0, 0, time.UTC), Version: 1,
+	}
 }
 
 func (repository *memoryIAMRepository) GetUser(_ context.Context, _ pgx.Tx, id uuid.UUID) (UserPrincipal, error) {
@@ -849,6 +974,23 @@ func (repository *memoryIAMRepository) DeleteRoleBinding(_ context.Context, _ pg
 		return ErrIAMConflict
 	}
 	delete(repository.roleBindings, id)
+	return nil
+}
+
+func (repository *memoryIAMRepository) ValidateRoleBindingScope(_ context.Context, _ pgx.Tx, scope CatalogScope) error {
+	if scope.Type == ScopeTypePlatform {
+		return nil
+	}
+	channels, exists := repository.catalogScopes[scope.ProductID]
+	if !exists {
+		return ErrRoleBindingInvalid
+	}
+	if scope.Type == ScopeTypeProduct {
+		return nil
+	}
+	if scope.Type != ScopeTypeChannel || !channels[scope.ChannelName] {
+		return ErrRoleBindingInvalid
+	}
 	return nil
 }
 

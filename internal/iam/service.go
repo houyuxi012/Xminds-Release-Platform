@@ -27,24 +27,28 @@ var identityFaultCodePattern = regexp.MustCompile(`^[A-Z][A-Z0-9_]{2,63}$`)
 var localUsernamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{2,127}$`)
 
 type ServiceConfig struct {
-	Repository Repository
-	Auditor    AuditAppender
-	Sessions   SessionRevoker
-	Passwords  PasswordService
-	Directory  DirectoryAdapter
-	HighRisk   HighRiskAuthorizer
-	Clock      func() time.Time
+	Repository   Repository
+	ScopeCatalog ScopeCatalogValidator
+	BreakGlass   BreakGlassInvariant
+	Auditor      AuditAppender
+	Sessions     SessionRevoker
+	Passwords    PasswordService
+	Directory    DirectoryAdapter
+	HighRisk     HighRiskAuthorizer
+	Clock        func() time.Time
 }
 
 type Service struct {
-	repository Repository
-	auditor    AuditAppender
-	sessions   SessionRevoker
-	passwords  PasswordService
-	directory  DirectoryAdapter
-	highRisk   HighRiskAuthorizer
-	authorizer *identity.Authorizer
-	clock      func() time.Time
+	repository   Repository
+	scopeCatalog ScopeCatalogValidator
+	breakGlass   BreakGlassInvariant
+	auditor      AuditAppender
+	sessions     SessionRevoker
+	passwords    PasswordService
+	directory    DirectoryAdapter
+	highRisk     HighRiskAuthorizer
+	authorizer   *identity.Authorizer
+	clock        func() time.Time
 }
 
 func (service *Service) CreateOrganization(ctx context.Context, actor identity.Principal, command CreateOrganizationCommand, request RequestContext) (OrganizationUnit, error) {
@@ -115,6 +119,9 @@ func (service *Service) CreateRoleBinding(ctx context.Context, actor identity.Pr
 	if command.SubjectVersion < 1 {
 		return RoleBinding{}, ErrRoleBindingInvalid
 	}
+	if err := service.scopeCatalog.ValidateRoleBindingScope(ctx, nil, catalogScopeFromCommand(command)); err != nil {
+		return RoleBinding{}, err
+	}
 	if err := service.validateRoleBindingSubject(ctx, nil, command, false); err != nil {
 		return RoleBinding{}, err
 	}
@@ -131,11 +138,19 @@ func (service *Service) CreateRoleBinding(ctx context.Context, actor identity.Pr
 	}
 	binding := RoleBinding{ID: id, SubjectType: command.SubjectType, SubjectID: command.SubjectID, Role: command.Role, ScopeType: command.ScopeType, ProductID: strings.TrimSpace(command.ProductID), ChannelName: strings.TrimSpace(command.ChannelName), Effect: command.Effect, ValidFrom: command.ValidFrom, ValidUntil: command.ValidUntil, CreatedBy: actor.Subject, Version: 1, CreatedAt: now, UpdatedAt: now}
 	err = service.repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
+		if validationErr := service.scopeCatalog.ValidateRoleBindingScope(ctx, tx, catalogScopeFromCommand(command)); validationErr != nil {
+			return validationErr
+		}
 		if validationErr := service.validateRoleBindingSubject(ctx, tx, command, true); validationErr != nil {
 			return validationErr
 		}
 		if insertErr := service.repository.InsertRoleBinding(ctx, tx, binding); insertErr != nil {
 			return insertErr
+		}
+		if binding.Role == identity.RoleAdmin && binding.ScopeType == ScopeTypePlatform && binding.Effect == BindingEffectDeny {
+			if invariantErr := service.breakGlass.LockAndRequireUsableAdministrator(ctx, tx, now); invariantErr != nil {
+				return invariantErr
+			}
 		}
 		if administratorElevation {
 			if binding.SubjectType == SubjectTypeUser {
@@ -220,6 +235,11 @@ func (service *Service) DeleteRoleBinding(ctx context.Context, actor identity.Pr
 		}
 		if err := service.repository.DeleteRoleBinding(ctx, tx, bindingID, expectedVersion); err != nil {
 			return err
+		}
+		if binding.Role == identity.RoleAdmin && binding.ScopeType == ScopeTypePlatform && binding.Effect == BindingEffectAllow {
+			if invariantErr := service.breakGlass.LockAndRequireUsableAdministrator(ctx, tx, service.clock().UTC().Truncate(time.Microsecond)); invariantErr != nil {
+				return invariantErr
+			}
 		}
 		if binding.SubjectType == SubjectTypeUser {
 			if err := service.sessions.RevokeSubject(ctx, tx, binding.SubjectID, "role binding removed"); err != nil {
@@ -492,11 +512,11 @@ func normalizeEmail(raw string) (string, error) {
 }
 
 func NewService(config ServiceConfig) (*Service, error) {
-	if config.Repository == nil || config.Auditor == nil || config.Passwords == nil || config.Clock == nil {
+	if config.Repository == nil || config.ScopeCatalog == nil || config.BreakGlass == nil || config.Auditor == nil || config.Passwords == nil || config.Clock == nil {
 		return nil, ErrIAMConfiguration
 	}
 	return &Service{
-		repository: config.Repository, auditor: config.Auditor, sessions: config.Sessions, directory: config.Directory, highRisk: config.HighRisk,
+		repository: config.Repository, scopeCatalog: config.ScopeCatalog, breakGlass: config.BreakGlass, auditor: config.Auditor, sessions: config.Sessions, directory: config.Directory, highRisk: config.HighRisk,
 		passwords: config.Passwords, authorizer: identity.NewAuthorizer(), clock: config.Clock,
 	}, nil
 }
@@ -516,6 +536,9 @@ func validateRoleBindingCommand(command CreateRoleBindingCommand) error {
 		return ErrRoleBindingInvalid
 	}
 	productID, channelName := strings.TrimSpace(command.ProductID), strings.TrimSpace(command.ChannelName)
+	if len([]rune(productID)) > 128 || len([]rune(channelName)) > 64 {
+		return ErrRoleBindingInvalid
+	}
 	switch command.ScopeType {
 	case ScopeTypePlatform:
 		if productID != "" || channelName != "" {
@@ -533,6 +556,12 @@ func validateRoleBindingCommand(command CreateRoleBindingCommand) error {
 		return ErrRoleBindingInvalid
 	}
 	return nil
+}
+
+func catalogScopeFromCommand(command CreateRoleBindingCommand) CatalogScope {
+	return CatalogScope{
+		Type: command.ScopeType, ProductID: strings.TrimSpace(command.ProductID), ChannelName: strings.TrimSpace(command.ChannelName),
+	}
 }
 
 func (service *Service) EnableSSO(ctx context.Context, actor identity.Principal, sourceID uuid.UUID, expectedVersion int64, proof HighRiskProof, request RequestContext) error {
@@ -568,15 +597,11 @@ func (service *Service) EnableSSO(ctx context.Context, actor identity.Principal,
 		if err != nil {
 			return err
 		}
-		emergencyCount, err := service.repository.CountUsableEmergencyAdministrators(ctx, tx, uuid.Nil, now)
-		if err != nil {
-			return err
-		}
 		if source.Version != expectedVersion {
 			return ErrIAMConflict
 		}
 		if source.Status != IdentitySourceStatusVerified || source.VerifiedAt.IsZero() || source.PreviewedAt.IsZero() ||
-			!source.RequiredMappingsComplete || emergencyCount < 1 {
+			!source.RequiredMappingsComplete {
 			return ErrSSOPreconditionFailed
 		}
 		previousMode := state.Mode
@@ -599,6 +624,12 @@ func (service *Service) EnableSSO(ctx context.Context, actor identity.Principal,
 		}
 		if err := service.sessions.RevokeRegularLocalSessions(ctx, tx, "login mode changed to sso"); err != nil {
 			return fmt.Errorf("revoke regular local sessions for SSO: %w", err)
+		}
+		if invariantErr := service.breakGlass.LockAndRequireUsableAdministrator(ctx, tx, now); invariantErr != nil {
+			if invariantErr == ErrLastEmergencyAdministrator {
+				return ErrSSOPreconditionFailed
+			}
+			return invariantErr
 		}
 		_, err = service.auditor.Append(ctx, tx, audit.AppendCommand{
 			Actor: actor, Action: "identity.sso.enable", ResourceType: "identity_source", ResourceID: source.ID.String(),
@@ -755,15 +786,6 @@ func (service *Service) DisableUser(ctx context.Context, actor identity.Principa
 		if user.Version != expectedVersion {
 			return ErrIAMConflict
 		}
-		if user.Kind == UserKindEmergency {
-			remaining, err := service.repository.CountUsableEmergencyAdministrators(ctx, tx, user.ID, now)
-			if err != nil {
-				return err
-			}
-			if remaining == 0 {
-				return ErrLastEmergencyAdministrator
-			}
-		}
 		previousStatus := user.Status
 		previousVersion := user.Version
 		user.Status = UserStatusDisabled
@@ -773,6 +795,11 @@ func (service *Service) DisableUser(ctx context.Context, actor identity.Principa
 		user.UpdatedAt = now
 		if err := service.repository.SaveUser(ctx, tx, user, previousVersion); err != nil {
 			return err
+		}
+		if user.Kind == UserKindEmergency {
+			if invariantErr := service.breakGlass.LockAndRequireUsableAdministrator(ctx, tx, now); invariantErr != nil {
+				return invariantErr
+			}
 		}
 		if err := service.sessions.RevokeSubject(ctx, tx, userID, reason); err != nil {
 			return fmt.Errorf("revoke disabled user sessions: %w", err)

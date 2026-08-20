@@ -132,22 +132,91 @@ WHERE id = $1 AND version = $9
 	return nil
 }
 
-func (repository *PostgresRepository) CountUsableEmergencyAdministrators(ctx context.Context, tx pgx.Tx, excluding uuid.UUID, at time.Time) (int, error) {
-	if repository == nil || repository.pool == nil {
+func (repository *PostgresRepository) LockBreakGlassInvariant(ctx context.Context, tx pgx.Tx) error {
+	if repository == nil || repository.pool == nil || tx == nil {
+		return ErrIAMConfiguration
+	}
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('xminds-release-platform:iam:break-glass-invariant', 0))`); err != nil {
+		return fmt.Errorf("lock break-glass invariant: %w", err)
+	}
+	return nil
+}
+
+func (repository *PostgresRepository) CountUsableEmergencyAdministrators(ctx context.Context, tx pgx.Tx, at time.Time) (int, error) {
+	if repository == nil || repository.pool == nil || tx == nil {
 		return 0, ErrIAMConfiguration
 	}
-	queryer := iamQueryer(repository.pool)
-	if tx != nil {
-		queryer = tx
-	}
 	var count int
-	err := queryer.QueryRow(ctx, `
+	err := tx.QueryRow(ctx, `
 SELECT count(*)
-FROM user_principals
-WHERE user_kind = 'emergency' AND status = 'active' AND mfa_enrolled = TRUE
-  AND credential_rotated_at IS NOT NULL AND credential_rotated_at >= $2
-  AND ($1::uuid = '00000000-0000-0000-0000-000000000000'::uuid OR id <> $1)
-`, excluding, at.UTC().Add(-emergencyCredentialMaximumAge)).Scan(&count)
+FROM user_principals AS user_record
+JOIN local_credentials AS credential ON credential.user_id=user_record.id
+CROSS JOIN LATERAL regexp_match(
+    credential.parameters,
+    '^m=([0-9]{1,6}),t=([0-9]{1,2}),p=([0-9]),l=([0-9]{1,2})$'
+) AS parsed
+WHERE user_record.user_kind='emergency'
+  AND user_record.status='active'
+  AND user_record.mfa_enrolled=TRUE
+  AND user_record.credential_rotated_at IS NOT NULL
+  AND user_record.credential_rotated_at >= $2
+  AND credential.algorithm='argon2id'
+  AND credential.activation_digest IS NULL
+  AND credential.password_changed_at IS NOT NULL
+  AND (credential.locked_until IS NULL OR credential.locked_until <= $1)
+  AND credential.mfa_secret_reference <> ''
+  AND octet_length(credential.salt) BETWEEN 16 AND 64
+  AND octet_length(credential.derived_key) BETWEEN 16 AND 64
+  AND parsed[1]::integer BETWEEN 19456 AND 262144
+  AND parsed[2]::integer BETWEEN 1 AND 10
+  AND parsed[3]::integer BETWEEN 1 AND 8
+  AND parsed[4]::integer BETWEEN 16 AND 64
+  AND parsed[4]::integer = octet_length(credential.derived_key)
+  AND credential.parameters = format(
+      'm=%s,t=%s,p=%s,l=%s', parsed[1]::integer, parsed[2]::integer,
+      parsed[3]::integer, parsed[4]::integer
+  )
+  AND EXISTS (
+      SELECT 1
+      FROM role_bindings AS binding
+      WHERE binding.role_name='admin'
+        AND binding.scope_type='platform'
+        AND binding.effect='allow'
+        AND binding.valid_from <= $1
+        AND (binding.valid_until IS NULL OR binding.valid_until > $1)
+        AND (
+            (binding.subject_type='user' AND binding.subject_id=user_record.id)
+            OR (
+                binding.subject_type='organization'
+                AND EXISTS (
+                    SELECT 1 FROM organization_memberships AS membership
+                    WHERE membership.organization_id=binding.subject_id
+                      AND membership.user_id=user_record.id
+                )
+            )
+        )
+  )
+  AND NOT EXISTS (
+      SELECT 1
+      FROM role_bindings AS binding
+      WHERE binding.role_name='admin'
+        AND binding.scope_type='platform'
+        AND binding.effect='deny'
+        AND binding.valid_from <= $1
+        AND (binding.valid_until IS NULL OR binding.valid_until > $1)
+        AND (
+            (binding.subject_type='user' AND binding.subject_id=user_record.id)
+            OR (
+                binding.subject_type='organization'
+                AND EXISTS (
+                    SELECT 1 FROM organization_memberships AS membership
+                    WHERE membership.organization_id=binding.subject_id
+                      AND membership.user_id=user_record.id
+                )
+            )
+        )
+  )
+`, at.UTC(), at.UTC().Add(-emergencyCredentialMaximumAge)).Scan(&count)
 	if err != nil {
 		return 0, fmt.Errorf("count usable emergency administrators: %w", err)
 	}
@@ -380,9 +449,44 @@ func (repository *PostgresRepository) InsertRoleBinding(ctx context.Context, tx 
 	}
 	_, err := tx.Exec(ctx, `
 INSERT INTO role_bindings (id, subject_type, subject_id, role_name, scope_type, product_id, channel_name, effect, valid_from, valid_until, created_by, version, created_at, updated_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`, binding.ID, binding.SubjectType, binding.SubjectID, binding.Role, binding.ScopeType, nullableString(binding.ProductID), nullableString(binding.ChannelName), binding.Effect, binding.ValidFrom.UTC(), nullableTime(binding.ValidUntil), binding.CreatedBy, binding.Version, binding.CreatedAt.UTC(), binding.UpdatedAt.UTC())
+	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`, binding.ID, binding.SubjectType, binding.SubjectID, binding.Role, binding.ScopeType, nullableString(binding.ProductID), nullableString(binding.ChannelName), binding.Effect, binding.ValidFrom.UTC(), nullableTime(binding.ValidUntil), binding.CreatedBy, binding.Version, binding.CreatedAt.UTC(), binding.UpdatedAt.UTC())
 	if err != nil {
+		var postgresError *pgconn.PgError
+		if errors.As(err, &postgresError) && (postgresError.Code == "23503" ||
+			postgresError.ConstraintName == "role_bindings_product_id_length" ||
+			postgresError.ConstraintName == "role_bindings_channel_name_length") {
+			return ErrRoleBindingInvalid
+		}
 		return fmt.Errorf("insert role binding: %w", err)
+	}
+	return nil
+}
+
+func (repository *PostgresRepository) ValidateRoleBindingScope(ctx context.Context, tx pgx.Tx, scope CatalogScope) error {
+	if repository == nil || repository.pool == nil {
+		return ErrIAMConfiguration
+	}
+	if scope.Type == ScopeTypePlatform {
+		return nil
+	}
+	queryer := iamQueryer(repository.pool)
+	query := `SELECT 1 FROM products WHERE id=$1`
+	arguments := []any{scope.ProductID}
+	if scope.Type == ScopeTypeChannel {
+		query = `SELECT 1 FROM product_channels WHERE product_id=$1 AND name=$2`
+		arguments = append(arguments, scope.ChannelName)
+	} else if scope.Type != ScopeTypeProduct {
+		return ErrRoleBindingInvalid
+	}
+	if tx != nil {
+		queryer = tx
+		query += ` FOR KEY SHARE`
+	}
+	var marker int
+	if err := queryer.QueryRow(ctx, query, arguments...).Scan(&marker); errors.Is(err, pgx.ErrNoRows) {
+		return ErrRoleBindingInvalid
+	} else if err != nil {
+		return fmt.Errorf("validate role binding catalog scope: %w", err)
 	}
 	return nil
 }

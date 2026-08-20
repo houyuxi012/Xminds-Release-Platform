@@ -185,6 +185,12 @@ type RoleBinding struct {
 	UpdatedAt   time.Time     `json:"updated_at"`
 }
 
+type CatalogScope struct {
+	Type        ScopeType
+	ProductID   string
+	ChannelName string
+}
+
 type PasswordDigest struct {
 	Algorithm  string
 	Parameters string
