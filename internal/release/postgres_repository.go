@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
+	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -15,6 +18,8 @@ import (
 type PostgresRepository struct {
 	pool *pgxpool.Pool
 }
+
+var publicationFailureCodePattern = regexp.MustCompile(`^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$`)
 
 func NewPostgresRepository(pool *pgxpool.Pool) *PostgresRepository {
 	return &PostgresRepository{pool: pool}
@@ -53,6 +58,19 @@ VALUES ($1, $2, $3, $4)
 func (repository *PostgresRepository) Get(ctx context.Context, productID string, releaseID uuid.UUID) (Release, error) {
 	if repository == nil || repository.pool == nil {
 		return Release{}, ErrRepositoryRequired
+	}
+	return loadRelease(ctx, repository.pool, productID, releaseID)
+}
+
+func (repository *PostgresRepository) GetByID(ctx context.Context, releaseID uuid.UUID) (Release, error) {
+	if repository == nil || repository.pool == nil {
+		return Release{}, ErrRepositoryRequired
+	}
+	var productID string
+	if err := repository.pool.QueryRow(ctx, `SELECT product_id FROM releases WHERE id = $1`, releaseID).Scan(&productID); errors.Is(err, pgx.ErrNoRows) {
+		return Release{}, ErrReleaseNotFound
+	} else if err != nil {
+		return Release{}, fmt.Errorf("find release product: %w", err)
 	}
 	return loadRelease(ctx, repository.pool, productID, releaseID)
 }
@@ -102,12 +120,14 @@ func (repository *PostgresRepository) FindAttempt(ctx context.Context, tx pgx.Tx
 	}
 	var attempt Attempt
 	err := queryer.QueryRow(ctx, `
-SELECT id, release_id, kind, attempt_number, idempotency_key, status, created_by, created_at
+SELECT id, release_id, kind, attempt_number, idempotency_key, status,
+       COALESCE(error_code, ''), created_by, created_at, updated_at
 FROM release_attempts
 WHERE release_id = $1 AND kind = $2 AND idempotency_key = $3
 `, releaseID, kind, idempotencyKey).Scan(
 		&attempt.ID, &attempt.ReleaseID, &attempt.Kind, &attempt.Number,
-		&attempt.IdempotencyKey, &attempt.Status, &attempt.CreatedBy, &attempt.CreatedAt,
+		&attempt.IdempotencyKey, &attempt.Status, &attempt.ErrorCode,
+		&attempt.CreatedBy, &attempt.CreatedAt, &attempt.UpdatedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Attempt{}, ErrAttemptNotFound
@@ -116,6 +136,263 @@ WHERE release_id = $1 AND kind = $2 AND idempotency_key = $3
 		return Attempt{}, fmt.Errorf("find release attempt: %w", err)
 	}
 	return attempt, nil
+}
+
+func (repository *PostgresRepository) GetAttemptByID(ctx context.Context, attemptID uuid.UUID) (Attempt, error) {
+	if repository == nil || repository.pool == nil {
+		return Attempt{}, ErrRepositoryRequired
+	}
+	var attempt Attempt
+	err := repository.pool.QueryRow(ctx, `
+SELECT id, release_id, kind, attempt_number, idempotency_key, status,
+       COALESCE(error_code, ''), created_by, created_at, updated_at
+FROM release_attempts
+WHERE id = $1
+`, attemptID).Scan(
+		&attempt.ID, &attempt.ReleaseID, &attempt.Kind, &attempt.Number,
+		&attempt.IdempotencyKey, &attempt.Status, &attempt.ErrorCode,
+		&attempt.CreatedBy, &attempt.CreatedAt, &attempt.UpdatedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Attempt{}, ErrAttemptNotFound
+	}
+	if err != nil {
+		return Attempt{}, fmt.Errorf("get release attempt: %w", err)
+	}
+	return attempt, nil
+}
+
+func (repository *PostgresRepository) CompletePublication(ctx context.Context, tx pgx.Tx, releaseID, attemptID uuid.UUID, completedAt time.Time) error {
+	if tx == nil {
+		return ErrTransactorRequired
+	}
+	if releaseID == uuid.Nil || attemptID == uuid.Nil || completedAt.IsZero() {
+		return ErrAttemptStateInvalid
+	}
+	var attemptReleaseID uuid.UUID
+	var attemptKind AttemptKind
+	var attemptStatus AttemptStatus
+	if err := tx.QueryRow(ctx, `
+SELECT release_id, kind, status
+FROM release_attempts
+WHERE id = $1
+FOR UPDATE
+`, attemptID).Scan(&attemptReleaseID, &attemptKind, &attemptStatus); errors.Is(err, pgx.ErrNoRows) {
+		return ErrAttemptNotFound
+	} else if err != nil {
+		return fmt.Errorf("lock publication attempt: %w", err)
+	}
+	if attemptReleaseID != releaseID || attemptKind != AttemptKindPublish {
+		return ErrAttemptNotFound
+	}
+	if attemptStatus == AttemptStatusSucceeded {
+		var status Status
+		if err := tx.QueryRow(ctx, `SELECT status FROM releases WHERE id = $1`, releaseID).Scan(&status); err != nil {
+			return fmt.Errorf("get completed publication release: %w", err)
+		}
+		if status == StatusPublished {
+			return nil
+		}
+		return ErrAttemptStateInvalid
+	}
+	if attemptStatus != AttemptStatusPending {
+		return ErrAttemptStateInvalid
+	}
+	completedAt = completedAt.UTC().Truncate(time.Microsecond)
+	result, err := tx.Exec(ctx, `
+UPDATE releases
+SET status = 'PUBLISHED', lock_version = lock_version + 1,
+    publication_failure_code = NULL, updated_at = $2
+WHERE id = $1 AND status = 'PUBLISHING'
+`, releaseID, completedAt)
+	if err != nil {
+		return fmt.Errorf("mark release published: %w", err)
+	}
+	if result.RowsAffected() != 1 {
+		return ErrInvalidTransition
+	}
+	result, err = tx.Exec(ctx, `
+UPDATE release_attempts
+SET status = 'succeeded', error_code = NULL, updated_at = $3
+WHERE id = $1 AND release_id = $2 AND status = 'pending'
+`, attemptID, releaseID, completedAt)
+	if err != nil {
+		return fmt.Errorf("mark publication attempt succeeded: %w", err)
+	}
+	if result.RowsAffected() != 1 {
+		return ErrAttemptStateInvalid
+	}
+	return nil
+}
+
+func (repository *PostgresRepository) CompleteRevocation(ctx context.Context, tx pgx.Tx, releaseID, attemptID uuid.UUID, completedAt time.Time) error {
+	if tx == nil {
+		return ErrTransactorRequired
+	}
+	if releaseID == uuid.Nil || attemptID == uuid.Nil || completedAt.IsZero() {
+		return ErrAttemptStateInvalid
+	}
+	var attemptReleaseID uuid.UUID
+	var kind AttemptKind
+	var status AttemptStatus
+	if err := tx.QueryRow(ctx, `
+SELECT release_id, kind, status
+FROM release_attempts
+WHERE id = $1
+FOR UPDATE
+`, attemptID).Scan(&attemptReleaseID, &kind, &status); errors.Is(err, pgx.ErrNoRows) {
+		return ErrAttemptNotFound
+	} else if err != nil {
+		return fmt.Errorf("lock revocation attempt: %w", err)
+	}
+	if attemptReleaseID != releaseID || kind != AttemptKindRevoke {
+		return ErrAttemptNotFound
+	}
+	if status == AttemptStatusSucceeded {
+		return nil
+	}
+	if status != AttemptStatusPending {
+		return ErrAttemptStateInvalid
+	}
+	var releaseStatus Status
+	var revokedAt *time.Time
+	if err := tx.QueryRow(ctx, `SELECT status, revoked_at FROM releases WHERE id = $1 FOR SHARE`, releaseID).Scan(&releaseStatus, &revokedAt); err != nil {
+		return fmt.Errorf("validate revoked release: %w", err)
+	}
+	if releaseStatus != StatusPublished || revokedAt == nil {
+		return ErrInvalidTransition
+	}
+	result, err := tx.Exec(ctx, `
+UPDATE release_attempts
+SET status = 'succeeded', error_code = NULL, updated_at = $3
+WHERE id = $1 AND release_id = $2 AND status = 'pending'
+`, attemptID, releaseID, completedAt.UTC().Truncate(time.Microsecond))
+	if err != nil {
+		return fmt.Errorf("mark revocation attempt succeeded: %w", err)
+	}
+	if result.RowsAffected() != 1 {
+		return ErrAttemptStateInvalid
+	}
+	return nil
+}
+
+func (repository *PostgresRepository) FailPublication(ctx context.Context, tx pgx.Tx, releaseID, attemptID uuid.UUID, errorCode string, failedAt time.Time) error {
+	if tx == nil {
+		return ErrTransactorRequired
+	}
+	errorCode = strings.TrimSpace(errorCode)
+	if releaseID == uuid.Nil || attemptID == uuid.Nil || failedAt.IsZero() || len(errorCode) > 128 || !publicationFailureCodePattern.MatchString(errorCode) {
+		return ErrAttemptStateInvalid
+	}
+	var attemptReleaseID uuid.UUID
+	var attemptKind AttemptKind
+	var attemptStatus AttemptStatus
+	var existingCode string
+	if err := tx.QueryRow(ctx, `
+SELECT release_id, kind, status, COALESCE(error_code, '')
+FROM release_attempts
+WHERE id = $1
+FOR UPDATE
+`, attemptID).Scan(&attemptReleaseID, &attemptKind, &attemptStatus, &existingCode); errors.Is(err, pgx.ErrNoRows) {
+		return ErrAttemptNotFound
+	} else if err != nil {
+		return fmt.Errorf("lock failed publication attempt: %w", err)
+	}
+	if attemptReleaseID != releaseID || attemptKind != AttemptKindPublish {
+		return ErrAttemptNotFound
+	}
+	if attemptStatus == AttemptStatusFailed {
+		var status Status
+		var releaseCode string
+		if err := tx.QueryRow(ctx, `SELECT status, COALESCE(publication_failure_code, '') FROM releases WHERE id = $1`, releaseID).Scan(&status, &releaseCode); err != nil {
+			return fmt.Errorf("get failed publication release: %w", err)
+		}
+		if status == StatusFailed && existingCode == errorCode && releaseCode == errorCode {
+			return nil
+		}
+		return ErrAttemptStateInvalid
+	}
+	if attemptStatus != AttemptStatusPending {
+		return ErrAttemptStateInvalid
+	}
+	failedAt = failedAt.UTC().Truncate(time.Microsecond)
+	result, err := tx.Exec(ctx, `
+UPDATE releases
+SET status = 'FAILED', lock_version = lock_version + 1,
+    publication_failure_code = $2, updated_at = $3
+WHERE id = $1 AND status = 'PUBLISHING'
+`, releaseID, errorCode, failedAt)
+	if err != nil {
+		return fmt.Errorf("mark release publication failed: %w", err)
+	}
+	if result.RowsAffected() != 1 {
+		return ErrInvalidTransition
+	}
+	result, err = tx.Exec(ctx, `
+UPDATE release_attempts
+SET status = 'failed', error_code = $3, updated_at = $4
+WHERE id = $1 AND release_id = $2 AND status = 'pending'
+`, attemptID, releaseID, errorCode, failedAt)
+	if err != nil {
+		return fmt.Errorf("mark publication attempt failed: %w", err)
+	}
+	if result.RowsAffected() != 1 {
+		return ErrAttemptStateInvalid
+	}
+	return nil
+}
+
+func (repository *PostgresRepository) FailRevocation(ctx context.Context, tx pgx.Tx, releaseID, attemptID uuid.UUID, errorCode string, failedAt time.Time) error {
+	if tx == nil {
+		return ErrTransactorRequired
+	}
+	errorCode = strings.TrimSpace(errorCode)
+	if releaseID == uuid.Nil || attemptID == uuid.Nil || failedAt.IsZero() || len(errorCode) > 128 || !publicationFailureCodePattern.MatchString(errorCode) {
+		return ErrAttemptStateInvalid
+	}
+	var attemptReleaseID uuid.UUID
+	var kind AttemptKind
+	var status AttemptStatus
+	var existingCode string
+	if err := tx.QueryRow(ctx, `
+SELECT release_id, kind, status, COALESCE(error_code, '')
+FROM release_attempts
+WHERE id = $1
+FOR UPDATE
+`, attemptID).Scan(&attemptReleaseID, &kind, &status, &existingCode); errors.Is(err, pgx.ErrNoRows) {
+		return ErrAttemptNotFound
+	} else if err != nil {
+		return fmt.Errorf("lock failed revocation attempt: %w", err)
+	}
+	if attemptReleaseID != releaseID || kind != AttemptKindRevoke {
+		return ErrAttemptNotFound
+	}
+	if status == AttemptStatusFailed && existingCode == errorCode {
+		return nil
+	}
+	if status != AttemptStatusPending {
+		return ErrAttemptStateInvalid
+	}
+	var releaseStatus Status
+	var revokedAt *time.Time
+	if err := tx.QueryRow(ctx, `SELECT status, revoked_at FROM releases WHERE id = $1 FOR SHARE`, releaseID).Scan(&releaseStatus, &revokedAt); err != nil {
+		return fmt.Errorf("validate failed revocation release: %w", err)
+	}
+	if releaseStatus != StatusPublished || revokedAt == nil {
+		return ErrInvalidTransition
+	}
+	result, err := tx.Exec(ctx, `
+UPDATE release_attempts
+SET status = 'failed', error_code = $3, updated_at = $4
+WHERE id = $1 AND release_id = $2 AND status = 'pending'
+`, attemptID, releaseID, errorCode, failedAt.UTC().Truncate(time.Microsecond))
+	if err != nil {
+		return fmt.Errorf("mark revocation attempt failed: %w", err)
+	}
+	if result.RowsAffected() != 1 {
+		return ErrAttemptStateInvalid
+	}
+	return nil
 }
 
 func (repository *PostgresRepository) LockOperation(ctx context.Context, tx pgx.Tx, releaseID uuid.UUID, kind AttemptKind, idempotencyKey string) error {

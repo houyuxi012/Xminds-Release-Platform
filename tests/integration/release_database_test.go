@@ -119,6 +119,33 @@ func TestReleaseDatabaseEnforcesWorkflowIdempotencyAndImmutability(t *testing.T)
 	if attemptCount != 1 || jobCount != 1 || publishAuditCount != 1 {
 		t.Fatalf("attempts=%d jobs=%d publish_audits=%d, want 1/1/1", attemptCount, jobCount, publishAuditCount)
 	}
+	loadedByID, err := repository.GetByID(ctx, created.ID)
+	if err != nil || loadedByID.ID != created.ID {
+		t.Fatalf("GetByID() release=%#v error=%v", loadedByID, err)
+	}
+	loadedAttempt, err := repository.GetAttemptByID(ctx, first.Attempt.ID)
+	if err != nil || loadedAttempt.ID != first.Attempt.ID {
+		t.Fatalf("GetAttemptByID() attempt=%#v error=%v", loadedAttempt, err)
+	}
+	completedAt := time.Now().UTC().Truncate(time.Microsecond)
+	if err := database.WithTx(ctx, pool, func(tx pgx.Tx) error {
+		return repository.CompletePublication(ctx, tx, created.ID, first.Attempt.ID, completedAt)
+	}); err != nil {
+		t.Fatalf("CompletePublication() error = %v", err)
+	}
+	if err := database.WithTx(ctx, pool, func(tx pgx.Tx) error {
+		return repository.CompletePublication(ctx, tx, created.ID, first.Attempt.ID, completedAt)
+	}); err != nil {
+		t.Fatalf("idempotent CompletePublication() error = %v", err)
+	}
+	completedRelease, err := repository.GetByID(ctx, created.ID)
+	if err != nil || completedRelease.Status != releasedomain.StatusPublished {
+		t.Fatalf("completed release=%#v error=%v", completedRelease, err)
+	}
+	completedAttempt, err := repository.GetAttemptByID(ctx, first.Attempt.ID)
+	if err != nil || completedAttempt.Status != releasedomain.AttemptStatusSucceeded {
+		t.Fatalf("completed attempt=%#v error=%v", completedAttempt, err)
+	}
 	if _, err := pool.Exec(ctx, `UPDATE releases SET version = '9.9.9', lock_version = lock_version + 1 WHERE id = $1`, created.ID); err == nil {
 		t.Fatal("immutable release version was updated")
 	}
@@ -162,6 +189,26 @@ func TestReleaseDatabaseEnforcesWorkflowIdempotencyAndImmutability(t *testing.T)
 	}
 	if rollbackAttempts != 0 || rollbackJobs != 0 {
 		t.Fatalf("rolled back attempts=%d jobs=%d, want 0/0", rollbackAttempts, rollbackJobs)
+	}
+	failurePublication, err := service.Publish(ctx, publisher, productID, rollbackRelease.ID, rollbackRelease.LockVersion, "release-dead-letter-12345678", request)
+	if err != nil {
+		t.Fatalf("Publish(dead-letter release) error = %v", err)
+	}
+	failedAt := time.Now().UTC().Truncate(time.Microsecond)
+	for range 2 {
+		if err := database.WithTx(ctx, pool, func(tx pgx.Tx) error {
+			return repository.FailPublication(ctx, tx, rollbackRelease.ID, failurePublication.Attempt.ID, "catalog_signing_failed", failedAt)
+		}); err != nil {
+			t.Fatalf("idempotent FailPublication() error = %v", err)
+		}
+	}
+	failedRelease, err := repository.GetByID(ctx, rollbackRelease.ID)
+	if err != nil || failedRelease.Status != releasedomain.StatusFailed || failedRelease.PublicationFailureCode != "catalog_signing_failed" {
+		t.Fatalf("failed release=%#v error=%v", failedRelease, err)
+	}
+	failedAttempt, err := repository.GetAttemptByID(ctx, failurePublication.Attempt.ID)
+	if err != nil || failedAttempt.Status != releasedomain.AttemptStatusFailed || failedAttempt.ErrorCode != "catalog_signing_failed" {
+		t.Fatalf("failed attempt=%#v error=%v", failedAttempt, err)
 	}
 }
 

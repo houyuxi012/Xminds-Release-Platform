@@ -159,7 +159,23 @@ WHERE kind = 'audit.export.v1' AND aggregate_id = $1
 	if _, err := pool.Exec(ctx, "UPDATE audit_exports SET product_id = 'other-product' WHERE id = $1", export.ID); err == nil {
 		t.Fatal("immutable audit export request fields were updated")
 	}
-	if _, err := pool.Exec(ctx, "UPDATE audit_exports SET status = 'completed', object_key = 'audit/export.json' WHERE id = $1", export.ID); err != nil {
-		t.Fatalf("worker status update failed: %v", err)
+	if _, err := pool.Exec(ctx, "UPDATE audit_exports SET status = 'completed', object_key = 'audit/export.json' WHERE id = $1", export.ID); err == nil {
+		t.Fatal("incomplete worker export update succeeded without digest, size and expiry")
+	}
+	completed := stored
+	completed.Status = audit.ExportStatusCompleted
+	completed.ObjectKey = "audit-exports/" + productID + "/" + export.ID.String() + "/" + strings.Repeat("a", 64) + ".jsonl"
+	completed.SHA256 = strings.Repeat("a", 64)
+	completed.SizeBytes = 128
+	completed.ExpiresAt = time.Now().UTC().Add(time.Hour).Truncate(time.Microsecond)
+	completed.UpdatedAt = time.Now().UTC().Truncate(time.Microsecond)
+	if err := database.WithTx(ctx, pool, func(tx pgx.Tx) error {
+		return repository.CompleteExport(ctx, tx, completed)
+	}); err != nil {
+		t.Fatalf("CompleteExport() error = %v", err)
+	}
+	completedStored, err := repository.GetExport(ctx, export.ID)
+	if err != nil || completedStored.Status != audit.ExportStatusCompleted || completedStored.SHA256 != completed.SHA256 || completedStored.SizeBytes != completed.SizeBytes {
+		t.Fatalf("completed export=%#v error=%v", completedStored, err)
 	}
 }

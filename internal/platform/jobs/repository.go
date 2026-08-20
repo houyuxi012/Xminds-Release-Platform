@@ -19,6 +19,7 @@ var (
 type Repository interface {
 	Enqueue(ctx context.Context, tx pgx.Tx, job Job) error
 	Lease(ctx context.Context, owner string, limit int, lease time.Duration) ([]Job, error)
+	Renew(ctx context.Context, owner string, id uuid.UUID, lease time.Duration) error
 	Complete(ctx context.Context, owner string, id uuid.UUID) error
 	Retry(ctx context.Context, owner string, id uuid.UUID, code string, availableAt time.Time) error
 	DeadLetter(ctx context.Context, owner string, id uuid.UUID, code string) error

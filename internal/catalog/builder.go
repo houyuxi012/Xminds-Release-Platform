@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -37,6 +38,17 @@ type Builder struct {
 	clock    Clock
 }
 
+func (builder *Builder) RootVersion() uint64 {
+	if builder == nil {
+		return 0
+	}
+	version, err := positiveVersion(builder.root.Signed["version"])
+	if err != nil {
+		return 0
+	}
+	return version
+}
+
 func NewBuilder(config BuilderConfig) (*Builder, error) {
 	if config.Provider == nil || config.Resolver == nil || config.Clock == nil || len(config.Root) == 0 {
 		return nil, ErrBuilderConfiguration
@@ -64,6 +76,17 @@ func NewBuilder(config BuilderConfig) (*Builder, error) {
 }
 
 func (builder *Builder) Build(ctx context.Context, record release.Release, versions Versions) (Bundle, error) {
+	return builder.build(ctx, record, versions, false)
+}
+
+func (builder *Builder) BuildRevocation(ctx context.Context, record release.Release, versions Versions) (Bundle, error) {
+	if record.RevokedAt == nil || strings.TrimSpace(record.RevocationReason) == "" {
+		return Bundle{}, ErrTargetInvalid
+	}
+	return builder.build(ctx, record, versions, true)
+}
+
+func (builder *Builder) build(ctx context.Context, record release.Release, versions Versions, allowRevoked bool) (Bundle, error) {
 	if builder == nil || !versions.valid() {
 		return Bundle{}, ErrVersionsInvalid
 	}
@@ -128,7 +151,7 @@ func (builder *Builder) Build(ctx context.Context, record release.Release, versi
 		return Bundle{}, err
 	}
 	bundle := Bundle{Root: append([]byte(nil), builder.root.EnvelopeBytes...), Targets: targets, Snapshot: snapshot, Timestamp: timestamp, Revocation: revocation}
-	if err := Verify(bundle, builder.clock); err != nil {
+	if err := Verify(bundle, builder.clock); err != nil && !(allowRevoked && errors.Is(err, ErrTargetRevoked)) {
 		return Bundle{}, fmt.Errorf("verify generated catalog: %w", err)
 	}
 	return bundle, nil

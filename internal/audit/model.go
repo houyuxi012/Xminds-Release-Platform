@@ -80,9 +80,20 @@ type Export struct {
 	Filter      json.RawMessage
 	Status      ExportStatus
 	ObjectKey   string
+	SHA256      string
+	SizeBytes   int64
+	ExpiresAt   time.Time
 	ErrorCode   string
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
+}
+
+type ExportDownload struct {
+	ExportID  uuid.UUID
+	ObjectKey string
+	SHA256    string
+	SizeBytes int64
+	ExpiresAt time.Time
 }
 
 type StartExportCommand struct {

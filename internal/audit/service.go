@@ -32,6 +32,8 @@ var (
 	ErrExportJobsRequired  = errors.New("audit export job enqueuer is required")
 	ErrExportNotFound      = errors.New("audit export was not found")
 	ErrExportFilterInvalid = errors.New("audit export filter is invalid")
+	ErrExportNotReady      = errors.New("audit export is not ready")
+	ErrExportExpired       = errors.New("audit export has expired")
 )
 
 var auditActionPattern = regexp.MustCompile(`^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)+$`)
@@ -232,6 +234,28 @@ func (service *Service) GetExport(ctx context.Context, principal identity.Princi
 		return Export{}, err
 	}
 	return export, nil
+}
+
+func (service *Service) GetExportDownload(ctx context.Context, principal identity.Principal, id uuid.UUID) (ExportDownload, error) {
+	export, err := service.GetExport(ctx, principal, id)
+	if err != nil {
+		return ExportDownload{}, err
+	}
+	if export.Status != ExportStatusCompleted || export.ObjectKey == "" || export.SHA256 == "" || export.SizeBytes <= 0 || export.ExpiresAt.IsZero() {
+		return ExportDownload{}, ErrExportNotReady
+	}
+	now := service.now().UTC()
+	if !export.ExpiresAt.After(now) {
+		return ExportDownload{}, ErrExportExpired
+	}
+	grantExpiry := now.Add(5 * time.Minute)
+	if export.ExpiresAt.Before(grantExpiry) {
+		grantExpiry = export.ExpiresAt
+	}
+	return ExportDownload{
+		ExportID: export.ID, ObjectKey: export.ObjectKey, SHA256: export.SHA256,
+		SizeBytes: export.SizeBytes, ExpiresAt: grantExpiry,
+	}, nil
 }
 
 func encodeRedactedMetadata(metadata map[string]any) (json.RawMessage, error) {

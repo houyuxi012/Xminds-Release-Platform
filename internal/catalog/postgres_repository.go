@@ -65,12 +65,12 @@ func (repository *PostgresRepository) Create(ctx context.Context, tx pgx.Tx, rec
 	}
 	_, err := tx.Exec(ctx, `
 INSERT INTO catalog_versions (
-    id, product_id, channel_name, release_id,
+    id, publication_attempt_id, product_id, channel_name, release_id,
     root_version, targets_version, snapshot_version, timestamp_version, revocation_version,
     bundle_sha256, created_at
 )
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-`, record.ID, record.ProductID, record.Channel, record.ReleaseID,
+VALUES ($1, NULLIF($2, '00000000-0000-0000-0000-000000000000'::uuid), $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+`, record.ID, record.AttemptID, record.ProductID, record.Channel, record.ReleaseID,
 		record.Versions.Root, record.Versions.Targets, record.Versions.Snapshot, record.Versions.Timestamp, record.Versions.Revocation,
 		record.BundleSHA256, record.CreatedAt.UTC())
 	if err != nil {
@@ -80,14 +80,35 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 		document := record.Roles[role]
 		if _, err := tx.Exec(ctx, `
 INSERT INTO catalog_role_documents (
-    catalog_version_id, role, role_version, envelope_sha256, object_key, signatures
+    catalog_version_id, role, role_version, envelope_sha256, object_key, signatures, envelope_bytes
 )
-VALUES ($1, $2, $3, $4, $5, $6::jsonb)
-`, record.ID, role, document.Version, document.EnvelopeSHA256, document.ObjectKey, document.Signatures); err != nil {
+VALUES ($1, $2, $3, $4, $5, $6::jsonb, NULLIF($7, ''::bytea))
+`, record.ID, role, document.Version, document.EnvelopeSHA256, document.ObjectKey, document.Signatures, document.Envelope); err != nil {
 			return mapCatalogDatabaseError("insert catalog role document", err)
 		}
 	}
 	return nil
+}
+
+func (repository *PostgresRepository) FindByAttempt(ctx context.Context, attemptID uuid.UUID) (VersionRecord, error) {
+	if repository == nil || repository.pool == nil {
+		return VersionRecord{}, ErrRepositoryRequired
+	}
+	if attemptID == uuid.Nil {
+		return VersionRecord{}, ErrVersionRecordNotFound
+	}
+	record, err := scanVersionRecord(repository.pool.QueryRow(ctx, catalogVersionSelect+` WHERE version.publication_attempt_id = $1`, attemptID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return VersionRecord{}, ErrVersionRecordNotFound
+	}
+	if err != nil {
+		return VersionRecord{}, fmt.Errorf("find catalog version by publication attempt: %w", err)
+	}
+	record.Roles, err = loadRoleDocuments(ctx, repository.pool, record.ID)
+	if err != nil {
+		return VersionRecord{}, err
+	}
+	return record, nil
 }
 
 func (repository *PostgresRepository) Get(ctx context.Context, catalogVersionID uuid.UUID) (VersionRecord, error) {
@@ -155,7 +176,8 @@ func (repository *PostgresRepository) Current(ctx context.Context, productID, ch
 }
 
 const catalogVersionSelect = `
-SELECT version.id, version.product_id, version.channel_name, version.release_id,
+SELECT version.id, COALESCE(version.publication_attempt_id, '00000000-0000-0000-0000-000000000000'::uuid),
+       version.product_id, version.channel_name, version.release_id,
        version.root_version, version.targets_version, version.snapshot_version,
        version.timestamp_version, version.revocation_version,
        version.bundle_sha256, version.created_at, version.published_at
@@ -168,7 +190,7 @@ type catalogRow interface {
 func scanVersionRecord(row catalogRow) (VersionRecord, error) {
 	var record VersionRecord
 	err := row.Scan(
-		&record.ID, &record.ProductID, &record.Channel, &record.ReleaseID,
+		&record.ID, &record.AttemptID, &record.ProductID, &record.Channel, &record.ReleaseID,
 		&record.Versions.Root, &record.Versions.Targets, &record.Versions.Snapshot,
 		&record.Versions.Timestamp, &record.Versions.Revocation,
 		&record.BundleSHA256, &record.CreatedAt, &record.PublishedAt,
@@ -182,7 +204,7 @@ type catalogRoleQueryer interface {
 
 func loadRoleDocuments(ctx context.Context, queryer catalogRoleQueryer, catalogVersionID uuid.UUID) (map[Role]RoleDocument, error) {
 	rows, err := queryer.Query(ctx, `
-SELECT role, role_version, envelope_sha256, object_key, signatures
+SELECT role, role_version, envelope_sha256, object_key, signatures, COALESCE(envelope_bytes, ''::bytea)
 FROM catalog_role_documents
 WHERE catalog_version_id = $1
 ORDER BY role
@@ -194,7 +216,7 @@ ORDER BY role
 	result := make(map[Role]RoleDocument, 5)
 	for rows.Next() {
 		var document RoleDocument
-		if err := rows.Scan(&document.Role, &document.Version, &document.EnvelopeSHA256, &document.ObjectKey, &document.Signatures); err != nil {
+		if err := rows.Scan(&document.Role, &document.Version, &document.EnvelopeSHA256, &document.ObjectKey, &document.Signatures, &document.Envelope); err != nil {
 			return nil, fmt.Errorf("scan catalog role document: %w", err)
 		}
 		result[document.Role] = document
@@ -219,6 +241,9 @@ func validateVersionRecord(record VersionRecord) error {
 	for role, version := range expected {
 		document, exists := record.Roles[role]
 		if !exists || document.Role != role || document.Version != version || !unprefixedDigest(document.EnvelopeSHA256) || !validCatalogObjectKey(document.ObjectKey) || !validSignatures(document.Signatures) {
+			return ErrVersionRecordInvalid
+		}
+		if record.AttemptID != uuid.Nil && (len(document.Envelope) == 0 || len(document.Envelope) > maximumRoleEnvelopeBytes) {
 			return ErrVersionRecordInvalid
 		}
 	}

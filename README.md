@@ -30,8 +30,11 @@ Xminds Release Platform 是面向企业软件交付场景的多产品可信发�
 - 严格 Canonical JSON、Ed25519 五角色签名链、跨角色摘要/版本绑定和 NGEP 消费端黄金向量；
 - AES-256-GCM 本地加密 Signing Provider、在线 root 拒绝门禁、单调 Catalog 版本仓储和原子 current pointer；
 - 离线 root 密钥工具及双人控制的[密钥仪式规范](docs/security/key-ceremony.md)。
+- 可续租的持久化 Worker、分级退避重试、五次失败死信和领域状态终结；
+- 五角色目录的不可变对象发布、回读摘要校验、数据库原子 current 切换和崩溃后幂等恢复；
+- 发布后撤销目录、Release/attempt 完成与失败回写，以及 UTF-8 JSONL 审计导出的摘要和过期控制。
 
-当前运行时只开放存活、就绪和版本端点。产品、制品和 Release HTTP 适配器已经完成并强制从请求上下文获取已验证身份；在运行时组合根完成 OIDC/工作负载身份配置前不会挂载业务路由，避免暴露未受保护的管理接口。
+当前 API 运行时只开放存活、就绪和版本端点。产品、制品和 Release HTTP 适配器已经完成并强制从请求上下文获取已验证身份；在 API 组合根完成 OIDC/工作负载身份配置前不会挂载业务路由，避免暴露未受保护的管理接口。Worker 已挂载目录发布、目录撤销和审计导出处理器，所有签名材料与对象存储凭据必须在启动时显式注入，否则拒绝运行。
 
 ## P0 能力范围
 
@@ -85,6 +88,7 @@ make verify
 ```bash
 go run ./apps/release-api migrate
 go run ./apps/release-api serve
+go run ./apps/release-worker
 ```
 
 默认管理 API 监听 `127.0.0.1:8080`，可访问：
@@ -93,7 +97,7 @@ go run ./apps/release-api serve
 - `GET /health/ready`：PostgreSQL 就绪检查；
 - `GET /version`：构建版本信息。
 
-Worker 目前保持安全关闭，直到具体领域作业处理器完成后才会进入消费循环。
+Worker 依赖预先执行的数据库迁移、可用的 S3/MinIO 桶、经签名的 `root.json`、四类在线角色加密私钥和 32 字节主密钥文件。完整变量见 [`.env.example`](.env.example)，root 与在线密钥边界见[密钥仪式规范](docs/security/key-ceremony.md)。
 
 ## PostgreSQL 集成测试
 

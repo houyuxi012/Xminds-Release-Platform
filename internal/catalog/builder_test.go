@@ -162,6 +162,46 @@ func TestBuilderProducesVerifiableExactFiveRoleBundleWithRequiredTargetFields(t 
 	}
 }
 
+func TestBuilderProducesSignedRevocationBundleThatRejectsRevokedTarget(t *testing.T) {
+	t.Parallel()
+
+	provider := newDeterministicProvider()
+	now := time.Date(2026, 8, 20, 7, 0, 0, 0, time.UTC)
+	descriptor := validTargetMetadata(t)
+	builder, err := NewBuilder(BuilderConfig{
+		Root: provider.rootEnvelope(t, now.Add(365*24*time.Hour), 3), Provider: provider,
+		KeyRefs: RoleKeyRefs{
+			Targets: []string{"targets-online"}, Snapshot: []string{"snapshot-online"},
+			Timestamp: []string{"timestamp-online"}, Revocation: []string{"revocation-online"},
+		},
+		Resolver: TargetResolverFunc(func(context.Context, release.Release) (TargetMetadata, error) { return descriptor, nil }),
+		Clock:    func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	revokedAt := now.Add(-time.Minute)
+	bundle, err := builder.BuildRevocation(context.Background(), release.Release{
+		ID: uuid.New(), RevokedAt: &revokedAt, RevocationReason: "critical signing compromise",
+	}, Versions{Root: 3, Targets: 8, Snapshot: 10, Timestamp: 12, Revocation: 14})
+	if err != nil {
+		t.Fatalf("BuildRevocation() error = %v", err)
+	}
+	if err := Verify(bundle, func() time.Time { return now.Add(time.Minute) }); !errors.Is(err, ErrTargetRevoked) {
+		t.Fatalf("revocation bundle verification error = %v, want %v", err, ErrTargetRevoked)
+	}
+	for role, want := range map[Role]uint64{RoleTargets: 8, RoleSnapshot: 10, RoleTimestamp: 12, RoleRevocation: 14} {
+		envelope, parseErr := parseEnvelope(bundle.Roles()[role])
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		got, parseErr := positiveVersion(envelope.Signed["version"])
+		if parseErr != nil || got != want {
+			t.Fatalf("%s version = %d, want %d (error=%v)", role, got, want, parseErr)
+		}
+	}
+}
+
 func validTargetMetadata(t *testing.T) TargetMetadata {
 	t.Helper()
 	notes := "# 1.2.3\n\n- 企业级发布。\n"

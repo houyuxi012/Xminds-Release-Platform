@@ -106,6 +106,12 @@ func TestPlatformDatabaseConcurrentLeasesAreDisjoint(t *testing.T) {
 	if ownedJob == uuid.Nil {
 		t.Fatal("worker-a did not lease a job")
 	}
+	if err := repository.Renew(ctx, "worker-b", ownedJob, time.Minute); !errors.Is(err, jobs.ErrLeaseNotOwned) {
+		t.Fatalf("wrong-owner Renew() error = %v, want %v", err, jobs.ErrLeaseNotOwned)
+	}
+	if err := repository.Renew(ctx, "worker-a", ownedJob, time.Minute); err != nil {
+		t.Fatalf("owner Renew() error = %v", err)
+	}
 	if err := repository.Complete(ctx, "worker-b", ownedJob); !errors.Is(err, jobs.ErrLeaseNotOwned) {
 		t.Fatalf("wrong-owner Complete() error = %v, want %v", err, jobs.ErrLeaseNotOwned)
 	}

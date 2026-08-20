@@ -26,10 +26,12 @@ type RoleDocument struct {
 	EnvelopeSHA256 string
 	ObjectKey      string
 	Signatures     json.RawMessage
+	Envelope       []byte
 }
 
 type VersionRecord struct {
 	ID           uuid.UUID
+	AttemptID    uuid.UUID
 	ProductID    string
 	Channel      string
 	ReleaseID    uuid.UUID
@@ -46,4 +48,5 @@ type Repository interface {
 	Get(ctx context.Context, catalogVersionID uuid.UUID) (VersionRecord, error)
 	SetCurrent(ctx context.Context, tx pgx.Tx, productID, channel string, catalogVersionID uuid.UUID, switchedAt time.Time) error
 	Current(ctx context.Context, productID, channel string) (VersionRecord, error)
+	FindByAttempt(ctx context.Context, attemptID uuid.UUID) (VersionRecord, error)
 }

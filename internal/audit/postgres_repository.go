@@ -206,10 +206,12 @@ func (repository *PostgresRepository) GetExport(ctx context.Context, id uuid.UUI
 		return Export{}, ErrRepositoryRequired
 	}
 	var export Export
+	var expiresAt *time.Time
 	err := repository.pool.QueryRow(ctx, `
 SELECT
     id, product_id, requested_by, request_id, filter, status,
-    object_key, error_code, created_at, updated_at
+    object_key, COALESCE(sha256, ''), COALESCE(size_bytes, 0), expires_at,
+    error_code, created_at, updated_at
 FROM audit_exports
 WHERE id = $1
 `, id).Scan(
@@ -220,6 +222,9 @@ WHERE id = $1
 		&export.Filter,
 		&export.Status,
 		&export.ObjectKey,
+		&export.SHA256,
+		&export.SizeBytes,
+		&expiresAt,
 		&export.ErrorCode,
 		&export.CreatedAt,
 		&export.UpdatedAt,
@@ -230,7 +235,63 @@ WHERE id = $1
 	if err != nil {
 		return Export{}, fmt.Errorf("get audit export: %w", err)
 	}
+	if expiresAt != nil {
+		export.ExpiresAt = expiresAt.UTC()
+	}
 	return export, nil
+}
+
+func (repository *PostgresRepository) CompleteExport(ctx context.Context, tx pgx.Tx, completed Export) error {
+	if tx == nil {
+		return ErrTransactionRequired
+	}
+	if completed.ID == uuid.Nil || completed.ObjectKey == "" || len(completed.SHA256) != 64 || completed.SizeBytes <= 0 || completed.ExpiresAt.IsZero() || completed.UpdatedAt.IsZero() {
+		return ErrExportFilterInvalid
+	}
+	result, err := tx.Exec(ctx, `
+UPDATE audit_exports
+SET status = 'completed', object_key = $2, sha256 = $3, size_bytes = $4,
+    expires_at = $5, error_code = '', updated_at = $6
+WHERE id = $1 AND status = 'pending'
+`, completed.ID, completed.ObjectKey, completed.SHA256, completed.SizeBytes,
+		completed.ExpiresAt.UTC(), completed.UpdatedAt.UTC())
+	if err != nil {
+		return fmt.Errorf("complete audit export: %w", err)
+	}
+	if result.RowsAffected() != 1 {
+		current, getErr := repository.GetExport(ctx, completed.ID)
+		if getErr == nil && current.Status == ExportStatusCompleted && current.ObjectKey == completed.ObjectKey && current.SHA256 == completed.SHA256 {
+			return nil
+		}
+		return ErrExportNotReady
+	}
+	return nil
+}
+
+func (repository *PostgresRepository) FailExport(ctx context.Context, tx pgx.Tx, id uuid.UUID, code string, failedAt time.Time) error {
+	if tx == nil {
+		return ErrTransactionRequired
+	}
+	code = strings.TrimSpace(code)
+	if id == uuid.Nil || code == "" || len(code) > 128 || failedAt.IsZero() {
+		return ErrExportFilterInvalid
+	}
+	result, err := tx.Exec(ctx, `
+UPDATE audit_exports
+SET status = 'failed', error_code = $2, updated_at = $3
+WHERE id = $1 AND status = 'pending'
+`, id, code, failedAt.UTC())
+	if err != nil {
+		return fmt.Errorf("fail audit export: %w", err)
+	}
+	if result.RowsAffected() != 1 {
+		current, getErr := repository.GetExport(ctx, id)
+		if getErr == nil && current.Status == ExportStatusFailed && current.ErrorCode == code {
+			return nil
+		}
+		return ErrExportNotReady
+	}
+	return nil
 }
 
 func calculateEventHash(event Event) (string, error) {

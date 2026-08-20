@@ -100,6 +100,67 @@ func TestPostgresRepositoryPersistsAndReadsCompleteCatalogVersion(t *testing.T) 
 	}
 }
 
+func TestPostgresRepositoryFindsCrashRecoveryEnvelopeByPublicationAttempt(t *testing.T) {
+	databaseURL := catalogIntegrationDatabaseURL(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool, err := database.Open(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if err := database.ApplyMigrations(ctx, pool, migrations.FS); err != nil {
+		t.Fatal(err)
+	}
+	productID := "catalog-attempt-" + uuid.NewString()
+	releaseID := insertCatalogPackageScope(t, ctx, pool, productID)
+	attemptID := uuid.Must(uuid.NewV7())
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	if _, err := pool.Exec(ctx, `
+INSERT INTO release_attempts (
+    id, release_id, kind, attempt_number, idempotency_key, status, created_by, created_at, updated_at
+) VALUES ($1, $2, 'publish', 1, 'catalog-attempt-recovery', 'pending', 'publisher', $3, $3)
+`, attemptID, releaseID, now); err != nil {
+		t.Fatal(err)
+	}
+	repository := NewPostgresRepository(pool)
+	var versions Versions
+	if err := database.WithTx(ctx, pool, func(tx pgx.Tx) error {
+		var reserveErr error
+		versions, reserveErr = repository.ReserveVersions(ctx, tx, productID, "stable", 1)
+		return reserveErr
+	}); err != nil {
+		t.Fatal(err)
+	}
+	record := validRepositoryRecord()
+	record.ProductID = productID
+	record.Channel = "stable"
+	record.ReleaseID = releaseID
+	record.AttemptID = attemptID
+	record.Versions = versions
+	for role, version := range map[Role]uint64{RoleRoot: versions.Root, RoleTargets: versions.Targets, RoleSnapshot: versions.Snapshot, RoleTimestamp: versions.Timestamp, RoleRevocation: versions.Revocation} {
+		document := record.Roles[role]
+		document.Version = version
+		document.Envelope = []byte(`{"signed":{"_type":"` + string(role) + `"},"signatures":[{"keyid":"test","sig":"test"}]}`)
+		record.Roles[role] = document
+	}
+	if err := database.WithTx(ctx, pool, func(tx pgx.Tx) error { return repository.Create(ctx, tx, record) }); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := repository.FindByAttempt(ctx, attemptID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.ID != record.ID || stored.AttemptID != attemptID {
+		t.Fatalf("stored record = %+v", stored)
+	}
+	for role, document := range stored.Roles {
+		if len(document.Envelope) == 0 {
+			t.Fatalf("role %s envelope is empty", role)
+		}
+	}
+}
+
 func TestPostgresRepositoryRejectsMissingDependenciesAndTransactions(t *testing.T) {
 	var repository *PostgresRepository
 	if _, err := repository.Get(context.Background(), uuid.New()); !errors.Is(err, ErrRepositoryRequired) {

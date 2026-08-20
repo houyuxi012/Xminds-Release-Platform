@@ -39,6 +39,7 @@ var (
 	ErrIdempotencyKeyInvalid    = errors.New("release idempotency key is invalid")
 	ErrAttemptNotFound          = errors.New("release attempt was not found")
 	ErrAttemptAlreadyExists     = errors.New("release idempotency key already exists")
+	ErrAttemptStateInvalid      = errors.New("release attempt state is invalid")
 	ErrRevocationReasonRequired = errors.New("release revocation reason is required")
 	ErrRejectionReasonRequired  = errors.New("release rejection reason is required")
 	ErrReleaseAlreadyRevoked    = errors.New("release is already revoked")
@@ -133,7 +134,9 @@ const (
 type AttemptStatus string
 
 const (
-	AttemptStatusPending AttemptStatus = "pending"
+	AttemptStatusPending   AttemptStatus = "pending"
+	AttemptStatusSucceeded AttemptStatus = "succeeded"
+	AttemptStatusFailed    AttemptStatus = "failed"
 )
 
 type Attempt struct {
@@ -143,8 +146,10 @@ type Attempt struct {
 	Number         int           `json:"number"`
 	IdempotencyKey string        `json:"idempotency_key"`
 	Status         AttemptStatus `json:"status"`
+	ErrorCode      string        `json:"error_code,omitempty"`
 	CreatedBy      string        `json:"created_by"`
 	CreatedAt      time.Time     `json:"created_at"`
+	UpdatedAt      time.Time     `json:"updated_at"`
 }
 
 type OperationResult struct {

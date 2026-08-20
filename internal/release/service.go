@@ -377,7 +377,7 @@ func newAttempt(releaseID uuid.UUID, kind AttemptKind, idempotencyKey string, ac
 	}
 	return Attempt{
 		ID: attemptID, ReleaseID: releaseID, Kind: kind, IdempotencyKey: idempotencyKey,
-		Status: AttemptStatusPending, CreatedBy: strings.TrimSpace(actor), CreatedAt: now,
+		Status: AttemptStatusPending, CreatedBy: strings.TrimSpace(actor), CreatedAt: now, UpdatedAt: now,
 	}, nil
 }
 

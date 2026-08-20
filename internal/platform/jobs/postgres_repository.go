@@ -93,6 +93,30 @@ WHERE id = $1 AND status = 'leased' AND lease_owner = $2
 `)
 }
 
+func (repository *PostgresRepository) Renew(ctx context.Context, owner string, id uuid.UUID, lease time.Duration) error {
+	owner = strings.TrimSpace(owner)
+	if owner == "" {
+		return ErrLeaseOwnerRequired
+	}
+	if lease <= 0 || lease > 24*time.Hour {
+		return ErrLeaseInvalid
+	}
+	result, err := repository.pool.Exec(ctx, `
+UPDATE outbox_jobs
+SET lease_expires_at = clock_timestamp() + ($3 * interval '1 millisecond'),
+    updated_at = clock_timestamp()
+WHERE id = $1 AND status = 'leased' AND lease_owner = $2
+  AND lease_expires_at > clock_timestamp()
+`, id, owner, lease.Milliseconds())
+	if err != nil {
+		return fmt.Errorf("renew outbox job lease: %w", err)
+	}
+	if result.RowsAffected() != 1 {
+		return ErrLeaseNotOwned
+	}
+	return nil
+}
+
 func (repository *PostgresRepository) Retry(ctx context.Context, owner string, id uuid.UUID, code string, availableAt time.Time) error {
 	if availableAt.IsZero() {
 		return ErrAvailableAtInvalid
