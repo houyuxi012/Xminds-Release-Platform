@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -118,7 +119,8 @@ type SecretResolver interface {
 }
 
 type DirectorySecretResolver struct {
-	root string
+	mutex sync.RWMutex
+	root  *os.File
 }
 
 func NewDirectorySecretResolver(root string) (*DirectorySecretResolver, error) {
@@ -127,16 +129,19 @@ func NewDirectorySecretResolver(root string) (*DirectorySecretResolver, error) {
 		return nil, ErrSecretReferenceInvalid
 	}
 	clean := filepath.Clean(root)
-	directory, err := openNoFollow(clean, true)
+	directory, err := openDirectoryPathNoFollow(clean)
 	if err != nil {
 		return nil, ErrSecretReferenceInvalid
 	}
-	_ = directory.Close()
-	return &DirectorySecretResolver{root: clean}, nil
+	if !trustedDirectoryDescriptor(directory) {
+		_ = directory.Close()
+		return nil, ErrSecretReferenceInvalid
+	}
+	return &DirectorySecretResolver{root: directory}, nil
 }
 
 func (resolver *DirectorySecretResolver) Resolve(_ context.Context, reference string) ([]byte, error) {
-	if resolver == nil || resolver.root == "" {
+	if resolver == nil {
 		return nil, ErrSecretReferenceInvalid
 	}
 	const prefix = "secret://iam/"
@@ -144,12 +149,12 @@ func (resolver *DirectorySecretResolver) Resolve(_ context.Context, reference st
 	if !found || name == "" || name != filepath.Base(name) || strings.ContainsAny(name, `/\\`) {
 		return nil, ErrSecretReferenceInvalid
 	}
-	root, err := openNoFollow(resolver.root, true)
-	if err != nil {
+	resolver.mutex.RLock()
+	defer resolver.mutex.RUnlock()
+	if !trustedDirectoryDescriptor(resolver.root) {
 		return nil, ErrSecretReferenceInvalid
 	}
-	defer root.Close()
-	fd, err := unix.Openat(int(root.Fd()), name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	fd, err := unix.Openat(int(resolver.root.Fd()), name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, ErrSecretReferenceInvalid
 	}
@@ -160,7 +165,7 @@ func (resolver *DirectorySecretResolver) Resolve(_ context.Context, reference st
 	}
 	defer secret.Close()
 	info, err := secret.Stat()
-	if err != nil || !info.Mode().IsRegular() || info.Mode()&0o077 != 0 || info.Size() <= 0 || info.Size() > 4096 {
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 || info.Size() <= 0 || info.Size() > 4096 || !trustedDescriptorOwner(secret) {
 		return nil, ErrSecretReferenceInvalid
 	}
 	contents, err := io.ReadAll(io.LimitReader(secret, 4097))
@@ -170,26 +175,75 @@ func (resolver *DirectorySecretResolver) Resolve(_ context.Context, reference st
 	return []byte(strings.TrimSpace(string(contents))), nil
 }
 
-func openNoFollow(path string, directory bool) (*os.File, error) {
-	flags := unix.O_RDONLY | unix.O_CLOEXEC | unix.O_NOFOLLOW
-	if directory {
-		flags |= unix.O_DIRECTORY
+func (resolver *DirectorySecretResolver) Close() error {
+	if resolver == nil {
+		return nil
 	}
-	fd, err := unix.Open(path, flags, 0)
+	resolver.mutex.Lock()
+	defer resolver.mutex.Unlock()
+	if resolver.root == nil {
+		return nil
+	}
+	err := resolver.root.Close()
+	resolver.root = nil
+	return err
+}
+
+func openDirectoryPathNoFollow(path string) (*os.File, error) {
+	current, err := openDirectoryAt(unix.AT_FDCWD, string(filepath.Separator))
 	if err != nil {
 		return nil, err
 	}
-	file := os.NewFile(uintptr(fd), path)
+	relative := strings.TrimPrefix(filepath.Clean(path), string(filepath.Separator))
+	if relative == "" {
+		return current, nil
+	}
+	for _, component := range strings.Split(relative, string(filepath.Separator)) {
+		next, openErr := openDirectoryAt(int(current.Fd()), component)
+		_ = current.Close()
+		if openErr != nil {
+			return nil, openErr
+		}
+		current = next
+	}
+	return current, nil
+}
+
+func openDirectoryAt(parentFD int, name string) (*os.File, error) {
+	fd, err := unix.Openat(parentFD, name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_DIRECTORY, 0)
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(fd), name)
 	if file == nil {
 		_ = unix.Close(fd)
 		return nil, ErrSecretReferenceInvalid
 	}
 	info, err := file.Stat()
-	if err != nil || directory && !info.IsDir() || !directory && !info.Mode().IsRegular() {
+	if err != nil || !info.IsDir() {
 		_ = file.Close()
 		return nil, ErrSecretReferenceInvalid
 	}
 	return file, nil
+}
+
+func trustedDescriptorOwner(file *os.File) bool {
+	if file == nil {
+		return false
+	}
+	var metadata unix.Stat_t
+	if err := unix.Fstat(int(file.Fd()), &metadata); err != nil {
+		return false
+	}
+	return metadata.Uid == 0 || int(metadata.Uid) == os.Geteuid()
+}
+
+func trustedDirectoryDescriptor(directory *os.File) bool {
+	if directory == nil || !trustedDescriptorOwner(directory) {
+		return false
+	}
+	info, err := directory.Stat()
+	return err == nil && info.IsDir() && info.Mode().Perm()&0o022 == 0
 }
 
 type TOTPConfig struct {

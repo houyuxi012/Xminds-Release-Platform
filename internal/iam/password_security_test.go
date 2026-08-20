@@ -102,7 +102,7 @@ func TestTOTPVerifierResolvesReferencedSecretAndRejectsWrongWindow(t *testing.T)
 func TestDirectorySecretResolverConfinesReferencesToConfiguredRoot(t *testing.T) {
 	t.Parallel()
 
-	directory := t.TempDir()
+	directory := resolvedTempDir(t)
 	if err := os.WriteFile(filepath.Join(directory, "admin-totp"), []byte("JBSWY3DPEHPK3PXP\n"), 0o400); err != nil {
 		t.Fatal(err)
 	}
@@ -110,6 +110,7 @@ func TestDirectorySecretResolverConfinesReferencesToConfiguredRoot(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer resolver.Close()
 	secret, err := resolver.Resolve(context.Background(), "secret://iam/admin-totp")
 	if err != nil || string(secret) != "JBSWY3DPEHPK3PXP" {
 		t.Fatalf("Resolve(valid) = %q, %v", secret, err)
@@ -123,14 +124,145 @@ func TestDirectorySecretResolverConfinesReferencesToConfiguredRoot(t *testing.T)
 
 func TestDirectorySecretResolverRejectsSymlinkRoot(t *testing.T) {
 	t.Parallel()
-	realRoot := t.TempDir()
-	linkedRoot := filepath.Join(t.TempDir(), "iam-secrets")
+	realRoot := resolvedTempDir(t)
+	linkedRoot := filepath.Join(resolvedTempDir(t), "iam-secrets")
 	if err := os.Symlink(realRoot, linkedRoot); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := NewDirectorySecretResolver(linkedRoot); !errors.Is(err, ErrSecretReferenceInvalid) {
 		t.Fatalf("NewDirectorySecretResolver(symlink root) error = %v", err)
 	}
+}
+
+func TestDirectorySecretResolverRejectsSymlinkAncestor(t *testing.T) {
+	realParent := resolvedTempDir(t)
+	realRoot := filepath.Join(realParent, "iam-secrets")
+	if err := os.Mkdir(realRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	linkedParent := filepath.Join(resolvedTempDir(t), "linked-parent")
+	if err := os.Symlink(realParent, linkedParent); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewDirectorySecretResolver(filepath.Join(linkedParent, "iam-secrets")); !errors.Is(err, ErrSecretReferenceInvalid) {
+		t.Fatalf("NewDirectorySecretResolver(symlink ancestor) error = %v", err)
+	}
+}
+
+func TestDirectorySecretResolverRejectsGroupOrWorldWritableRoot(t *testing.T) {
+	for name, mode := range map[string]os.FileMode{"group writable": 0o770, "world writable": 0o702} {
+		t.Run(name, func(t *testing.T) {
+			root := filepath.Join(resolvedTempDir(t), "iam-secrets")
+			if err := os.Mkdir(root, mode); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(root, mode); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := NewDirectorySecretResolver(root); !errors.Is(err, ErrSecretReferenceInvalid) {
+				t.Fatalf("NewDirectorySecretResolver(%s root) error = %v", name, err)
+			}
+		})
+	}
+}
+
+func TestDirectorySecretResolverRejectsRootPermissionChangeAfterConstruction(t *testing.T) {
+	root := filepath.Join(resolvedTempDir(t), "iam-secrets")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "admin-totp"), []byte("PINNED-SECRET"), 0o400); err != nil {
+		t.Fatal(err)
+	}
+	resolver, err := NewDirectorySecretResolver(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resolver.Close()
+	if err := os.Chmod(root, 0o770); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolver.Resolve(context.Background(), "secret://iam/admin-totp"); !errors.Is(err, ErrSecretReferenceInvalid) {
+		t.Fatalf("Resolve(group-writable pinned root) error = %v", err)
+	}
+}
+
+func TestDirectorySecretResolverRejectsUntrustedOwnerWhenSupported(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("changing fixtures to an untrusted owner requires root")
+	}
+	t.Run("root", func(t *testing.T) {
+		root := filepath.Join(resolvedTempDir(t), "iam-secrets")
+		if err := os.Mkdir(root, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chown(root, 65534, -1); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := NewDirectorySecretResolver(root); !errors.Is(err, ErrSecretReferenceInvalid) {
+			t.Fatalf("NewDirectorySecretResolver(untrusted root owner) error = %v", err)
+		}
+	})
+	t.Run("secret", func(t *testing.T) {
+		root := filepath.Join(resolvedTempDir(t), "iam-secrets")
+		if err := os.Mkdir(root, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		secretPath := filepath.Join(root, "admin-totp")
+		if err := os.WriteFile(secretPath, []byte("UNTRUSTED-SECRET"), 0o400); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chown(secretPath, 65534, -1); err != nil {
+			t.Fatal(err)
+		}
+		resolver, err := NewDirectorySecretResolver(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resolver.Close()
+		if _, err := resolver.Resolve(context.Background(), "secret://iam/admin-totp"); !errors.Is(err, ErrSecretReferenceInvalid) {
+			t.Fatalf("Resolve(untrusted secret owner) error = %v", err)
+		}
+	})
+}
+
+func TestDirectorySecretResolverPinsOpenedRootAcrossPathReplacement(t *testing.T) {
+	parent := resolvedTempDir(t)
+	root := filepath.Join(parent, "iam-secrets")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "admin-totp"), []byte("ORIGINAL-SECRET"), 0o400); err != nil {
+		t.Fatal(err)
+	}
+	resolver, err := NewDirectorySecretResolver(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resolver.Close()
+	pinned := filepath.Join(parent, "pinned-root")
+	if err := os.Rename(root, pinned); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "admin-totp"), []byte("REPLACEMENT-SECRET"), 0o400); err != nil {
+		t.Fatal(err)
+	}
+	secret, err := resolver.Resolve(context.Background(), "secret://iam/admin-totp")
+	if err != nil || string(secret) != "ORIGINAL-SECRET" {
+		t.Fatalf("Resolve(after root replacement) = %q, %v", secret, err)
+	}
+}
+
+func resolvedTempDir(t *testing.T) string {
+	t.Helper()
+	directory, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return directory
 }
 
 type staticSecretResolver struct {

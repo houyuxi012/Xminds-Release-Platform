@@ -245,6 +245,59 @@ func TestIneligibleLocalLoginCannotIncreasePersistentFailureState(t *testing.T) 
 	}
 }
 
+func TestEligibleMFAAuthenticationFailuresApplyProgressiveLockout(t *testing.T) {
+	for _, account := range []struct {
+		name  string
+		kind  UserKind
+		admin bool
+		login func(*localAuthHarness, LocalLoginCommand) error
+	}{
+		{
+			name: "local administrator", kind: UserKindLocal, admin: true,
+			login: func(harness *localAuthHarness, command LocalLoginCommand) error {
+				_, err := harness.service.LoginLocal(context.Background(), command, harness.request)
+				return err
+			},
+		},
+		{
+			name: "emergency account", kind: UserKindEmergency,
+			login: func(harness *localAuthHarness, command LocalLoginCommand) error {
+				_, err := harness.service.LoginEmergency(context.Background(), command, harness.request)
+				return err
+			},
+		},
+	} {
+		for _, failure := range []struct {
+			name        string
+			proof       string
+			lastCounter int64
+		}{
+			{name: "missing proof", proof: "", lastCounter: 41},
+			{name: "invalid proof", proof: "654321", lastCounter: 41},
+			{name: "counter replay", proof: "123456", lastCounter: 42},
+		} {
+			t.Run(account.name+"/"+failure.name, func(t *testing.T) {
+				harness := newActiveLocalAuthHarness(t, account.kind, account.admin, LoginModeLocal)
+				credential := harness.repository.credentials[harness.userID]
+				credential.MFALastCounter = failure.lastCounter
+				harness.repository.credentials[harness.userID] = credential
+				for attempt := 1; attempt <= 5; attempt++ {
+					err := account.login(harness, LocalLoginCommand{
+						Username: "release.operator", Password: "Current-Strong-Password!", MFAProof: failure.proof,
+					})
+					if !errors.Is(err, ErrLocalAuthenticationFailed) {
+						t.Fatalf("attempt %d error = %v", attempt, err)
+					}
+				}
+				credential = harness.repository.credentials[harness.userID]
+				if credential.FailedAttempts != 5 || !credential.LockedUntil.Equal(harness.now.Add(5*time.Minute)) {
+					t.Fatalf("MFA failure lockout state = attempts:%d locked_until:%s", credential.FailedAttempts, credential.LockedUntil)
+				}
+			})
+		}
+	}
+}
+
 func TestLocalLoginEnforcesPersistentAccountAndIPLimitsWithoutSkippingAudit(t *testing.T) {
 	t.Parallel()
 	account := newActiveLocalAuthHarness(t, UserKindLocal, false, LoginModeLocal)

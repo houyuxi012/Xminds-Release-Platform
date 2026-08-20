@@ -185,6 +185,7 @@ func run(ctx context.Context, arguments []string, environ map[string]string) err
 	if err != nil {
 		return fmt.Errorf("configure IAM secret resolver: %w", err)
 	}
+	defer secretResolver.Close()
 	mfaVerifier, err := iam.NewTOTPVerifier(runtimeConfig.LocalAuth.TOTP, secretResolver, time.Now)
 	if err != nil {
 		return fmt.Errorf("configure IAM TOTP verifier: %w", err)

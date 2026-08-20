@@ -158,47 +158,48 @@ func (service *LocalAuthService) loginWithMethod(ctx context.Context, command Lo
 			return findErr
 		}
 		reasonCode := "CREDENTIAL_INVALID"
-		valid := findErr == nil
-		if valid && method == AuthenticationMethodLocal && user.Kind != UserKindLocal {
-			valid, reasonCode = false, "ENTRY_NOT_ALLOWED"
+		eligible := findErr == nil
+		if eligible && method == AuthenticationMethodLocal && user.Kind != UserKindLocal {
+			eligible, reasonCode = false, "ENTRY_NOT_ALLOWED"
 		}
-		if valid && method == AuthenticationMethodEmergency && user.Kind != UserKindEmergency {
-			valid, reasonCode = false, "ENTRY_NOT_ALLOWED"
+		if eligible && method == AuthenticationMethodEmergency && user.Kind != UserKindEmergency {
+			eligible, reasonCode = false, "ENTRY_NOT_ALLOWED"
 		}
-		if valid && method == AuthenticationMethodLocal && state.Mode != LoginModeLocal && state.Mode != LoginModeConfiguring {
-			valid, reasonCode = false, "LOGIN_MODE_REJECTED"
+		if eligible && method == AuthenticationMethodLocal && state.Mode != LoginModeLocal && state.Mode != LoginModeConfiguring {
+			eligible, reasonCode = false, "LOGIN_MODE_REJECTED"
 		}
-		if valid && user.Status != UserStatusActive {
-			valid, reasonCode = false, "SUBJECT_INACTIVE"
+		if eligible && user.Status != UserStatusActive {
+			eligible, reasonCode = false, "SUBJECT_INACTIVE"
 		}
-		if valid && credential.LockedUntil.After(now) {
-			valid, reasonCode = false, "CREDENTIAL_LOCKED"
+		if eligible && credential.LockedUntil.After(now) {
+			eligible, reasonCode = false, "CREDENTIAL_LOCKED"
 		}
 		passwordDigest := service.dummyPassword
-		if valid {
+		if eligible {
 			passwordDigest = credential.Password
 		}
 		passwordErr := service.passwords.Verify(command.Password, passwordDigest)
-		credentialFailure := valid && passwordErr != nil
-		if credentialFailure {
-			valid, credentialFailure, reasonCode = false, true, "CREDENTIAL_INVALID"
+		authenticated := eligible
+		authenticationFailed := eligible && passwordErr != nil
+		if authenticationFailed {
+			authenticated, reasonCode = false, "CREDENTIAL_INVALID"
 		}
 		mfaCounter := int64(0)
 		requiresMFA := user.Kind == UserKindEmergency || administrator
-		if valid && requiresMFA {
+		if authenticated && requiresMFA {
 			if !user.MFAEnrolled || credential.MFASecretReference == "" || strings.TrimSpace(command.MFAProof) == "" {
-				valid, reasonCode = false, "MFA_REQUIRED"
+				authenticated, authenticationFailed, reasonCode = false, true, "MFA_REQUIRED"
 			} else {
 				assertion, verifyErr := service.mfa.Verify(ctx, credential.MFASecretReference, command.MFAProof)
 				if verifyErr != nil || assertion.Counter <= credential.MFALastCounter {
-					valid, reasonCode = false, "MFA_PROOF_INVALID"
+					authenticated, authenticationFailed, reasonCode = false, true, "MFA_PROOF_INVALID"
 				} else {
 					mfaCounter = assertion.Counter
 				}
 			}
 		}
-		if !valid {
-			if credentialFailure {
+		if !authenticated {
+			if authenticationFailed {
 				attempts := credential.FailedAttempts + 1
 				if err := service.login.SaveAuthenticationFailure(ctx, tx, user.ID, attempts, lockUntilForAttempts(now, attempts, service.policy.LockoutStages)); err != nil {
 					return err
