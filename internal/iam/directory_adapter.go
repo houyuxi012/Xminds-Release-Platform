@@ -3,7 +3,9 @@ package iam
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
 	"crypto/elliptic"
+	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
@@ -316,7 +318,7 @@ func (adapter *SecretBackedDirectoryAdapter) verifyOIDC(ctx context.Context, sou
 	if err != nil {
 		return CapabilityReport{}, err
 	}
-	if _, _, err := adapter.oidcTrusts.prepare(ctx, material); err != nil {
+	if _, _, _, err := adapter.oidcTrusts.prepare(ctx, material); err != nil {
 		return CapabilityReport{}, err
 	}
 	return CapabilityReport{
@@ -512,38 +514,21 @@ func validSigningAlgorithms(algorithms []string) bool {
 	return true
 }
 
-func validOIDCKeySet(keySet oidcJWKSet, algorithms []string) bool {
-	allowed := make(map[string]struct{}, len(algorithms))
-	for _, algorithm := range algorithms {
-		allowed[algorithm] = struct{}{}
-	}
-	for _, key := range keySet.Keys {
-		_, algorithmAllowed := allowed[key.Alg]
-		if !algorithmAllowed || strings.TrimSpace(key.KeyID) == "" || (key.Use != "" && key.Use != "sig") {
-			continue
-		}
-		if (strings.HasPrefix(key.Alg, "RS") || strings.HasPrefix(key.Alg, "PS")) && key.KeyType == "RSA" && validRSAJWK(key.Modulus, key.Exponent) {
-			return true
-		}
-		if strings.HasPrefix(key.Alg, "ES") && key.KeyType == "EC" && validECJWK(key.Alg, key.Curve, key.X, key.Y) {
-			return true
-		}
-	}
-	return false
-}
-
-func validRSAJWK(encodedModulus, encodedExponent string) bool {
+func parseRSAJWK(encodedModulus, encodedExponent string) (*rsa.PublicKey, bool) {
 	modulusBytes, modulusErr := base64.RawURLEncoding.DecodeString(encodedModulus)
 	exponentBytes, exponentErr := base64.RawURLEncoding.DecodeString(encodedExponent)
 	if modulusErr != nil || exponentErr != nil || len(modulusBytes) < 256 || len(modulusBytes) > 1024 || len(exponentBytes) == 0 || len(exponentBytes) > 4 {
-		return false
+		return nil, false
 	}
 	modulus := new(big.Int).SetBytes(modulusBytes)
 	exponent := new(big.Int).SetBytes(exponentBytes)
-	return modulus.BitLen() >= 2048 && modulus.Bit(0) == 1 && exponent.IsInt64() && exponent.Int64() >= 3 && exponent.Int64() <= 1<<31-1 && exponent.Bit(0) == 1
+	if modulus.BitLen() < 2048 || modulus.Bit(0) != 1 || !exponent.IsInt64() || exponent.Int64() < 3 || exponent.Int64() > 1<<31-1 || exponent.Bit(0) != 1 {
+		return nil, false
+	}
+	return &rsa.PublicKey{N: modulus, E: int(exponent.Int64())}, true
 }
 
-func validECJWK(algorithm, curveName, encodedX, encodedY string) bool {
+func parseECJWK(algorithm, curveName, encodedX, encodedY string) (*ecdsa.PublicKey, bool) {
 	var curve elliptic.Curve
 	switch {
 	case algorithm == "ES256" && curveName == "P-256":
@@ -553,15 +538,19 @@ func validECJWK(algorithm, curveName, encodedX, encodedY string) bool {
 	case algorithm == "ES512" && curveName == "P-521":
 		curve = elliptic.P521()
 	default:
-		return false
+		return nil, false
 	}
 	xBytes, xErr := base64.RawURLEncoding.DecodeString(encodedX)
 	yBytes, yErr := base64.RawURLEncoding.DecodeString(encodedY)
 	coordinateBytes := (curve.Params().BitSize + 7) / 8
 	if xErr != nil || yErr != nil || len(xBytes) != coordinateBytes || len(yBytes) != coordinateBytes {
-		return false
+		return nil, false
 	}
-	return curve.IsOnCurve(new(big.Int).SetBytes(xBytes), new(big.Int).SetBytes(yBytes))
+	x, y := new(big.Int).SetBytes(xBytes), new(big.Int).SetBytes(yBytes)
+	if !curve.IsOnCurve(x, y) {
+		return nil, false
+	}
+	return &ecdsa.PublicKey{Curve: curve, X: x, Y: y}, true
 }
 
 func safeBaseURL(raw string, allowLoopbackHTTP bool) bool {

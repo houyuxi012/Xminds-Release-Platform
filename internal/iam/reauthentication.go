@@ -21,6 +21,11 @@ import (
 
 const reauthenticationEvidencePrefix = "xmr_"
 
+const (
+	reauthenticationActorBindingVersion int16 = 1
+	reauthenticationActorBindingDomain        = "xminds:iam:reauthentication:actor-binding:v1"
+)
+
 type ReauthenticationOperation string
 
 const (
@@ -46,6 +51,8 @@ type ReauthenticationChallenge struct {
 	ID                  uuid.UUID
 	ActorSubject        string
 	ActorKind           identity.PrincipalKind
+	ActorBindingVersion int16
+	ActorBindingDigest  string
 	CreatedTokenDigest  string
 	Operation           ReauthenticationOperation
 	Status              ReauthenticationStatus
@@ -152,7 +159,8 @@ func NewReauthenticationService(config ReauthenticationConfig) (*Reauthenticatio
 }
 
 func (service *ReauthenticationService) CreateChallenge(ctx context.Context, actor identity.Principal, operation ReauthenticationOperation, request RequestContext) (ReauthenticationChallengeResult, error) {
-	if !service.allowedActor(actor) || !validReauthenticationOperation(operation) {
+	bindingVersion, bindingDigest, actorOK := service.actorBinding(actor)
+	if !actorOK || !validReauthenticationOperation(operation) {
 		return ReauthenticationChallengeResult{}, ErrHighRiskConfirmationRequired
 	}
 	if err := service.authorizer.Require(actor, identity.ActionIdentityManage, ""); err != nil {
@@ -165,6 +173,7 @@ func (service *ReauthenticationService) CreateChallenge(ctx context.Context, act
 	}
 	challenge := ReauthenticationChallenge{
 		ID: id, ActorSubject: strings.TrimSpace(actor.Subject), ActorKind: actor.Kind,
+		ActorBindingVersion: bindingVersion, ActorBindingDigest: bindingDigest,
 		CreatedTokenDigest: reauthenticationDigest(actor.TokenID), Operation: operation, Status: ReauthenticationStatusPending,
 		CreatedAt: now, ChallengeExpiresAt: now.Add(service.policy.ChallengeTTL), CreatedRequestID: request.RequestID, Version: 1,
 	}
@@ -184,12 +193,13 @@ func (service *ReauthenticationService) CreateChallenge(ctx context.Context, act
 }
 
 func (service *ReauthenticationService) CompleteChallenge(ctx context.Context, actor identity.Principal, challengeID uuid.UUID, command CompleteReauthenticationCommand, request RequestContext) (ReauthenticationEvidence, error) {
-	if !service.allowedActor(actor) || challengeID == uuid.Nil || challengeID.Version() != 7 {
+	bindingVersion, bindingDigest, actorOK := service.actorBinding(actor)
+	if !actorOK || challengeID == uuid.Nil || challengeID.Version() != 7 {
 		return ReauthenticationEvidence{}, ErrHighRiskConfirmationRequired
 	}
 	now := service.clock().UTC().Truncate(time.Microsecond)
 	preflight, err := service.repository.GetReauthenticationChallenge(ctx, nil, challengeID)
-	if err != nil || !service.canComplete(preflight, actor, now) {
+	if err != nil || !service.canComplete(preflight, actor, bindingVersion, bindingDigest, now) {
 		return ReauthenticationEvidence{}, ErrHighRiskConfirmationRequired
 	}
 	switch actor.Kind {
@@ -214,7 +224,7 @@ func (service *ReauthenticationService) CompleteChallenge(ctx context.Context, a
 	var expiresAt time.Time
 	err = service.repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
 		challenge, getErr := service.repository.GetReauthenticationChallenge(ctx, tx, challengeID)
-		if getErr != nil || !service.canComplete(challenge, actor, now) {
+		if getErr != nil || !service.canComplete(challenge, actor, bindingVersion, bindingDigest, now) {
 			return ErrHighRiskConfirmationRequired
 		}
 		previousVersion := challenge.Version
@@ -249,7 +259,8 @@ func (service *ReauthenticationService) CompleteChallenge(ctx context.Context, a
 func (service *ReauthenticationService) Authorize(ctx context.Context, actor identity.Principal, operation string, proof HighRiskProof, request RequestContext) error {
 	parsedOperation := ReauthenticationOperation(strings.TrimSpace(operation))
 	challengeID, evidenceOK := parseReauthenticationProof(proof)
-	if !proof.Confirmed || !service.allowedActor(actor) || !validReauthenticationOperation(parsedOperation) || !evidenceOK {
+	bindingVersion, bindingDigest, actorOK := service.actorBinding(actor)
+	if !proof.Confirmed || !actorOK || !validReauthenticationOperation(parsedOperation) || !evidenceOK {
 		return ErrHighRiskConfirmationRequired
 	}
 	now := service.clock().UTC().Truncate(time.Microsecond)
@@ -260,6 +271,7 @@ func (service *ReauthenticationService) Authorize(ctx context.Context, actor ide
 		challenge, getErr := service.repository.GetReauthenticationChallenge(ctx, tx, challengeID)
 		if getErr != nil || challenge.Status != ReauthenticationStatusVerified || challenge.Operation != parsedOperation ||
 			challenge.ActorSubject != strings.TrimSpace(actor.Subject) || challenge.ActorKind != actor.Kind ||
+			!challengeMatchesReauthenticationActor(challenge, bindingVersion, bindingDigest) ||
 			!challenge.EvidenceExpiresAt.After(now) || challenge.VerifiedTokenDigest != reauthenticationDigest(actor.TokenID) ||
 			subtle.ConstantTimeCompare([]byte(challenge.EvidenceDigest), []byte(reauthenticationDigest(proof.Evidence))) != 1 {
 			return ErrHighRiskConfirmationRequired
@@ -277,16 +289,46 @@ func (service *ReauthenticationService) Authorize(ctx context.Context, actor ide
 	return nil
 }
 
-func (service *ReauthenticationService) allowedActor(actor identity.Principal) bool {
-	if service == nil || service.repository == nil || service.authorizer == nil || strings.TrimSpace(actor.Subject) == "" || strings.TrimSpace(actor.TokenID) == "" {
-		return false
+func (service *ReauthenticationService) actorBinding(actor identity.Principal) (int16, string, bool) {
+	if service == nil || service.repository == nil || service.authorizer == nil || !actor.Governed || strings.TrimSpace(actor.Subject) == "" || strings.TrimSpace(actor.TokenID) == "" {
+		return 0, "", false
 	}
-	return actor.Kind == identity.PrincipalKindHuman || actor.Kind == identity.PrincipalKindLocal
+	userID, err := uuid.Parse(strings.TrimSpace(actor.GovernedUserID))
+	if err != nil || userID == uuid.Nil {
+		return 0, "", false
+	}
+	hash := sha256.New()
+	_, _ = hash.Write([]byte(reauthenticationActorBindingDomain))
+	_, _ = hash.Write(userID[:])
+	switch actor.Kind {
+	case identity.PrincipalKindHuman:
+		sourceID, sourceErr := uuid.Parse(strings.TrimSpace(actor.IdentitySourceID))
+		if sourceErr != nil || sourceID == uuid.Nil {
+			return 0, "", false
+		}
+		_, _ = hash.Write([]byte{0x01})
+		_, _ = hash.Write(sourceID[:])
+	case identity.PrincipalKindLocal:
+		if strings.TrimSpace(actor.IdentitySourceID) != "" {
+			return 0, "", false
+		}
+		_, _ = hash.Write([]byte{0x02})
+	default:
+		return 0, "", false
+	}
+	return reauthenticationActorBindingVersion, hex.EncodeToString(hash.Sum(nil)), true
 }
 
-func (service *ReauthenticationService) canComplete(challenge ReauthenticationChallenge, actor identity.Principal, now time.Time) bool {
+func (service *ReauthenticationService) canComplete(challenge ReauthenticationChallenge, actor identity.Principal, bindingVersion int16, bindingDigest string, now time.Time) bool {
 	return challenge.ID != uuid.Nil && challenge.Status == ReauthenticationStatusPending && challenge.ChallengeExpiresAt.After(now) &&
-		challenge.ActorSubject == strings.TrimSpace(actor.Subject) && challenge.ActorKind == actor.Kind
+		challenge.ActorSubject == strings.TrimSpace(actor.Subject) && challenge.ActorKind == actor.Kind &&
+		challengeMatchesReauthenticationActor(challenge, bindingVersion, bindingDigest)
+}
+
+func challengeMatchesReauthenticationActor(challenge ReauthenticationChallenge, bindingVersion int16, bindingDigest string) bool {
+	return challenge.ActorBindingVersion == reauthenticationActorBindingVersion && bindingVersion == reauthenticationActorBindingVersion &&
+		validReauthenticationDigest(challenge.ActorBindingDigest) && validReauthenticationDigest(bindingDigest) &&
+		subtle.ConstantTimeCompare([]byte(challenge.ActorBindingDigest), []byte(bindingDigest)) == 1
 }
 
 func (service *ReauthenticationService) appendAudit(ctx context.Context, tx pgx.Tx, actor identity.Principal, action string, challenge ReauthenticationChallenge, outcome audit.Outcome, request RequestContext) error {
@@ -337,4 +379,16 @@ func parseReauthenticationProof(proof HighRiskProof) (uuid.UUID, bool) {
 func reauthenticationDigest(value string) string {
 	digest := sha256.Sum256([]byte(value))
 	return hex.EncodeToString(digest[:])
+}
+
+func validReauthenticationDigest(value string) bool {
+	if len(value) != sha256.Size*2 {
+		return false
+	}
+	for _, character := range value {
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return false
+		}
+	}
+	return true
 }

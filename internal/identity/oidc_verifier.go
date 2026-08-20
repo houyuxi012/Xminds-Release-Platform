@@ -40,7 +40,7 @@ type OIDCVerifierConfig struct {
 	WorkloadProviderClaim string
 	SigningAlgorithms     []string
 	HTTPClient            *http.Client
-	JWKSURL               string
+	KeySet                oidc.KeySet
 }
 
 type idTokenVerifier interface {
@@ -73,15 +73,14 @@ func newTokenVerifier(ctx context.Context, config OIDCVerifierConfig, kind Princ
 		SupportedSigningAlgs: normalized.SigningAlgorithms,
 	}
 	var tokenVerifier idTokenVerifier
-	if normalized.JWKSURL == "" {
+	if normalized.KeySet == nil {
 		provider, err := oidc.NewProvider(clientContext, normalized.Issuer)
 		if err != nil {
 			return nil, fmt.Errorf("discover OIDC provider: %w", err)
 		}
 		tokenVerifier = provider.VerifierContext(clientContext, verifierConfig)
 	} else {
-		keys := oidc.NewRemoteKeySet(clientContext, normalized.JWKSURL)
-		tokenVerifier = oidc.NewVerifier(normalized.Issuer, keys, verifierConfig)
+		tokenVerifier = oidc.NewVerifier(normalized.Issuer, normalized.KeySet, verifierConfig)
 	}
 	return &OIDCVerifier{
 		tokens:                  tokenVerifier,
@@ -208,13 +207,6 @@ func normalizeOIDCConfig(config OIDCVerifierConfig) (OIDCVerifierConfig, error) 
 	}
 	if issuerURL.Scheme != "https" && !(issuerURL.Scheme == "http" && isLoopbackHost(issuerURL.Hostname())) {
 		return OIDCVerifierConfig{}, ErrOIDCConfigurationInvalid
-	}
-	if config.JWKSURL = strings.TrimSpace(config.JWKSURL); config.JWKSURL != "" {
-		jwksURL, jwksErr := url.Parse(config.JWKSURL)
-		if jwksErr != nil || jwksURL.Host == "" || jwksURL.User != nil || jwksURL.Fragment != "" || jwksURL.RawQuery != "" || jwksURL.RawPath != "" ||
-			jwksURL.Scheme != issuerURL.Scheme || !strings.EqualFold(jwksURL.Host, issuerURL.Host) {
-			return OIDCVerifierConfig{}, ErrOIDCConfigurationInvalid
-		}
 	}
 	if config.RolesClaim = strings.TrimSpace(config.RolesClaim); config.RolesClaim == "" {
 		config.RolesClaim = defaultRolesClaim

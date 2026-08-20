@@ -99,6 +99,9 @@ func TestActiveOIDCVerifierConcurrentFirstUseBuildsTrustOnce(t *testing.T) {
 	if calls := issuer.discoveryCalls.Load(); calls != 1 {
 		t.Fatalf("discovery requests=%d, want one shared trust build", calls)
 	}
+	if calls := issuer.jwksCalls.Load(); calls != 1 {
+		t.Fatalf("JWKS requests=%d, want prefetched keys reused by the first token", calls)
+	}
 }
 
 func TestActiveOIDCVerifierEvictsOldTrustBeyondConfiguredCacheBound(t *testing.T) {
@@ -469,6 +472,7 @@ type activeOIDCTestIssuer struct {
 	server         *httptest.Server
 	key            *rsa.PrivateKey
 	discoveryCalls atomic.Int32
+	jwksCalls      atomic.Int32
 	discoveryBody  []byte
 	jwksStarted    chan struct{}
 	releaseJWKS    chan struct{}
@@ -498,6 +502,7 @@ func newActiveOIDCTestIssuer(t *testing.T) *activeOIDCTestIssuer {
 				"id_token_signing_alg_values_supported": []string{"RS256"},
 			})
 		case "/jwks":
+			fixture.jwksCalls.Add(1)
 			if fixture.jwksStarted != nil {
 				fixture.jwksOnce.Do(func() { close(fixture.jwksStarted) })
 				<-fixture.releaseJWKS

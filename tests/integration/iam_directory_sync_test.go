@@ -356,7 +356,7 @@ VALUES ($1, 'self-cycle', 'self-cycle')`, stagedJobID); err == nil {
 	}
 }
 
-func TestDirectorySyncMigrationUpgradesImmutableOriginal14To15(t *testing.T) {
+func TestDirectorySyncMigrationUpgradesImmutableOriginal14ToCurrent(t *testing.T) {
 	databaseURL := integrationDatabaseURL(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -396,14 +396,14 @@ func TestDirectorySyncMigrationUpgradesImmutableOriginal14To15(t *testing.T) {
 		t.Fatalf("migration 14 checksum=%s, want immutable %s", checksum, original14Checksum)
 	}
 	if err := database.ApplyMigrations(ctx, pool, migrations.FS); err != nil {
-		t.Fatalf("upgrade original migration 14 database to 15: %v", err)
+		t.Fatalf("upgrade original migration 14 database to current: %v", err)
 	}
 	var maximumVersion int
 	if err := pool.QueryRow(ctx, `SELECT max(version) FROM schema_migrations`).Scan(&maximumVersion); err != nil {
 		t.Fatal(err)
 	}
-	if maximumVersion != 15 {
-		t.Fatalf("maximum migration version=%d, want 15", maximumVersion)
+	if maximumVersion != 16 {
+		t.Fatalf("maximum migration version=%d, want 16", maximumVersion)
 	}
 	var original14PreflightRows int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM schema_migration_preflights WHERE migration_version=14`).Scan(&original14PreflightRows); err != nil {
@@ -1220,120 +1220,135 @@ func TestIAMDirectorySyncAndLocalCreationShareCanonicalMappingAuthority(t *testi
 	if err := database.ApplyMigrations(ctx, pool, migrations.FS); err != nil {
 		t.Fatal(err)
 	}
-	for _, scenario := range []struct {
+	scenarios := []struct {
 		name, localUsername, localEmail, conflictCode string
 		failDirectoryAudit                            bool
+		existingDirectoryUser                         bool
 	}{
 		{name: "username", localUsername: "shared.user", localEmail: "local@example.com", conflictCode: "CANONICAL_USERNAME_CONFLICT"},
+		{name: "username update", localUsername: "shared.user", localEmail: "local@example.com", conflictCode: "CANONICAL_USERNAME_CONFLICT", existingDirectoryUser: true},
 		{name: "email", localUsername: "local.user", localEmail: "shared@example.com", conflictCode: "AMBIGUOUS_EMAIL"},
 		{name: "audit rollback", localUsername: "shared.user", localEmail: "local@example.com", conflictCode: "CANONICAL_USERNAME_CONFLICT", failDirectoryAudit: true},
-	} {
-		t.Run(scenario.name, func(t *testing.T) {
-			resetDirectoryIntegrationTables(t, ctx, pool)
-			now := time.Date(2026, 8, 21, 16, 0, 0, 0, time.UTC)
-			sourceID := uuid.New()
-			seedDirectoryIntegrationSource(t, ctx, pool, sourceID, iam.IdentitySourceSCIM, now, 5)
-			repository := iam.NewPostgresRepository(pool)
-			realAuditor := audit.NewService(audit.NewPostgresRepository(pool))
-			var auditor iam.AuditAppender = realAuditor
-			var auditGate *directoryIntegrationAuditGate
-			if scenario.failDirectoryAudit {
-				auditGate = &directoryIntegrationAuditGate{delegate: realAuditor, failAction: "identity.directory_sync.batch.apply", failPhase: string(iam.DirectorySyncPhaseUsers), remainingFailures: 1}
-				auditor = auditGate
-			}
-			service, err := iam.NewDirectorySyncService(iam.DirectorySyncServiceConfig{Store: repository, Jobs: jobs.NewPostgresRepository(pool), Auditor: auditor, Clock: func() time.Time { return now }, ConflictCursors: directoryIntegrationCursorCodec(t, now)})
-			if err != nil {
-				t.Fatal(err)
-			}
-			executor, err := iam.NewPostgresDirectorySyncExecutor(iam.PostgresDirectorySyncExecutorConfig{Pool: pool, Auditor: auditor, Sessions: repository, Clock: func() time.Time { return now }, BatchSize: 1})
-			if err != nil {
-				t.Fatal(err)
-			}
-			created, err := service.Start(ctx, directorySyncIntegrationAdmin(), sourceID, iam.DirectorySyncModeApply, 5, iam.RequestContext{RequestID: uuid.NewString()})
-			if err != nil {
-				t.Fatal(err)
-			}
-			job, source, err := executor.Load(ctx, created.ID, sourceID)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := executor.Stage(ctx, job, source, iam.SyncPage{Users: []iam.DirectoryUser{{ExternalSubject: "directory-user", Username: "shared.user", DisplayName: "Directory User", Email: "shared@example.com", Enabled: true}}, Complete: true}); err != nil {
-				t.Fatal(err)
-			}
-			job, source, err = executor.Load(ctx, created.ID, sourceID)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if _, err := executor.Advance(ctx, job, source); err != nil {
-				t.Fatal(err)
-			}
-			job, source, err = executor.Load(ctx, created.ID, sourceID)
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			localID := uuid.New()
-			localUser := iam.UserPrincipal{ID: localID, Username: scenario.localUsername, DisplayName: "Local User", Email: scenario.localEmail, Kind: iam.UserKindLocal, Status: iam.UserStatusPending, Version: 1, CreatedAt: now, UpdatedAt: now}
-			credential := iam.LocalCredential{
-				UserID: localID, Password: iam.PasswordDigest{Algorithm: "argon2id", Parameters: "m=19456,t=1,p=1,l=16", Salt: bytes.Repeat([]byte{1}, 16), DerivedKey: bytes.Repeat([]byte{2}, 16)},
-				PasswordChangedAt: now, ActivationDigest: strings.Repeat("a", 64), ActivationExpiresAt: now.Add(time.Hour),
-			}
-			start := make(chan struct{})
-			directoryResult := make(chan error, 1)
-			localResult := make(chan error, 1)
-			go func() {
-				<-start
-				_, advanceErr := executor.Advance(ctx, job, source)
-				directoryResult <- advanceErr
-			}()
-			go func() {
-				<-start
-				localResult <- repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
-					return repository.InsertLocalUser(ctx, tx, localUser, credential)
-				})
-			}()
-			close(start)
-			directoryErr, localErr := <-directoryResult, <-localResult
-			if scenario.failDirectoryAudit {
-				if directoryErr == nil || localErr != nil {
-					t.Fatalf("audit race directory_error=%v local_error=%v", directoryErr, localErr)
+	}
+	for attempt := range 4 {
+		for _, scenario := range scenarios {
+			t.Run(fmt.Sprintf("%s-%d", scenario.name, attempt), func(t *testing.T) {
+				resetDirectoryIntegrationTables(t, ctx, pool)
+				now := time.Date(2026, 8, 21, 16, 0, 0, 0, time.UTC)
+				sourceID := uuid.New()
+				seedDirectoryIntegrationSource(t, ctx, pool, sourceID, iam.IdentitySourceSCIM, now, 5)
+				if scenario.existingDirectoryUser {
+					if _, err := pool.Exec(ctx, `
+INSERT INTO user_principals (
+    id, identity_source_id, external_subject, username, display_name, email,
+    user_kind, status, version, created_at, updated_at
+) VALUES ($1, $2, 'directory-user', 'previous.user', 'Previous Directory User',
+          'previous@example.com', 'external', 'active', 1, $3, $3)`, uuid.New(), sourceID, now.Add(-time.Hour)); err != nil {
+						t.Fatalf("seed existing directory user: %v", err)
+					}
 				}
-				auditGate.clearFailure()
+				repository := iam.NewPostgresRepository(pool)
+				realAuditor := audit.NewService(audit.NewPostgresRepository(pool))
+				var auditor iam.AuditAppender = realAuditor
+				var auditGate *directoryIntegrationAuditGate
+				if scenario.failDirectoryAudit {
+					auditGate = &directoryIntegrationAuditGate{delegate: realAuditor, failAction: "identity.directory_sync.batch.apply", failPhase: string(iam.DirectorySyncPhaseUsers), remainingFailures: 1}
+					auditor = auditGate
+				}
+				service, err := iam.NewDirectorySyncService(iam.DirectorySyncServiceConfig{Store: repository, Jobs: jobs.NewPostgresRepository(pool), Auditor: auditor, Clock: func() time.Time { return now }, ConflictCursors: directoryIntegrationCursorCodec(t, now)})
+				if err != nil {
+					t.Fatal(err)
+				}
+				executor, err := iam.NewPostgresDirectorySyncExecutor(iam.PostgresDirectorySyncExecutorConfig{Pool: pool, Auditor: auditor, Sessions: repository, Clock: func() time.Time { return now }, BatchSize: 1})
+				if err != nil {
+					t.Fatal(err)
+				}
+				created, err := service.Start(ctx, directorySyncIntegrationAdmin(), sourceID, iam.DirectorySyncModeApply, 5, iam.RequestContext{RequestID: uuid.NewString()})
+				if err != nil {
+					t.Fatal(err)
+				}
+				job, source, err := executor.Load(ctx, created.ID, sourceID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := executor.Stage(ctx, job, source, iam.SyncPage{Users: []iam.DirectoryUser{{ExternalSubject: "directory-user", Username: "shared.user", DisplayName: "Directory User", Email: "shared@example.com", Enabled: true}}, Complete: true}); err != nil {
+					t.Fatal(err)
+				}
 				job, source, err = executor.Load(ctx, created.ID, sourceID)
 				if err != nil {
 					t.Fatal(err)
 				}
 				if _, err := executor.Advance(ctx, job, source); err != nil {
-					t.Fatalf("retry after audit rollback: %v", err)
+					t.Fatal(err)
 				}
-			} else {
-				if directoryErr != nil || (localErr != nil && !errors.Is(localErr, iam.ErrIAMConflict)) {
-					t.Fatalf("directory_error=%v local_error=%v", directoryErr, localErr)
+				job, source, err = executor.Load(ctx, created.ID, sourceID)
+				if err != nil {
+					t.Fatal(err)
 				}
-			}
-			var canonicalUsers, mappings, conflicts int
-			if scenario.conflictCode == "AMBIGUOUS_EMAIL" {
-				err = pool.QueryRow(ctx, `SELECT count(*) FROM user_principals WHERE lower(email)='shared@example.com'`).Scan(&canonicalUsers)
-			} else {
-				err = pool.QueryRow(ctx, `SELECT count(*) FROM user_principals WHERE lower(username)='shared.user'`).Scan(&canonicalUsers)
-			}
-			if err != nil {
-				t.Fatal(err)
-			}
-			canonicalMapping := "shared.user"
-			if scenario.conflictCode == "AMBIGUOUS_EMAIL" {
-				canonicalMapping = "shared@example.com"
-			}
-			if err := pool.QueryRow(ctx, `SELECT count(*) FROM principal_mapping_registry WHERE canonical_value=$1`, canonicalMapping).Scan(&mappings); err != nil {
-				t.Fatal(err)
-			}
-			if err := pool.QueryRow(ctx, `SELECT count(*) FROM directory_sync_conflicts WHERE sync_job_id=$1 AND conflict_code=$2`, created.ID, scenario.conflictCode).Scan(&conflicts); err != nil {
-				t.Fatal(err)
-			}
-			if canonicalUsers != 1 || mappings != 1 || (localErr == nil && conflicts != 1) {
-				t.Fatalf("canonical users=%d mappings=%d conflicts=%d local_error=%v", canonicalUsers, mappings, conflicts, localErr)
-			}
-		})
+
+				localID := uuid.New()
+				localUser := iam.UserPrincipal{ID: localID, Username: scenario.localUsername, DisplayName: "Local User", Email: scenario.localEmail, Kind: iam.UserKindLocal, Status: iam.UserStatusPending, Version: 1, CreatedAt: now, UpdatedAt: now}
+				credential := iam.LocalCredential{
+					UserID: localID, Password: iam.PasswordDigest{Algorithm: "argon2id", Parameters: "m=19456,t=1,p=1,l=16", Salt: bytes.Repeat([]byte{1}, 16), DerivedKey: bytes.Repeat([]byte{2}, 16)},
+					PasswordChangedAt: now, ActivationDigest: strings.Repeat("a", 64), ActivationExpiresAt: now.Add(time.Hour),
+				}
+				start := make(chan struct{})
+				directoryResult := make(chan error, 1)
+				localResult := make(chan error, 1)
+				go func() {
+					<-start
+					_, advanceErr := executor.Advance(ctx, job, source)
+					directoryResult <- advanceErr
+				}()
+				go func() {
+					<-start
+					localResult <- repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
+						return repository.InsertLocalUser(ctx, tx, localUser, credential)
+					})
+				}()
+				close(start)
+				directoryErr, localErr := <-directoryResult, <-localResult
+				if scenario.failDirectoryAudit {
+					if directoryErr == nil || localErr != nil {
+						t.Fatalf("audit race directory_error=%v local_error=%v", directoryErr, localErr)
+					}
+					auditGate.clearFailure()
+					job, source, err = executor.Load(ctx, created.ID, sourceID)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if _, err := executor.Advance(ctx, job, source); err != nil {
+						t.Fatalf("retry after audit rollback: %v", err)
+					}
+				} else {
+					if directoryErr != nil || (localErr != nil && !errors.Is(localErr, iam.ErrIAMConflict)) {
+						t.Fatalf("directory_error=%v local_error=%v", directoryErr, localErr)
+					}
+				}
+				var canonicalUsers, mappings, conflicts int
+				if scenario.conflictCode == "AMBIGUOUS_EMAIL" {
+					err = pool.QueryRow(ctx, `SELECT count(*) FROM user_principals WHERE lower(email)='shared@example.com'`).Scan(&canonicalUsers)
+				} else {
+					err = pool.QueryRow(ctx, `SELECT count(*) FROM user_principals WHERE lower(username)='shared.user'`).Scan(&canonicalUsers)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				canonicalMapping := "shared.user"
+				if scenario.conflictCode == "AMBIGUOUS_EMAIL" {
+					canonicalMapping = "shared@example.com"
+				}
+				if err := pool.QueryRow(ctx, `SELECT count(*) FROM principal_mapping_registry WHERE canonical_value=$1`, canonicalMapping).Scan(&mappings); err != nil {
+					t.Fatal(err)
+				}
+				if err := pool.QueryRow(ctx, `SELECT count(*) FROM directory_sync_conflicts WHERE sync_job_id=$1 AND conflict_code=$2`, created.ID, scenario.conflictCode).Scan(&conflicts); err != nil {
+					t.Fatal(err)
+				}
+				if canonicalUsers != 1 || mappings != 1 || (localErr == nil && conflicts != 1) {
+					t.Fatalf("canonical users=%d mappings=%d conflicts=%d local_error=%v", canonicalUsers, mappings, conflicts, localErr)
+				}
+			})
+		}
 	}
 }
 

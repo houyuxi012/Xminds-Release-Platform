@@ -285,7 +285,12 @@ func TestIAMPostgresReauthenticationConcurrencyAndAuditRollback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	creator := identity.Principal{Subject: "postgres.admin", Kind: identity.PrincipalKindHuman, Roles: []identity.Role{identity.RoleAdmin}, TokenID: "oidc-old-token"}
+	sourceAID, sourceBID, sourceAUserID, sourceBUserID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	creator := identity.Principal{
+		Subject: "postgres.admin", Kind: identity.PrincipalKindHuman, TokenID: "oidc-old-token", Governed: true,
+		IdentitySourceID: sourceAID.String(), GovernedUserID: sourceAUserID.String(),
+		RoleScopes: []identity.RoleScope{{Role: identity.RoleAdmin, Effect: "allow", ScopeType: "platform"}},
+	}
 	completer := creator
 	completer.TokenID = "oidc-fresh-token"
 	completer.AuthenticatedAt = now.Add(-time.Minute)
@@ -299,12 +304,44 @@ func TestIAMPostgresReauthenticationConcurrencyAndAuditRollback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	crossSourceCompleter := completer
+	crossSourceCompleter.IdentitySourceID = sourceBID.String()
+	crossSourceCompleter.GovernedUserID = sourceBUserID.String()
+	crossSourceChallenge, err := service.CreateChallenge(ctx, creator, iam.ReauthenticationOperationUserEnable, request)
+	if err != nil {
+		t.Fatalf("CreateChallenge() for cross-source proof error = %v", err)
+	}
+	if completed, completeErr := service.CompleteChallenge(ctx, crossSourceCompleter, crossSourceChallenge.ID, iam.CompleteReauthenticationCommand{}, request); !errors.Is(completeErr, iam.ErrHighRiskConfirmationRequired) || completed.Evidence != "" {
+		t.Fatalf("cross-source CompleteChallenge() = %#v, %v", completed, completeErr)
+	}
+	var status string
+	if err := pool.QueryRow(ctx, `SELECT status FROM iam_reauthentication_challenges WHERE id=$1`, crossSourceChallenge.ID).Scan(&status); err != nil || status != "pending" {
+		t.Fatalf("cross-source completion status=%q error=%v", status, err)
+	}
+	sameSourceEvidence, err := service.CompleteChallenge(ctx, completer, crossSourceChallenge.ID, iam.CompleteReauthenticationCommand{}, request)
+	if err != nil {
+		t.Fatalf("same-source CompleteChallenge() error = %v", err)
+	}
+	crossSourceProof := iam.HighRiskProof{ChallengeID: crossSourceChallenge.ID.String(), Evidence: sameSourceEvidence.Evidence, Confirmed: true}
+	if authorizeErr := service.Authorize(ctx, crossSourceCompleter, string(iam.ReauthenticationOperationUserEnable), crossSourceProof, request); !errors.Is(authorizeErr, iam.ErrHighRiskConfirmationRequired) {
+		t.Fatalf("cross-source Authorize() error = %v", authorizeErr)
+	}
+	if err := pool.QueryRow(ctx, `SELECT status FROM iam_reauthentication_challenges WHERE id=$1`, crossSourceChallenge.ID).Scan(&status); err != nil || status != "verified" {
+		t.Fatalf("cross-source authorization status=%q error=%v", status, err)
+	}
+	if authorizeErr := service.Authorize(ctx, completer, string(iam.ReauthenticationOperationUserEnable), crossSourceProof, request); authorizeErr != nil {
+		t.Fatalf("same-source Authorize() error = %v", authorizeErr)
+	}
+	var challengeCountBeforeFailure int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM iam_reauthentication_challenges`).Scan(&challengeCountBeforeFailure); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := failingService.CreateChallenge(ctx, creator, iam.ReauthenticationOperationUserDisable, request); err == nil {
 		t.Fatal("CreateChallenge() with failing audit error = nil")
 	}
 	var challengeCount int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM iam_reauthentication_challenges`).Scan(&challengeCount); err != nil || challengeCount != 0 {
-		t.Fatalf("challenge count after create rollback = %d, %v", challengeCount, err)
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM iam_reauthentication_challenges`).Scan(&challengeCount); err != nil || challengeCount != challengeCountBeforeFailure {
+		t.Fatalf("challenge count after create rollback = %d, want %d, error=%v", challengeCount, challengeCountBeforeFailure, err)
 	}
 
 	created, err := service.CreateChallenge(ctx, creator, iam.ReauthenticationOperationUserDisable, request)
@@ -387,7 +424,6 @@ func TestIAMPostgresReauthenticationConcurrencyAndAuditRollback(t *testing.T) {
 	if _, err := failingService.CompleteChallenge(ctx, completer, rollbackChallenge.ID, iam.CompleteReauthenticationCommand{}, request); err == nil {
 		t.Fatal("CompleteChallenge() audit failure error = nil")
 	}
-	var status string
 	if err := pool.QueryRow(ctx, `SELECT status FROM iam_reauthentication_challenges WHERE id=$1`, rollbackChallenge.ID).Scan(&status); err != nil || status != "pending" {
 		t.Fatalf("status after complete rollback = %q, %v", status, err)
 	}
@@ -400,6 +436,27 @@ func TestIAMPostgresReauthenticationConcurrencyAndAuditRollback(t *testing.T) {
 	}
 	if err := pool.QueryRow(ctx, `SELECT status FROM iam_reauthentication_challenges WHERE id=$1`, rollbackChallenge.ID).Scan(&status); err != nil || status != "verified" {
 		t.Fatalf("status after consume rollback = %q, %v", status, err)
+	}
+
+	localActor := creator
+	localActor.Subject = "local:postgres-emergency-admin"
+	localActor.Kind = identity.PrincipalKindLocal
+	localActor.IdentitySourceID = ""
+	localActor.GovernedUserID = uuid.NewString()
+	localActor.TokenID = "local-session-token"
+	localActor.AuthenticationAssurance = 1
+	localChallenge, err := service.CreateChallenge(ctx, localActor, iam.ReauthenticationOperationUserRevokeSessions, request)
+	if err != nil {
+		t.Fatalf("local CreateChallenge() error = %v", err)
+	}
+	localEvidence, err := service.CompleteChallenge(ctx, localActor, localChallenge.ID, iam.CompleteReauthenticationCommand{}, request)
+	if err != nil {
+		t.Fatalf("local CompleteChallenge() error = %v", err)
+	}
+	if authorizeErr := service.Authorize(ctx, localActor, string(iam.ReauthenticationOperationUserRevokeSessions), iam.HighRiskProof{
+		ChallengeID: localChallenge.ID.String(), Evidence: localEvidence.Evidence, Confirmed: true,
+	}, request); authorizeErr != nil {
+		t.Fatalf("local Authorize() error = %v", authorizeErr)
 	}
 
 	expiringChallenge, err := service.CreateChallenge(ctx, creator, iam.ReauthenticationOperationSSODisable, iam.RequestContext{RequestID: uuid.NewString(), SourceIP: "192.0.2.91"})
@@ -519,7 +576,11 @@ INSERT INTO local_sessions (
 	if err != nil {
 		t.Fatal(err)
 	}
-	creator := identity.Principal{Subject: "postgres.admin", Kind: identity.PrincipalKindHuman, Roles: []identity.Role{identity.RoleAdmin}, TokenID: "oidc-old-token"}
+	creator := identity.Principal{
+		Subject: "postgres.admin", Kind: identity.PrincipalKindHuman, TokenID: "oidc-old-token", Governed: true,
+		IdentitySourceID: uuid.NewString(), GovernedUserID: uuid.NewString(),
+		RoleScopes: []identity.RoleScope{{Role: identity.RoleAdmin, Effect: "allow", ScopeType: "platform"}},
+	}
 	actor := creator
 	actor.TokenID = "oidc-fresh-token"
 	actor.AuthenticatedAt = now.Add(-time.Minute)
@@ -892,7 +953,11 @@ func TestIAMPostgresBreakGlassScheduledPermissionContinuity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	creator := identity.Principal{Subject: "scheduled.admin", Kind: identity.PrincipalKindHuman, Roles: []identity.Role{identity.RoleAdmin}, TokenID: "scheduled-old-token"}
+	creator := identity.Principal{
+		Subject: "scheduled.admin", Kind: identity.PrincipalKindHuman, TokenID: "scheduled-old-token", Governed: true,
+		IdentitySourceID: uuid.NewString(), GovernedUserID: uuid.NewString(),
+		RoleScopes: []identity.RoleScope{{Role: identity.RoleAdmin, Effect: "allow", ScopeType: "platform"}},
+	}
 	actor := creator
 	actor.TokenID = "scheduled-fresh-token"
 	actor.AuthenticatedAt = now.Add(-time.Minute)
@@ -1806,9 +1871,9 @@ INSERT INTO role_bindings (
 			Roles: []identity.Role{identity.RoleAdmin}, ProductIDs: []string{"untrusted-product"},
 		})
 	}
-	assertOnlyRole := func(t *testing.T, principal identity.Principal, role identity.Role) {
+	assertOnlyRole := func(t *testing.T, principal identity.Principal, userID uuid.UUID, role identity.Role) {
 		t.Helper()
-		if !principal.Governed || len(principal.Roles) != 0 || len(principal.ProductIDs) != 0 || len(principal.RoleScopes) != 1 || principal.RoleScopes[0].Role != role {
+		if !principal.Governed || principal.GovernedUserID != userID.String() || len(principal.Roles) != 0 || len(principal.ProductIDs) != 0 || len(principal.RoleScopes) != 1 || principal.RoleScopes[0].Role != role {
 			t.Fatalf("resolved principal = %+v, want only governed %q scope", principal, role)
 		}
 	}
@@ -1824,7 +1889,7 @@ INSERT INTO role_bindings (
 		if resolveErr != nil {
 			t.Fatalf("ResolvePrincipal() error = %v", resolveErr)
 		}
-		assertOnlyRole(t, resolved, identity.RoleViewer)
+		assertOnlyRole(t, resolved, sourceAUserID, identity.RoleViewer)
 	})
 
 	t.Run("subject from wrong source fails closed", func(t *testing.T) {
@@ -1840,7 +1905,7 @@ INSERT INTO role_bindings (
 		if resolveErr != nil {
 			t.Fatalf("ResolvePrincipal() error = %v", resolveErr)
 		}
-		assertOnlyRole(t, resolved, identity.RolePublisher)
+		assertOnlyRole(t, resolved, sourceBUserID, identity.RolePublisher)
 	})
 
 	t.Run("verified source binding cannot replay across active source switch", func(t *testing.T) {

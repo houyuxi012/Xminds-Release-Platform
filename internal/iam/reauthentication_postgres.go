@@ -47,16 +47,18 @@ USING removable WHERE challenge.id=removable.id`, now.UTC().Add(-retention), lim
 
 func (repository *PostgresRepository) InsertReauthenticationChallenge(ctx context.Context, tx pgx.Tx, challenge ReauthenticationChallenge) error {
 	if repository == nil || repository.pool == nil || tx == nil || challenge.ID == uuid.Nil || challenge.ID.Version() != 7 ||
-		strings.TrimSpace(challenge.ActorSubject) == "" || !validReauthenticationOperation(challenge.Operation) || challenge.Status != ReauthenticationStatusPending || challenge.Version != 1 {
+		strings.TrimSpace(challenge.ActorSubject) == "" || challenge.ActorBindingVersion != reauthenticationActorBindingVersion ||
+		!validReauthenticationDigest(challenge.ActorBindingDigest) || !validReauthenticationOperation(challenge.Operation) || challenge.Status != ReauthenticationStatusPending || challenge.Version != 1 {
 		return ErrIAMConfiguration
 	}
 	_, err := tx.Exec(ctx, `
 INSERT INTO iam_reauthentication_challenges (
-    id, actor_subject, actor_kind, created_token_digest, operation, status,
-    created_at, challenge_expires_at, created_request_id, version
-) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-		challenge.ID, challenge.ActorSubject, challenge.ActorKind, challenge.CreatedTokenDigest, challenge.Operation, challenge.Status,
-		challenge.CreatedAt.UTC(), challenge.ChallengeExpiresAt.UTC(), challenge.CreatedRequestID, challenge.Version)
+    id, actor_subject, actor_kind, actor_binding_version, actor_binding_digest,
+    created_token_digest, operation, status, created_at, challenge_expires_at, created_request_id, version
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+		challenge.ID, challenge.ActorSubject, challenge.ActorKind, challenge.ActorBindingVersion, challenge.ActorBindingDigest,
+		challenge.CreatedTokenDigest, challenge.Operation, challenge.Status, challenge.CreatedAt.UTC(),
+		challenge.ChallengeExpiresAt.UTC(), challenge.CreatedRequestID, challenge.Version)
 	if err != nil {
 		return fmt.Errorf("insert reauthentication challenge: %w", err)
 	}
@@ -67,7 +69,8 @@ func (repository *PostgresRepository) GetReauthenticationChallenge(ctx context.C
 	if repository == nil || repository.pool == nil || id == uuid.Nil {
 		return ReauthenticationChallenge{}, ErrIAMConfiguration
 	}
-	query := `SELECT id, actor_subject, actor_kind, created_token_digest, operation, status,
+	query := `SELECT id, actor_subject, actor_kind, actor_binding_version, actor_binding_digest,
+       created_token_digest, operation, status,
        verified_token_digest, evidence_digest, created_at, verified_at, challenge_expires_at,
        evidence_expires_at, consumed_at, created_request_id::text, completed_request_id::text, version
 FROM iam_reauthentication_challenges WHERE id=$1`
@@ -104,7 +107,8 @@ func scanReauthenticationChallenge(row pgx.Row) (ReauthenticationChallenge, erro
 	var verifiedTokenDigest, evidenceDigest, completedRequestID *string
 	var verifiedAt, evidenceExpiresAt, consumedAt *time.Time
 	err := row.Scan(
-		&challenge.ID, &challenge.ActorSubject, &challenge.ActorKind, &challenge.CreatedTokenDigest, &challenge.Operation, &challenge.Status,
+		&challenge.ID, &challenge.ActorSubject, &challenge.ActorKind, &challenge.ActorBindingVersion, &challenge.ActorBindingDigest,
+		&challenge.CreatedTokenDigest, &challenge.Operation, &challenge.Status,
 		&verifiedTokenDigest, &evidenceDigest, &challenge.CreatedAt, &verifiedAt, &challenge.ChallengeExpiresAt,
 		&evidenceExpiresAt, &consumedAt, &challenge.CreatedRequestID, &completedRequestID, &challenge.Version,
 	)

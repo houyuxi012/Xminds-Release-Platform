@@ -130,11 +130,11 @@ go run ./apps/release-worker
 - `POST /api/v1/auth/local/login`：本地账户登录；
 - `POST /api/v1/auth/emergency/login`：强制 MFA 的应急账户登录。
 
-上述 3 个认证入口不要求现有 Bearer，重认证挑战创建/完成和其他管理 API 仍在统一认证中间件之后。所有环境都必须配置绝对路径 `XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY`；生产、测试和预发环境还必须配置指向非可写 SHA-1/SHA-256 摘要文件的 `XMINDS_RELEASE_IAM_BREACH_CORPUS`，缺失时服务拒绝启动。仅显式 `development` 环境可通过 `XMINDS_RELEASE_IAM_USE_DEVELOPMENT_BREACH_CORPUS=true` 单独启用内置最小语料库；缺省环境、其他环境或与外部语料库同时配置时均拒绝启动。锁定阶段可通过 `XMINDS_RELEASE_IAM_LOCKOUT_STAGES=5:5m,8:30m,10:24h` 配置，次数和时长必须严格递增且满足运行时安全上下界。高风险挑战 TTL、evidence TTL、OIDC 新鲜度/时钟偏差、终态保留期和有界清理批次可通过 `.env.example` 中的 `XMINDS_RELEASE_IAM_REAUTH_*` 变量调整；越过安全边界的配置会导致服务拒绝启动。
+上述 3 个认证入口不要求现有 Bearer，重认证挑战创建/完成和其他管理 API 仍在统一认证中间件之后。所有环境都必须配置绝对路径 `XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY`；生产、测试和预发环境还必须配置指向非可写 SHA-1/SHA-256 摘要文件的 `XMINDS_RELEASE_IAM_BREACH_CORPUS`，缺失时服务拒绝启动。仅显式 `development` 环境可通过 `XMINDS_RELEASE_IAM_USE_DEVELOPMENT_BREACH_CORPUS=true` 单独启用内置最小语料库；缺省环境、其他环境或与外部语料库同时配置时均拒绝启动。锁定阶段可通过 `XMINDS_RELEASE_IAM_LOCKOUT_STAGES=5:5m,8:30m,10:24h` 配置，次数和时长必须严格递增且满足运行时安全上下界。高风险挑战 TTL、evidence TTL、OIDC 新鲜度/时钟偏差、终态保留期和有界清理批次可通过 `.env.example` 中的 `XMINDS_RELEASE_IAM_REAUTH_*` 变量调整；越过安全边界的配置会导致服务拒绝启动。重认证 proof 绑定稳定的内部治理用户 ID；人员 proof 还精确绑定来源 ID，本地 proof 则使用独立的 local 绑定域，空来源从不作为通配。`000016` 会将无法可靠回填该绑定的既有活动 challenge 统一置为 `expired`。
 
 ### 目录连接、活动 OIDC 与异步同步
 
-`XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY` 是 API 与 Worker 共享的受信任 IAM Secret 根（变量名为兼容已有部署保留）。目录必须是无符号链接的绝对路径，Secret 文件不得对 group/other 开放权限，单文件上限 4 KiB。数据库只保存 `secret://iam/<name>` 引用，不保存 Bearer、CA 或 Secret 内容。OIDC 来源 Secret 为严格 JSON：
+`XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY` 是 API 与 Worker 共享的受信任 IAM Secret 根（变量名为兼容已有部署保留）。目录必须是无符号链接的绝对路径，Secret 文件不得对 group/other 开放权限，单文件上限 4 KiB。数据库只保存 `secret://iam/<name>` 引用，不保存 Bearer、CA 或 Secret 内容。Secret 读取使用固定 4 个工作线程与 32 个等待槽位；调用方总超时可取消等待，即使底层 NFS/FUSE 打开操作卡住也不会按请求创建无界线程。每次读取都从同一个已固定目录描述符打开、校验并完整读取单个文件快照；卡住的底层 I/O 最多占满固定工作线程，运维应同时监控上游文件系统健康。OIDC 来源 Secret 为严格 JSON：
 
 ```json
 {
@@ -148,7 +148,7 @@ go run ./apps/release-worker
 }
 ```
 
-`token_use_claim` 必须精确为 `token_use`，以与管理令牌分派器的固定协议一致。当登录模式为 `sso` 时，API 每次人员认证都重读当前登录状态与活动来源；只有精确指向的 `enabled` OIDC 来源可继续。验签器缓存最多保留 16 个信任版本，键绑定来源 ID、数据库版本及 OIDC Secret 与 CA 内容摘要，并发首访仅构建一次。令牌完整验签后还会再次核对活动来源和 Secret 摘要，因此切换来源、进入 fault/local、停用来源或原子轮换 Secret/CA 不会继续接受旧信任。启动时若数据库已处于 SSO 而活动 Secret、CA、DNS/TLS 或 discovery 不可用，API 拒绝启动；`local|configuring|fault` 保持可启动以便运维恢复。
+`token_use_claim` 必须精确为 `token_use`，以与管理令牌分派器的固定协议一致。当登录模式为 `sso` 时，API 每次人员认证都重读当前登录状态与活动来源；只有精确指向的 `enabled` OIDC 来源可继续。验签器缓存最多保留 16 个信任版本，键绑定来源 ID、数据库版本及 OIDC Secret 与 CA 内容摘要，并发首访仅构建一次。JWKS 首次预取会直接作为验签缓存，单次响应严格限制为 2 MiB、最多 128 个 key、单个 `kid` 最多 128 字节；合法轮换只触发一次共享刷新，未知 `kid` 使用有界短期负缓存，所有等待和刷新都服从同一调用方总 deadline。令牌完整验签后还会再次核对活动来源和 Secret 摘要，因此切换来源、进入 fault/local、停用来源或原子轮换 Secret/CA 不会继续接受旧信任。启动时若数据库已处于 SSO 而活动 Secret、CA、DNS/TLS 或 discovery 不可用，API 拒绝启动；`local|configuring|fault` 保持可启动以便运维恢复。
 
 `XMINDS_RELEASE_OIDC_ISSUER` 与 `XMINDS_RELEASE_OIDC_AUDIENCE` 仅配置独立的工作负载 OIDC 发行者，不用于人员认证。人员 OIDC 只来自上述 IAM 来源 Secret；两者不会在验签失败时互相回退。
 
@@ -167,7 +167,7 @@ SCIM 来源 Secret 只引用另一个 Bearer 文件，禁止将 Token 直接写�
 
 目录请求总超时可在 1–30 秒范围内调整，该预算从操作入口开始，覆盖 Secret 读取、DNS、全部分页和 HTTP；单次拨号、TLS 与请求仍受更短上限约束。总页数上限为 10000，用户、组织、成员和层级关系总数上限为 100000。出站连接在解析后固定 IPv4/IPv6 地址并在拨号层校验目标 host，默认仅允许可公开路由地址，拒绝 loopback、link-local/metadata、CGNAT、文档/基准测试网段、unspecified、multicast 和其他特殊用途地址。拒绝表依据 IANA IPv4/IPv6 Special-Purpose Address Registry 的 2025-10-09 快照审核，并采用更保守的安全策略：`2001::/23` 整段均被拒绝，包括 IANA 标记为 globally reachable 的更具体例外，因此该策略不等同于 IANA `Globally Reachable` 属性。只有 `development`/`test` 可通过兼容变量 `XMINDS_RELEASE_IAM_DIRECTORY_ALLOW_LOOPBACK_HTTP=true` 显式允许 loopback HTTP/HTTPS；企业 RFC1918/ULA 私网必须经审核后通过 `XMINDS_RELEASE_IAM_DIRECTORY_ALLOWED_PRIVATE_CIDRS` 仅列出规范化、无主机位且确需访问的 CIDR，例如 `10.42.7.0/24,fd12:3456:789a::/48`。每个获准网段中的任一地址都可能接收目录 Bearer，因此必须遵循最小网段并纳入配置变更审计；即便配置私网 allowlist，仍强制 TLS 1.2+、正确 ServerName、DNS 固定与受控 CA，且不能放行 metadata、CGNAT、link-local 等特殊用途地址。具体变量与默认值见 [`.env.example`](.env.example)。
 
-迁移文件一经发布不得改写。`*.pre.sql` companion 仅用于让历史数据满足对应不可变迁移的前置条件：迁移框架在同一 PostgreSQL 事务中执行 companion 与目标 migration，并分别记录稳定名称和 SHA-256；目标失败时 companion 变更与两条记录全部回滚。已经记录目标 migration 的数据库不会补跑该 companion，后续修正必须使用新的顺序迁移。回滚目录同步迁移前必须停止 API/Worker 并由单一迁移领导者执行；`000015` down 会在同一事务中将仍含 v15 self-cycle staging 的非终态作业及其 active Outbox 收敛为带稳定回滚错误码的 `failed`/`dead_letter`，清理仅属 staging 的自循环关系后再恢复 v14 约束。原有 completed/dead-letter 终态与既有 failed 证据保持不变，迁移 ledger 与稳定错误码用于运维核查和重新发起同步。
+迁移文件一经发布不得改写。`*.pre.sql` companion 仅用于让历史数据满足对应不可变迁移的前置条件：迁移框架在同一 PostgreSQL 事务中执行 companion 与目标 migration，并分别记录稳定名称和 SHA-256；目标失败时 companion 变更与两条记录全部回滚。已经记录目标 migration 的数据库不会补跑该 companion，后续修正必须使用新的顺序迁移。回滚目录同步迁移前必须停止 API/Worker 并由单一迁移领导者执行；`000015` down 会在同一事务中将仍含 v15 self-cycle staging 的非终态作业及其 active Outbox 收敛为带稳定回滚错误码的 `failed`/`dead_letter`，清理仅属 staging 的自循环关系后再恢复 v14 约束。原有 completed/dead-letter 终态与既有 failed 证据保持不变，迁移 ledger 与稳定错误码用于运维核查和重新发起同步。回滚 `000016` 同样必须先停止 API/Worker；down 会先将所有 v16 活动重认证 proof 原子置为 `expired`，再移除旧版运行时无法强制的内部用户/来源绑定列。
 
 默认 Public API 监听 `127.0.0.1:8081`，只提供：
 

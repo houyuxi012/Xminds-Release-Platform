@@ -73,6 +73,101 @@ func TestReauthenticationChallengeBindsActorOperationAndCompletingToken(t *testi
 	}
 }
 
+func TestReauthenticationChallengeCannotCrossGovernedOIDCSourceWithSameSubject(t *testing.T) {
+	harness := newReauthenticationHarness(t)
+	sourceA, sourceB := uuid.New(), uuid.New()
+	userA, userB := uuid.New(), uuid.New()
+	harness.creator.IdentitySourceID, harness.creator.GovernedUserID, harness.creator.Governed = sourceA.String(), userA.String(), true
+	harness.completer.IdentitySourceID, harness.completer.GovernedUserID, harness.completer.Governed = sourceB.String(), userB.String(), true
+	governedAdmin := []identity.RoleScope{{Role: identity.RoleAdmin, Effect: "allow", ScopeType: "platform"}}
+	harness.creator.RoleScopes, harness.completer.RoleScopes = governedAdmin, governedAdmin
+	created, err := harness.service.CreateChallenge(context.Background(), harness.creator, ReauthenticationOperationUserDisable, harness.request)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if completed, completeErr := harness.service.CompleteChallenge(context.Background(), harness.completer, created.ID, CompleteReauthenticationCommand{}, harness.request); !errors.Is(completeErr, ErrHighRiskConfirmationRequired) || completed.Evidence != "" {
+		t.Fatalf("cross-source CompleteChallenge() = %#v, %v", completed, completeErr)
+	}
+	if harness.repository.challenges[created.ID].Status != ReauthenticationStatusPending {
+		t.Fatalf("cross-source completion changed challenge status=%q", harness.repository.challenges[created.ID].Status)
+	}
+
+	sameSourceCompleter := harness.creator
+	sameSourceCompleter.TokenID = "source-a-fresh-token"
+	sameSourceCompleter.AuthenticatedAt = harness.now.Add(-time.Minute)
+	sameSourceCompleter.AuthenticationAssurance = 1
+	completed, err := harness.service.CompleteChallenge(context.Background(), sameSourceCompleter, created.ID, CompleteReauthenticationCommand{}, harness.request)
+	if err != nil {
+		t.Fatalf("same-source CompleteChallenge() error = %v", err)
+	}
+	crossSourceConsumer := harness.completer
+	crossSourceConsumer.TokenID = sameSourceCompleter.TokenID
+	proof := HighRiskProof{ChallengeID: created.ID.String(), Evidence: completed.Evidence, Confirmed: true}
+	if authorizeErr := harness.service.Authorize(context.Background(), crossSourceConsumer, string(ReauthenticationOperationUserDisable), proof, harness.request); !errors.Is(authorizeErr, ErrHighRiskConfirmationRequired) {
+		t.Fatalf("cross-source Authorize() error = %v", authorizeErr)
+	}
+	if harness.repository.challenges[created.ID].Status != ReauthenticationStatusVerified {
+		t.Fatalf("cross-source authorization changed challenge status=%q", harness.repository.challenges[created.ID].Status)
+	}
+	if authorizeErr := harness.service.Authorize(context.Background(), sameSourceCompleter, string(ReauthenticationOperationUserDisable), proof, harness.request); authorizeErr != nil {
+		t.Fatalf("same-source Authorize() error = %v", authorizeErr)
+	}
+}
+
+func TestReauthenticationChallengeUsesExplicitLocalActorBinding(t *testing.T) {
+	harness := newReauthenticationHarness(t)
+	local := harness.creator
+	local.Subject = "local:emergency-admin"
+	local.Kind = identity.PrincipalKindLocal
+	local.IdentitySourceID = ""
+	local.TokenID = "local-session-token"
+	local.AuthenticatedAt = harness.now.Add(-time.Minute)
+	local.AuthenticationAssurance = 1
+
+	created, err := harness.service.CreateChallenge(context.Background(), local, ReauthenticationOperationSSODisable, harness.request)
+	if err != nil {
+		t.Fatalf("local CreateChallenge() error = %v", err)
+	}
+	human := local
+	human.Kind = identity.PrincipalKindHuman
+	human.IdentitySourceID = uuid.NewString()
+	if completed, completeErr := harness.service.CompleteChallenge(context.Background(), human, created.ID, CompleteReauthenticationCommand{}, harness.request); !errors.Is(completeErr, ErrHighRiskConfirmationRequired) || completed.Evidence != "" {
+		t.Fatalf("human CompleteChallenge() against local binding = %#v, %v", completed, completeErr)
+	}
+	completed, err := harness.service.CompleteChallenge(context.Background(), local, created.ID, CompleteReauthenticationCommand{}, harness.request)
+	if err != nil {
+		t.Fatalf("local CompleteChallenge() error = %v", err)
+	}
+	proof := HighRiskProof{ChallengeID: created.ID.String(), Evidence: completed.Evidence, Confirmed: true}
+	if authorizeErr := harness.service.Authorize(context.Background(), local, string(ReauthenticationOperationSSODisable), proof, harness.request); authorizeErr != nil {
+		t.Fatalf("local Authorize() error = %v", authorizeErr)
+	}
+}
+
+func TestReauthenticationChallengeRejectsMissingOrAmbiguousGovernedBinding(t *testing.T) {
+	harness := newReauthenticationHarness(t)
+	for _, testCase := range []struct {
+		name  string
+		actor identity.Principal
+	}{
+		{name: "human without governed user", actor: func() identity.Principal { actor := harness.creator; actor.GovernedUserID = ""; return actor }()},
+		{name: "human without source", actor: func() identity.Principal { actor := harness.creator; actor.IdentitySourceID = ""; return actor }()},
+		{name: "local with human source", actor: func() identity.Principal {
+			actor := harness.creator
+			actor.Kind = identity.PrincipalKindLocal
+			actor.AuthenticationAssurance = 1
+			return actor
+		}()},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			if result, err := harness.service.CreateChallenge(context.Background(), testCase.actor, ReauthenticationOperationUserDisable, harness.request); !errors.Is(err, ErrHighRiskConfirmationRequired) || result.ID != uuid.Nil {
+				t.Fatalf("CreateChallenge() = %#v, %v", result, err)
+			}
+		})
+	}
+}
+
 func TestReauthenticationChallengeRejectsUnsupportedActorsOperationsAndOIDCAssurance(t *testing.T) {
 	harness := newReauthenticationHarness(t)
 	workload := harness.creator
@@ -209,7 +304,9 @@ func newReauthenticationHarness(t *testing.T) *reauthenticationHarness {
 
 func reauthenticationActor(authenticatedAt time.Time, assurance int, tokenID string) identity.Principal {
 	return identity.Principal{
-		Subject: "admin", Kind: identity.PrincipalKindHuman, Roles: []identity.Role{identity.RoleAdmin}, TokenID: tokenID,
+		Subject: "admin", Kind: identity.PrincipalKindHuman, Roles: []identity.Role{identity.RoleAdmin}, TokenID: tokenID, Governed: true,
+		GovernedUserID: "018f835d-7e4b-7abc-9f42-67a2f5f48e01", IdentitySourceID: "018f835d-7e4b-7abc-9f42-67a2f5f48e02",
+		RoleScopes:      []identity.RoleScope{{Role: identity.RoleAdmin, Effect: "allow", ScopeType: "platform"}},
 		AuthenticatedAt: authenticatedAt, AuthenticationAssurance: assurance,
 	}
 }

@@ -43,6 +43,7 @@ type Principal struct {
 	Subject                 string
 	Kind                    PrincipalKind
 	IdentitySourceID        string
+	GovernedUserID          string
 	Roles                   []Role
 	ProductIDs              []string
 	TokenID                 string

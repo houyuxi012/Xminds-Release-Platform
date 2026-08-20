@@ -373,6 +373,9 @@ func (repository *PostgresRepository) InsertLocalUser(ctx context.Context, tx pg
 	if tx == nil || user.ID == uuid.Nil || credential.UserID != user.ID || user.Kind != UserKindLocal {
 		return ErrIAMConfiguration
 	}
+	if err := lockPrincipalMappingKeys(ctx, tx, user.Username, user.Email); err != nil {
+		return err
+	}
 	_, err := tx.Exec(ctx, `
 INSERT INTO user_principals (
     id, identity_source_id, external_subject, username, display_name, email, user_kind, status,

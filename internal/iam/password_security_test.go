@@ -8,8 +8,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestFileBreachCheckerRejectsDigestMatchesAndMalformedCorpus(t *testing.T) {
@@ -120,6 +123,94 @@ func TestDirectorySecretResolverConfinesReferencesToConfiguredRoot(t *testing.T)
 			t.Fatalf("Resolve(%q) error = %v", reference, err)
 		}
 	}
+}
+
+func TestDirectorySecretResolverReturnsWhenContextExpiresDuringBlockedFileOpen(t *testing.T) {
+	root := resolvedTempDir(t)
+	fifo := filepath.Join(root, "blocked-secret")
+	if err := unix.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resolver, err := NewDirectorySecretResolver(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resolver.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		_, resolveErr := resolver.Resolve(ctx, "secret://iam/blocked-secret")
+		result <- resolveErr
+	}()
+
+	var resolveErr error
+	returnedBeforeRelease := false
+	select {
+	case resolveErr = <-result:
+		returnedBeforeRelease = true
+	case <-time.After(400 * time.Millisecond):
+	}
+	writer, openErr := unix.Open(fifo, unix.O_WRONLY|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if openErr != nil {
+		t.Fatalf("release blocked FIFO open: %v", openErr)
+	}
+	_ = unix.Close(writer)
+	if !returnedBeforeRelease {
+		resolveErr = <-result
+		t.Fatalf("Resolve() ignored context deadline until blocking file open was externally released: %v", resolveErr)
+	}
+	if !errors.Is(resolveErr, context.DeadlineExceeded) {
+		t.Fatalf("Resolve() error=%v, want context deadline exceeded", resolveErr)
+	}
+}
+
+func TestSecretIOExecutorCapsBlockedWorkersAndReturnsCanceledCallers(t *testing.T) {
+	const (
+		workers   = 2
+		callers   = 12
+		queueSize = 2
+	)
+	release := make(chan struct{})
+	var active, maximum atomic.Int32
+	executor := newSecretIOExecutor(workers, queueSize, func(string) ([]byte, error) {
+		current := active.Add(1)
+		for {
+			observed := maximum.Load()
+			if current <= observed || maximum.CompareAndSwap(observed, current) {
+				break
+			}
+		}
+		<-release
+		active.Add(-1)
+		return []byte("snapshot"), nil
+	})
+
+	results := make(chan error, callers)
+	for range callers {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancel()
+			_, err := executor.Resolve(ctx, "secret://iam/blocked")
+			results <- err
+		}()
+	}
+	for range callers {
+		select {
+		case err := <-results:
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("Resolve() error=%v, want context deadline exceeded", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("canceled Secret caller did not return")
+		}
+	}
+	if got := maximum.Load(); got != workers {
+		t.Fatalf("maximum blocked Secret readers=%d, want fixed worker cap %d", got, workers)
+	}
+	close(release)
+	executor.Close()
 }
 
 func TestDirectorySecretResolverRejectsSymlinkRoot(t *testing.T) {
@@ -253,6 +344,34 @@ func TestDirectorySecretResolverPinsOpenedRootAcrossPathReplacement(t *testing.T
 	secret, err := resolver.Resolve(context.Background(), "secret://iam/admin-totp")
 	if err != nil || string(secret) != "ORIGINAL-SECRET" {
 		t.Fatalf("Resolve(after root replacement) = %q, %v", secret, err)
+	}
+}
+
+func TestDirectorySecretResolverReadsCompleteAtomicFileRotationSnapshots(t *testing.T) {
+	root := resolvedTempDir(t)
+	secretPath := filepath.Join(root, "rotating-secret")
+	if err := os.WriteFile(secretPath, []byte("OLD-COMPLETE-SNAPSHOT"), 0o400); err != nil {
+		t.Fatal(err)
+	}
+	resolver, err := NewDirectorySecretResolver(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resolver.Close()
+	oldSnapshot, err := resolver.Resolve(context.Background(), "secret://iam/rotating-secret")
+	if err != nil || string(oldSnapshot) != "OLD-COMPLETE-SNAPSHOT" {
+		t.Fatalf("Resolve(old snapshot)=%q, %v", oldSnapshot, err)
+	}
+	replacement := filepath.Join(root, "replacement")
+	if err := os.WriteFile(replacement, []byte("NEW-COMPLETE-SNAPSHOT"), 0o400); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacement, secretPath); err != nil {
+		t.Fatal(err)
+	}
+	newSnapshot, err := resolver.Resolve(context.Background(), "secret://iam/rotating-secret")
+	if err != nil || string(newSnapshot) != "NEW-COMPLETE-SNAPSHOT" {
+		t.Fatalf("Resolve(new snapshot)=%q, %v", newSnapshot, err)
 	}
 }
 

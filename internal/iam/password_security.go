@@ -119,8 +119,9 @@ type SecretResolver interface {
 }
 
 type DirectorySecretResolver struct {
-	mutex sync.RWMutex
-	root  *os.File
+	mutex    sync.RWMutex
+	root     *os.File
+	executor *secretIOExecutor
 }
 
 func NewDirectorySecretResolver(root string) (*DirectorySecretResolver, error) {
@@ -137,11 +138,17 @@ func NewDirectorySecretResolver(root string) (*DirectorySecretResolver, error) {
 		_ = directory.Close()
 		return nil, ErrSecretReferenceInvalid
 	}
-	return &DirectorySecretResolver{root: directory}, nil
+	resolver := &DirectorySecretResolver{root: directory}
+	resolver.executor = newSecretIOExecutor(directorySecretIOWorkers, directorySecretIOQueueSize, resolver.readSnapshot)
+	if resolver.executor == nil {
+		_ = directory.Close()
+		return nil, ErrSecretReferenceInvalid
+	}
+	return resolver, nil
 }
 
-func (resolver *DirectorySecretResolver) Resolve(_ context.Context, reference string) ([]byte, error) {
-	if resolver == nil {
+func (resolver *DirectorySecretResolver) Resolve(ctx context.Context, reference string) ([]byte, error) {
+	if resolver == nil || resolver.executor == nil || ctx == nil {
 		return nil, ErrSecretReferenceInvalid
 	}
 	const prefix = "secret://iam/"
@@ -149,9 +156,13 @@ func (resolver *DirectorySecretResolver) Resolve(_ context.Context, reference st
 	if !found || name == "" || name != filepath.Base(name) || strings.ContainsAny(name, `/\\`) {
 		return nil, ErrSecretReferenceInvalid
 	}
+	return resolver.executor.Resolve(ctx, name)
+}
+
+func (resolver *DirectorySecretResolver) readSnapshot(name string) ([]byte, error) {
 	resolver.mutex.RLock()
 	defer resolver.mutex.RUnlock()
-	if !trustedDirectoryDescriptor(resolver.root) {
+	if resolver.root == nil || !trustedDirectoryDescriptor(resolver.root) {
 		return nil, ErrSecretReferenceInvalid
 	}
 	fd, err := unix.Openat(int(resolver.root.Fd()), name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
@@ -178,6 +189,9 @@ func (resolver *DirectorySecretResolver) Resolve(_ context.Context, reference st
 func (resolver *DirectorySecretResolver) Close() error {
 	if resolver == nil {
 		return nil
+	}
+	if resolver.executor != nil {
+		resolver.executor.Close()
 	}
 	resolver.mutex.Lock()
 	defer resolver.mutex.Unlock()

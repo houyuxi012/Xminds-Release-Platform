@@ -140,15 +140,19 @@ func (factory *OIDCTrustFactory) client(ctx context.Context, material oidcTrustM
 }
 
 func (factory *OIDCTrustFactory) humanVerifier(ctx context.Context, material oidcTrustMaterial) (identity.Verifier, error) {
-	client, jwksURL, err := factory.prepare(ctx, material)
+	client, jwksURL, prefetchedKeys, err := factory.prepare(ctx, material)
 	if err != nil {
 		return nil, err
 	}
 	configuration := material.configuration
+	keySet, err := newBoundedOIDCKeySet(client, jwksURL, configuration.SigningAlgorithms, prefetchedKeys)
+	if err != nil {
+		return nil, ErrDirectoryResponseInvalid
+	}
 	verifier, err := identity.NewOIDCVerifier(ctx, identity.OIDCVerifierConfig{
 		Issuer: configuration.Issuer, Audience: configuration.Audience, RolesClaim: configuration.RolesClaim,
 		ProductIDsClaim: configuration.ProductIDsClaim, TokenUseClaim: configuration.TokenUseClaim,
-		SigningAlgorithms: append([]string(nil), configuration.SigningAlgorithms...), HTTPClient: client, JWKSURL: jwksURL,
+		SigningAlgorithms: append([]string(nil), configuration.SigningAlgorithms...), HTTPClient: client, KeySet: keySet,
 	})
 	if err != nil {
 		return nil, ErrDirectoryUpstreamRejected
@@ -156,27 +160,31 @@ func (factory *OIDCTrustFactory) humanVerifier(ctx context.Context, material oid
 	return verifier, nil
 }
 
-func (factory *OIDCTrustFactory) prepare(ctx context.Context, material oidcTrustMaterial) (*http.Client, string, error) {
+func (factory *OIDCTrustFactory) prepare(ctx context.Context, material oidcTrustMaterial) (*http.Client, string, oidcJWKSet, error) {
 	client, err := factory.client(ctx, material)
 	if err != nil {
-		return nil, "", err
+		return nil, "", oidcJWKSet{}, err
 	}
 	configuration := material.configuration
 	var discovery oidcDiscoveryDocument
 	if err := getDirectoryJSON(ctx, client, configuration.Issuer+"/.well-known/openid-configuration", "", &discovery); err != nil {
-		return nil, "", err
+		return nil, "", oidcJWKSet{}, err
 	}
 	if discovery.Issuer != configuration.Issuer || !safeRelatedURL(discovery.JWKSURI, configuration.Issuer, factory.allowLoopbackHTTP) {
-		return nil, "", ErrDirectoryResponseInvalid
+		return nil, "", oidcJWKSet{}, ErrDirectoryResponseInvalid
 	}
 	var keySet oidcJWKSet
 	if err := getDirectoryJSON(ctx, client, discovery.JWKSURI, "", &keySet); err != nil {
-		return nil, "", err
+		return nil, "", oidcJWKSet{}, err
 	}
-	if !validOIDCKeySet(keySet, configuration.SigningAlgorithms) {
-		return nil, "", ErrDirectoryResponseInvalid
+	allowedAlgorithms, err := oidcAllowedAlgorithms(configuration.SigningAlgorithms)
+	if err != nil {
+		return nil, "", oidcJWKSet{}, ErrDirectoryResponseInvalid
 	}
-	return client, discovery.JWKSURI, nil
+	if _, err := parseOIDCVerificationKeys(keySet, allowedAlgorithms); err != nil {
+		return nil, "", oidcJWKSet{}, ErrDirectoryResponseInvalid
+	}
+	return client, discovery.JWKSURI, keySet, nil
 }
 
 func oidcTrustDigestText(digest [sha256.Size]byte) string {
