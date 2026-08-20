@@ -16,9 +16,8 @@ import (
 )
 
 const (
-	directoryConflictCursorVersion   = 1
+	directoryConflictCursorVersion   = 2
 	directoryConflictCursorAADDomain = "xminds-release-platform:iam:directory-conflict-cursor"
-	directoryConflictCursorFilter    = "all"
 )
 
 type DirectoryConflictCursorCodec struct {
@@ -73,16 +72,16 @@ func NewDirectoryConflictCursorCodec(key []byte, clock func() time.Time, ttl tim
 	return &DirectoryConflictCursorCodec{aead: aead, clock: clock, ttl: ttl}, nil
 }
 
-func (codec *DirectoryConflictCursorCodec) Encode(route string, sourceID uuid.UUID, limit int, beforeTime time.Time, beforeID uuid.UUID) (string, error) {
-	if !validDirectoryConflictCursorBinding(codec, route, sourceID, limit) || beforeTime.IsZero() || beforeID == uuid.Nil {
+func (codec *DirectoryConflictCursorCodec) Encode(route string, sourceID uuid.UUID, status DirectorySyncConflictStatusFilter, limit int, beforeTime time.Time, beforeID uuid.UUID) (string, error) {
+	if !validDirectoryConflictCursorBinding(codec, route, sourceID, status, limit) || beforeTime.IsZero() || beforeID == uuid.Nil {
 		return "", ErrPageInvalid
 	}
-	additionalData, err := directoryConflictCursorAdditionalData(route, sourceID, limit)
+	additionalData, err := directoryConflictCursorAdditionalData(route, sourceID, status, limit)
 	if err != nil {
 		return "", err
 	}
 	payload, err := json.Marshal(directoryConflictCursorPayload{
-		Version: directoryConflictCursorVersion, Route: route, SourceID: sourceID, Limit: limit, Filter: directoryConflictCursorFilter,
+		Version: directoryConflictCursorVersion, Route: route, SourceID: sourceID, Limit: limit, Filter: string(status),
 		BeforeTime: beforeTime.UTC(), BeforeID: beforeID, ExpiresAt: codec.clock().UTC().Add(codec.ttl),
 	})
 	if err != nil {
@@ -96,8 +95,8 @@ func (codec *DirectoryConflictCursorCodec) Encode(route string, sourceID uuid.UU
 	return base64.RawURLEncoding.EncodeToString(sealed), nil
 }
 
-func (codec *DirectoryConflictCursorCodec) Decode(encoded, route string, sourceID uuid.UUID, limit int) (time.Time, uuid.UUID, error) {
-	if !validDirectoryConflictCursorBinding(codec, route, sourceID, limit) || strings.TrimSpace(encoded) != encoded {
+func (codec *DirectoryConflictCursorCodec) Decode(encoded, route string, sourceID uuid.UUID, status DirectorySyncConflictStatusFilter, limit int) (time.Time, uuid.UUID, error) {
+	if !validDirectoryConflictCursorBinding(codec, route, sourceID, status, limit) || strings.TrimSpace(encoded) != encoded {
 		return time.Time{}, uuid.Nil, ErrPageInvalid
 	}
 	sealed, err := base64.RawURLEncoding.DecodeString(encoded)
@@ -105,7 +104,7 @@ func (codec *DirectoryConflictCursorCodec) Decode(encoded, route string, sourceI
 		return time.Time{}, uuid.Nil, ErrPageInvalid
 	}
 	nonce, ciphertext := sealed[:codec.aead.NonceSize()], sealed[codec.aead.NonceSize():]
-	additionalData, err := directoryConflictCursorAdditionalData(route, sourceID, limit)
+	additionalData, err := directoryConflictCursorAdditionalData(route, sourceID, status, limit)
 	if err != nil {
 		return time.Time{}, uuid.Nil, err
 	}
@@ -115,20 +114,20 @@ func (codec *DirectoryConflictCursorCodec) Decode(encoded, route string, sourceI
 	}
 	var payload directoryConflictCursorPayload
 	if strictjson.DecodeBytes(payloadJSON, 1024, &payload) != nil || payload.Version != directoryConflictCursorVersion || payload.Route != route ||
-		payload.SourceID != sourceID || payload.Limit != limit || payload.Filter != directoryConflictCursorFilter || payload.BeforeTime.IsZero() || payload.BeforeID == uuid.Nil ||
+		payload.SourceID != sourceID || payload.Limit != limit || payload.Filter != string(status) || payload.BeforeTime.IsZero() || payload.BeforeID == uuid.Nil ||
 		!payload.ExpiresAt.After(codec.clock().UTC()) {
 		return time.Time{}, uuid.Nil, ErrPageInvalid
 	}
 	return payload.BeforeTime.UTC(), payload.BeforeID, nil
 }
 
-func directoryConflictCursorAdditionalData(route string, sourceID uuid.UUID, limit int) ([]byte, error) {
-	if strings.TrimSpace(route) != route || route == "" || len(route) > 128 || sourceID == uuid.Nil || limit < 1 || limit > 200 {
+func directoryConflictCursorAdditionalData(route string, sourceID uuid.UUID, status DirectorySyncConflictStatusFilter, limit int) ([]byte, error) {
+	if strings.TrimSpace(route) != route || route == "" || len(route) > 128 || sourceID == uuid.Nil || !validDirectoryConflictStatusFilter(status) || limit < 1 || limit > 200 {
 		return nil, ErrPageInvalid
 	}
 	additionalData, err := json.Marshal(directoryConflictCursorBinding{
 		Domain: directoryConflictCursorAADDomain, Version: directoryConflictCursorVersion, Route: route,
-		SourceID: sourceID, Limit: limit, Filter: directoryConflictCursorFilter,
+		SourceID: sourceID, Limit: limit, Filter: string(status),
 	})
 	if err != nil {
 		return nil, ErrPageInvalid
@@ -136,7 +135,11 @@ func directoryConflictCursorAdditionalData(route string, sourceID uuid.UUID, lim
 	return additionalData, nil
 }
 
-func validDirectoryConflictCursorBinding(codec *DirectoryConflictCursorCodec, route string, sourceID uuid.UUID, limit int) bool {
+func validDirectoryConflictCursorBinding(codec *DirectoryConflictCursorCodec, route string, sourceID uuid.UUID, status DirectorySyncConflictStatusFilter, limit int) bool {
 	route = strings.TrimSpace(route)
-	return codec != nil && codec.aead != nil && codec.clock != nil && route != "" && len(route) <= 128 && sourceID != uuid.Nil && limit >= 1 && limit <= 200
+	return codec != nil && codec.aead != nil && codec.clock != nil && route != "" && len(route) <= 128 && sourceID != uuid.Nil && validDirectoryConflictStatusFilter(status) && limit >= 1 && limit <= 200
+}
+
+func validDirectoryConflictStatusFilter(status DirectorySyncConflictStatusFilter) bool {
+	return status == DirectorySyncConflictStatusOpen || status == DirectorySyncConflictStatusResolved || status == DirectorySyncConflictStatusAll
 }

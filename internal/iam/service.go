@@ -414,11 +414,18 @@ func (service *Service) GetDirectorySyncJob(ctx context.Context, actor identity.
 	return service.directorySync.GetJob(ctx, actor, sourceID, jobID)
 }
 
-func (service *Service) ListDirectorySyncConflicts(ctx context.Context, actor identity.Principal, sourceID uuid.UUID, page Page) (DirectorySyncConflictPage, error) {
+func (service *Service) ListDirectorySyncConflicts(ctx context.Context, actor identity.Principal, sourceID uuid.UUID, status DirectorySyncConflictStatusFilter, page Page) (DirectorySyncConflictPage, error) {
 	if service == nil || service.directorySync == nil {
 		return DirectorySyncConflictPage{}, ErrDirectorySyncConfiguration
 	}
-	return service.directorySync.ListConflicts(ctx, actor, sourceID, page)
+	return service.directorySync.ListConflicts(ctx, actor, sourceID, status, page)
+}
+
+func (service *Service) ResolveDirectorySyncConflict(ctx context.Context, actor identity.Principal, sourceID, conflictID uuid.UUID, command ResolveDirectorySyncConflictCommand, proof HighRiskProof, request RequestContext) (DirectorySyncConflict, error) {
+	if service == nil || service.directorySync == nil {
+		return DirectorySyncConflict{}, ErrDirectorySyncConfiguration
+	}
+	return service.directorySync.ResolveConflict(ctx, actor, sourceID, conflictID, command, proof, request)
 }
 
 func (service *Service) PreviewIdentitySource(ctx context.Context, actor identity.Principal, sourceID uuid.UUID, request RequestContext) (SyncDiff, error) {

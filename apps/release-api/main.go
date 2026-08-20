@@ -256,7 +256,7 @@ func run(ctx context.Context, arguments []string, environ map[string]string) err
 		return fmt.Errorf("configure governed IAM principal resolver: %w", err)
 	}
 	directorySyncService, err := iam.NewDirectorySyncService(iam.DirectorySyncServiceConfig{
-		Store: iamRepository, Jobs: jobRepository, Auditor: auditor, Clock: time.Now, ConflictCursors: directoryCursorCodec,
+		Store: iamRepository, Jobs: jobRepository, Auditor: auditor, HighRisk: reauthenticationService, Clock: time.Now, ConflictCursors: directoryCursorCodec,
 	})
 	if err != nil {
 		return fmt.Errorf("configure IAM directory sync service: %w", err)

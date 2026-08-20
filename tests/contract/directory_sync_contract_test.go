@@ -26,6 +26,7 @@ func TestDirectorySynchronizationOpenAPIContract(t *testing.T) {
 		{method: "POST", path: "/api/v1/identity-sources/{source_id}/sync"},
 		{method: "GET", path: "/api/v1/identity-sources/{source_id}/sync-jobs/{job_id}"},
 		{method: "GET", path: "/api/v1/identity-sources/{source_id}/sync-conflicts"},
+		{method: "POST", path: "/api/v1/identity-sources/{source_id}/sync-conflicts/{conflict_id}/resolve"},
 	} {
 		pathItem := document.Paths.Find(operation.path)
 		if pathItem == nil || pathItem.GetOperation(operation.method) == nil {

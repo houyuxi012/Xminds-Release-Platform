@@ -29,13 +29,14 @@ const (
 type ReauthenticationOperation string
 
 const (
-	ReauthenticationOperationRoleBindingCreate  ReauthenticationOperation = "identity.role_binding.create"
-	ReauthenticationOperationRoleBindingDelete  ReauthenticationOperation = "identity.role_binding.delete"
-	ReauthenticationOperationUserDisable        ReauthenticationOperation = "identity.user.disable"
-	ReauthenticationOperationUserEnable         ReauthenticationOperation = "identity.user.enable"
-	ReauthenticationOperationUserRevokeSessions ReauthenticationOperation = "identity.user.revoke_sessions"
-	ReauthenticationOperationSSOEnable          ReauthenticationOperation = "identity.sso.enable"
-	ReauthenticationOperationSSODisable         ReauthenticationOperation = "identity.sso.disable"
+	ReauthenticationOperationRoleBindingCreate        ReauthenticationOperation = "identity.role_binding.create"
+	ReauthenticationOperationRoleBindingDelete        ReauthenticationOperation = "identity.role_binding.delete"
+	ReauthenticationOperationUserDisable              ReauthenticationOperation = "identity.user.disable"
+	ReauthenticationOperationUserEnable               ReauthenticationOperation = "identity.user.enable"
+	ReauthenticationOperationUserRevokeSessions       ReauthenticationOperation = "identity.user.revoke_sessions"
+	ReauthenticationOperationSSOEnable                ReauthenticationOperation = "identity.sso.enable"
+	ReauthenticationOperationSSODisable               ReauthenticationOperation = "identity.sso.disable"
+	ReauthenticationOperationDirectoryConflictResolve ReauthenticationOperation = "identity.directory_conflict.resolve"
 )
 
 type ReauthenticationStatus string
@@ -348,7 +349,7 @@ func validReauthenticationOperation(operation ReauthenticationOperation) bool {
 	switch operation {
 	case ReauthenticationOperationRoleBindingCreate, ReauthenticationOperationRoleBindingDelete,
 		ReauthenticationOperationUserDisable, ReauthenticationOperationUserEnable, ReauthenticationOperationUserRevokeSessions,
-		ReauthenticationOperationSSOEnable, ReauthenticationOperationSSODisable:
+		ReauthenticationOperationSSOEnable, ReauthenticationOperationSSODisable, ReauthenticationOperationDirectoryConflictResolve:
 		return true
 	default:
 		return false

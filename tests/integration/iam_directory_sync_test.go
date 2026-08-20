@@ -402,8 +402,8 @@ func TestDirectorySyncMigrationUpgradesImmutableOriginal14ToCurrent(t *testing.T
 	if err := pool.QueryRow(ctx, `SELECT max(version) FROM schema_migrations`).Scan(&maximumVersion); err != nil {
 		t.Fatal(err)
 	}
-	if maximumVersion != 16 {
-		t.Fatalf("maximum migration version=%d, want 16", maximumVersion)
+	if maximumVersion != 17 {
+		t.Fatalf("maximum migration version=%d, want 17", maximumVersion)
 	}
 	var original14PreflightRows int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM schema_migration_preflights WHERE migration_version=14`).Scan(&original14PreflightRows); err != nil {
@@ -1698,7 +1698,7 @@ VALUES ($1, repeat('a',64), $2, 'local_password', 0, $3::timestamptz, $3::timest
 	if roleCount != 1 || revokedSessionCount != 1 || validMembershipCount != 1 || ambiguousCount != 0 || cycleCount != 0 || collisionCount != 0 || dependentCount != 0 {
 		t.Fatalf("preservation role=%d revoked=%d membership=%d ambiguous=%d cycles=%d collisions=%d dependents=%d", roleCount, revokedSessionCount, validMembershipCount, ambiguousCount, cycleCount, collisionCount, dependentCount)
 	}
-	conflicts, err := service.ListConflicts(ctx, directorySyncIntegrationAdmin(), sourceID, iam.Page{Limit: 100})
+	conflicts, err := service.ListConflicts(ctx, directorySyncIntegrationAdmin(), sourceID, iam.DirectorySyncConflictStatusOpen, iam.Page{Limit: 100})
 	if err != nil {
 		t.Fatal(err)
 	}

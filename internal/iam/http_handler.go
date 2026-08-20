@@ -45,7 +45,8 @@ type DirectorySyncApplication interface {
 	VerifyIdentitySourceVersioned(ctx context.Context, actor identity.Principal, sourceID uuid.UUID, expectedVersion int64, request RequestContext) (CapabilityReport, error)
 	StartDirectorySync(ctx context.Context, actor identity.Principal, sourceID uuid.UUID, mode DirectorySyncMode, expectedVersion int64, request RequestContext) (DirectorySyncJob, error)
 	GetDirectorySyncJob(ctx context.Context, actor identity.Principal, sourceID, jobID uuid.UUID) (DirectorySyncJob, error)
-	ListDirectorySyncConflicts(ctx context.Context, actor identity.Principal, sourceID uuid.UUID, page Page) (DirectorySyncConflictPage, error)
+	ListDirectorySyncConflicts(ctx context.Context, actor identity.Principal, sourceID uuid.UUID, status DirectorySyncConflictStatusFilter, page Page) (DirectorySyncConflictPage, error)
+	ResolveDirectorySyncConflict(ctx context.Context, actor identity.Principal, sourceID, conflictID uuid.UUID, command ResolveDirectorySyncConflictCommand, proof HighRiskProof, request RequestContext) (DirectorySyncConflict, error)
 }
 
 func NewHTTPHandler(application IAMApplication) http.Handler {
@@ -95,6 +96,7 @@ func registerDirectorySyncRoutes(router chi.Router, application DirectorySyncApp
 	router.Post("/api/v1/identity-sources/{source_id}/sync", startDirectorySyncHandler(application, DirectorySyncModeApply))
 	router.Get("/api/v1/identity-sources/{source_id}/sync-jobs/{job_id}", getDirectorySyncJobHandler(application))
 	router.Get("/api/v1/identity-sources/{source_id}/sync-conflicts", listDirectorySyncConflictsHandler(application))
+	router.Post("/api/v1/identity-sources/{source_id}/sync-conflicts/{conflict_id}/resolve", resolveDirectorySyncConflictHandler(application))
 }
 
 func verifyIdentitySourceHandler(application DirectorySyncApplication) http.HandlerFunc {
@@ -185,12 +187,12 @@ func listDirectorySyncConflictsHandler(application DirectorySyncApplication) htt
 		if !ok {
 			return
 		}
-		page, err := parseDirectoryConflictPage(request)
+		status, page, err := parseDirectoryConflictPage(request)
 		if err != nil {
 			writeIAMApplicationError(writer, request, err)
 			return
 		}
-		result, err := application.ListDirectorySyncConflicts(request.Context(), principal, sourceID, page)
+		result, err := application.ListDirectorySyncConflicts(request.Context(), principal, sourceID, status, page)
 		if err != nil {
 			writeIAMApplicationError(writer, request, err)
 			return
@@ -199,22 +201,67 @@ func listDirectorySyncConflictsHandler(application DirectorySyncApplication) htt
 	}
 }
 
-func parseDirectoryConflictPage(request *http.Request) (Page, error) {
+func resolveDirectorySyncConflictHandler(application DirectorySyncApplication) http.HandlerFunc {
+	type input struct {
+		Version          int64                               `json:"version"`
+		Decision         DirectoryConflictResolutionDecision `json:"decision"`
+		Reason           string                              `json:"reason"`
+		Reauthentication reauthenticationProofInput          `json:"reauthentication"`
+	}
+	return func(writer http.ResponseWriter, request *http.Request) {
+		principal, ok := requireIAMPrincipal(writer, request)
+		if !ok {
+			return
+		}
+		sourceID, ok := parseDirectoryPathID(writer, request, "source_id", "IDENTITY_SOURCE_ID_INVALID")
+		if !ok {
+			return
+		}
+		conflictID, ok := parseDirectoryPathID(writer, request, "conflict_id", "DIRECTORY_SYNC_CONFLICT_ID_INVALID")
+		if !ok {
+			return
+		}
+		var body input
+		if err := decodeIAMJSON(request, &body); err != nil {
+			writeIAMProblem(writer, request, http.StatusBadRequest, "REQUEST_BODY_INVALID", "Request body is invalid", ErrIdentitySourceInputInvalid)
+			return
+		}
+		result, err := application.ResolveDirectorySyncConflict(request.Context(), principal, sourceID, conflictID, ResolveDirectorySyncConflictCommand{
+			Version: body.Version, Decision: body.Decision, Reason: body.Reason,
+		}, body.Reauthentication.proof(), iamRequestContext(request))
+		if err != nil {
+			writeIAMApplicationError(writer, request, err)
+			return
+		}
+		writer.Header().Set("Cache-Control", "no-store")
+		writeIAMJSON(writer, http.StatusOK, result)
+	}
+}
+
+func parseDirectoryConflictPage(request *http.Request) (DirectorySyncConflictStatusFilter, Page, error) {
 	page := Page{}
+	rawStatus := request.URL.Query().Get("status")
+	status := DirectorySyncConflictStatusFilter(strings.TrimSpace(rawStatus))
+	if status == "" {
+		status = DirectorySyncConflictStatusOpen
+	}
+	if !validDirectoryConflictStatusFilter(status) || (rawStatus != "" && string(status) != rawStatus) {
+		return "", Page{}, ErrPageInvalid
+	}
 	if rawLimit := strings.TrimSpace(request.URL.Query().Get("limit")); rawLimit != "" {
 		limit, err := strconv.Atoi(rawLimit)
 		if err != nil || limit < 1 || limit > 200 {
-			return Page{}, ErrPageInvalid
+			return "", Page{}, ErrPageInvalid
 		}
 		page.Limit = limit
 	}
 	if cursor := request.URL.Query().Get("cursor"); cursor != "" {
 		if strings.TrimSpace(cursor) != cursor || len(cursor) > 512 {
-			return Page{}, ErrPageInvalid
+			return "", Page{}, ErrPageInvalid
 		}
 		page.Cursor = cursor
 	}
-	return page, nil
+	return status, page, nil
 }
 
 func parseDirectoryPathID(writer http.ResponseWriter, request *http.Request, parameter, code string) (uuid.UUID, bool) {
@@ -674,6 +721,8 @@ func writeIAMApplicationError(writer http.ResponseWriter, request *http.Request,
 		writeIAMProblem(writer, request, http.StatusNotFound, "ROLE_BINDING_NOT_FOUND", "Role binding was not found", err)
 	case errors.Is(err, ErrIdentitySourceNotFound):
 		writeIAMProblem(writer, request, http.StatusNotFound, "IDENTITY_SOURCE_NOT_FOUND", "Identity source was not found", err)
+	case errors.Is(err, ErrDirectoryConflictNotFound):
+		writeIAMProblem(writer, request, http.StatusNotFound, "DIRECTORY_SYNC_CONFLICT_NOT_FOUND", "Directory synchronization conflict was not found", err)
 	case errors.Is(err, ErrIAMConflict):
 		writeIAMProblem(writer, request, http.StatusConflict, "IAM_RECORD_CONFLICT", "Identity record conflicts with current state", err)
 	case errors.Is(err, ErrDirectorySyncActive):
@@ -719,6 +768,9 @@ func iamProblemInstance(path string) string {
 		}
 		if len(segments) >= 3 && segments[1] == "sync-jobs" && segments[2] != "" {
 			segments[2] = "{job_id}"
+		}
+		if len(segments) >= 4 && segments[1] == "sync-conflicts" && segments[2] != "" && segments[3] == "resolve" {
+			segments[2] = "{conflict_id}"
 		}
 		return sourcePrefix + strings.Join(segments, "/")
 	}

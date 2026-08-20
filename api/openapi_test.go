@@ -320,3 +320,55 @@ func TestOpenAPIDefinesDurableDirectorySynchronizationWithoutWorkerState(t *test
 		}
 	}
 }
+
+func TestOpenAPIDefinesDirectoryConflictResolutionAndStatusBoundPagination(t *testing.T) {
+	t.Parallel()
+	loader := openapi3.NewLoader()
+	document, err := loader.LoadFromFile("openapi.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	list := document.Paths.Find("/api/v1/identity-sources/{source_id}/sync-conflicts")
+	if list == nil || list.Get == nil {
+		t.Fatal("directory conflict list operation is missing")
+	}
+	statusFound := false
+	for _, parameter := range list.Get.Parameters {
+		if parameter.Value != nil && parameter.Value.Name == "status" {
+			statusFound = true
+			if parameter.Value.Schema == nil || parameter.Value.Schema.Value == nil || parameter.Value.Schema.Value.Default != "open" {
+				t.Fatal("directory conflict status must default to open")
+			}
+		}
+	}
+	if !statusFound {
+		t.Fatal("directory conflict status query is missing")
+	}
+	resolve := document.Paths.Find("/api/v1/identity-sources/{source_id}/sync-conflicts/{conflict_id}/resolve")
+	if resolve == nil || resolve.Post == nil || resolve.Post.Extensions["x-required-action"] != "identity.manage" {
+		t.Fatal("directory conflict resolution operation is missing or unprotected")
+	}
+	for _, status := range []string{"200", "400", "403", "404", "409", "500"} {
+		if resolve.Post.Responses.Value(status) == nil {
+			t.Fatalf("directory conflict resolution response %s is missing", status)
+		}
+	}
+	request := document.Components.Schemas["ResolveDirectorySyncConflictRequest"]
+	if request == nil || request.Value == nil || request.Value.AdditionalProperties.Has != nil && *request.Value.AdditionalProperties.Has {
+		t.Fatal("strict directory conflict resolution request schema is missing")
+	}
+	for _, field := range []string{"version", "decision", "reason", "reauthentication"} {
+		if _, found := request.Value.Properties[field]; !found {
+			t.Fatalf("ResolveDirectorySyncConflictRequest.%s is missing", field)
+		}
+	}
+	conflict := document.Components.Schemas["DirectorySyncConflict"]
+	if conflict == nil || conflict.Value == nil {
+		t.Fatal("DirectorySyncConflict schema is missing")
+	}
+	for _, field := range []string{"version", "resolution_decision", "resolution_reason", "resolved_by", "resolved_at"} {
+		if _, found := conflict.Value.Properties[field]; !found {
+			t.Fatalf("DirectorySyncConflict.%s is missing", field)
+		}
+	}
+}

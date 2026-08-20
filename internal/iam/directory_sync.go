@@ -2,6 +2,8 @@ package iam
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,9 +19,10 @@ import (
 )
 
 const (
-	JobKindDirectorySync          = "iam.directory.sync.v1"
-	directorySyncBatchAuditAction = "identity.directory_sync.batch.apply"
-	directoryConflictCursorRoute  = "iam.directory-sync-conflicts"
+	JobKindDirectorySync           = "iam.directory.sync.v1"
+	directorySyncBatchAuditAction  = "identity.directory_sync.batch.apply"
+	directoryConflictCursorRoute   = "iam.directory-sync-conflicts"
+	directoryConflictResolveAction = "identity.directory_conflict.resolve"
 )
 
 type DirectorySyncMode string
@@ -37,6 +40,24 @@ const (
 	DirectorySyncStatusCompleted DirectorySyncStatus = "completed"
 	DirectorySyncStatusFailed    DirectorySyncStatus = "failed"
 )
+
+type DirectorySyncConflictStatusFilter string
+
+const (
+	DirectorySyncConflictStatusOpen     DirectorySyncConflictStatusFilter = "open"
+	DirectorySyncConflictStatusResolved DirectorySyncConflictStatusFilter = "resolved"
+	DirectorySyncConflictStatusAll      DirectorySyncConflictStatusFilter = "all"
+)
+
+type DirectoryConflictResolutionDecision string
+
+const DirectoryConflictResolutionKeepLastSafe DirectoryConflictResolutionDecision = "keep_last_safe"
+
+type ResolveDirectorySyncConflictCommand struct {
+	Version  int64
+	Decision DirectoryConflictResolutionDecision
+	Reason   string
+}
 
 type DirectorySyncPhase string
 
@@ -89,15 +110,20 @@ type DirectorySyncJobPayload struct {
 }
 
 type DirectorySyncConflict struct {
-	ID               uuid.UUID       `json:"id"`
-	SyncJobID        uuid.UUID       `json:"sync_job_id"`
-	IdentitySourceID uuid.UUID       `json:"identity_source_id"`
-	ObjectType       string          `json:"object_type"`
-	ExternalID       string          `json:"external_id"`
-	Code             string          `json:"code"`
-	Details          json.RawMessage `json:"details"`
-	Status           string          `json:"status"`
-	CreatedAt        time.Time       `json:"created_at"`
+	ID                 uuid.UUID                           `json:"id"`
+	SyncJobID          uuid.UUID                           `json:"sync_job_id"`
+	IdentitySourceID   uuid.UUID                           `json:"identity_source_id"`
+	ObjectType         string                              `json:"object_type"`
+	ExternalID         string                              `json:"external_id"`
+	Code               string                              `json:"code"`
+	Details            json.RawMessage                     `json:"details"`
+	Status             string                              `json:"status"`
+	Version            int64                               `json:"version"`
+	ResolutionDecision DirectoryConflictResolutionDecision `json:"resolution_decision,omitempty"`
+	ResolutionReason   string                              `json:"resolution_reason,omitempty"`
+	ResolvedBy         string                              `json:"resolved_by,omitempty"`
+	ResolvedAt         *time.Time                          `json:"resolved_at,omitempty"`
+	CreatedAt          time.Time                           `json:"created_at"`
 }
 
 type DirectorySyncConflictPage struct {
@@ -110,7 +136,10 @@ type DirectorySyncStore interface {
 	GetIdentitySource(ctx context.Context, tx pgx.Tx, id uuid.UUID) (IdentitySource, error)
 	InsertDirectorySyncJob(ctx context.Context, tx pgx.Tx, job DirectorySyncJob) error
 	GetDirectorySyncJob(ctx context.Context, sourceID, jobID uuid.UUID) (DirectorySyncJob, error)
-	ListDirectorySyncConflicts(ctx context.Context, sourceID uuid.UUID, page Page) (DirectorySyncConflictPage, error)
+	ListDirectorySyncConflicts(ctx context.Context, sourceID uuid.UUID, status DirectorySyncConflictStatusFilter, page Page) (DirectorySyncConflictPage, error)
+	GetDirectorySyncConflict(ctx context.Context, sourceID, conflictID uuid.UUID) (DirectorySyncConflict, DirectorySyncStatus, error)
+	LockDirectorySyncConflict(ctx context.Context, tx pgx.Tx, sourceID, conflictID uuid.UUID) (DirectorySyncConflict, DirectorySyncStatus, error)
+	ResolveDirectorySyncConflict(ctx context.Context, tx pgx.Tx, conflict DirectorySyncConflict, expectedVersion int64) error
 }
 
 type DirectorySyncJobEnqueuer interface {
@@ -123,6 +152,7 @@ type DirectorySyncServiceConfig struct {
 	Auditor         AuditAppender
 	Clock           func() time.Time
 	ConflictCursors *DirectoryConflictCursorCodec
+	HighRisk        HighRiskAuthorizer
 }
 
 type DirectorySyncService struct {
@@ -132,13 +162,14 @@ type DirectorySyncService struct {
 	authorizer      *identity.Authorizer
 	clock           func() time.Time
 	conflictCursors *DirectoryConflictCursorCodec
+	highRisk        HighRiskAuthorizer
 }
 
 func NewDirectorySyncService(config DirectorySyncServiceConfig) (*DirectorySyncService, error) {
 	if config.Store == nil || config.Jobs == nil || config.Auditor == nil || config.Clock == nil || config.ConflictCursors == nil {
 		return nil, ErrDirectorySyncConfiguration
 	}
-	return &DirectorySyncService{store: config.Store, jobs: config.Jobs, auditor: config.Auditor, authorizer: identity.NewAuthorizer(), clock: config.Clock, conflictCursors: config.ConflictCursors}, nil
+	return &DirectorySyncService{store: config.Store, jobs: config.Jobs, auditor: config.Auditor, highRisk: config.HighRisk, authorizer: identity.NewAuthorizer(), clock: config.Clock, conflictCursors: config.ConflictCursors}, nil
 }
 
 func (service *DirectorySyncService) Start(ctx context.Context, actor identity.Principal, sourceID uuid.UUID, mode DirectorySyncMode, expectedVersion int64, request RequestContext) (DirectorySyncJob, error) {
@@ -222,12 +253,18 @@ func (service *DirectorySyncService) GetJob(ctx context.Context, actor identity.
 	return redactDirectorySyncJob(job), nil
 }
 
-func (service *DirectorySyncService) ListConflicts(ctx context.Context, actor identity.Principal, sourceID uuid.UUID, page Page) (DirectorySyncConflictPage, error) {
+func (service *DirectorySyncService) ListConflicts(ctx context.Context, actor identity.Principal, sourceID uuid.UUID, status DirectorySyncConflictStatusFilter, page Page) (DirectorySyncConflictPage, error) {
 	if service == nil || service.authorizer == nil || sourceID == uuid.Nil {
 		return DirectorySyncConflictPage{}, ErrDirectorySyncNotFound
 	}
 	if err := service.authorizer.Require(actor, identity.ActionIdentityManage, ""); err != nil {
 		return DirectorySyncConflictPage{}, err
+	}
+	if status == "" {
+		status = DirectorySyncConflictStatusOpen
+	}
+	if status != DirectorySyncConflictStatusOpen && status != DirectorySyncConflictStatusResolved && status != DirectorySyncConflictStatusAll {
+		return DirectorySyncConflictPage{}, ErrPageInvalid
 	}
 	if !validIAMPage(page) || (page.Cursor != "" && (!page.BeforeTime.IsZero() || page.BeforeID != uuid.Nil)) {
 		return DirectorySyncConflictPage{}, ErrPageInvalid
@@ -237,7 +274,7 @@ func (service *DirectorySyncService) ListConflicts(ctx context.Context, actor id
 		return DirectorySyncConflictPage{}, err
 	}
 	if page.Cursor != "" {
-		page.BeforeTime, page.BeforeID, err = service.conflictCursors.Decode(page.Cursor, directoryConflictCursorRoute, sourceID, limit)
+		page.BeforeTime, page.BeforeID, err = service.conflictCursors.Decode(page.Cursor, directoryConflictCursorRoute, sourceID, status, limit)
 		if err != nil {
 			return DirectorySyncConflictPage{}, err
 		}
@@ -245,7 +282,7 @@ func (service *DirectorySyncService) ListConflicts(ctx context.Context, actor id
 	if _, err := service.store.GetIdentitySource(ctx, nil, sourceID); err != nil {
 		return DirectorySyncConflictPage{}, err
 	}
-	result, err := service.store.ListDirectorySyncConflicts(ctx, sourceID, page)
+	result, err := service.store.ListDirectorySyncConflicts(ctx, sourceID, status, page)
 	if err != nil {
 		return DirectorySyncConflictPage{}, err
 	}
@@ -254,12 +291,98 @@ func (service *DirectorySyncService) ListConflicts(ctx context.Context, actor id
 			return DirectorySyncConflictPage{}, ErrPageInvalid
 		}
 		last := result.Items[len(result.Items)-1]
-		result.NextCursor, err = service.conflictCursors.Encode(directoryConflictCursorRoute, sourceID, limit, last.CreatedAt, last.ID)
+		result.NextCursor, err = service.conflictCursors.Encode(directoryConflictCursorRoute, sourceID, status, limit, last.CreatedAt, last.ID)
 		if err != nil {
 			return DirectorySyncConflictPage{}, err
 		}
 	}
 	return result, nil
+}
+
+func (service *DirectorySyncService) ResolveConflict(ctx context.Context, actor identity.Principal, sourceID, conflictID uuid.UUID, command ResolveDirectorySyncConflictCommand, proof HighRiskProof, request RequestContext) (DirectorySyncConflict, error) {
+	if service == nil || service.store == nil || service.auditor == nil || service.authorizer == nil || service.clock == nil || service.highRisk == nil {
+		return DirectorySyncConflict{}, ErrDirectorySyncConfiguration
+	}
+	reason := strings.TrimSpace(command.Reason)
+	reasonCharacters := len([]rune(reason))
+	if sourceID == uuid.Nil || conflictID == uuid.Nil || command.Version < 1 || command.Decision != DirectoryConflictResolutionKeepLastSafe || reasonCharacters < 8 || reasonCharacters > 512 {
+		return DirectorySyncConflict{}, ErrIdentitySourceInputInvalid
+	}
+	if err := service.authorizer.Require(actor, identity.ActionIdentityManage, ""); err != nil {
+		return DirectorySyncConflict{}, err
+	}
+	governedUserID, err := uuid.Parse(strings.TrimSpace(actor.GovernedUserID))
+	if !actor.Governed || err != nil || governedUserID == uuid.Nil || (actor.Kind != identity.PrincipalKindHuman && actor.Kind != identity.PrincipalKindLocal) {
+		return DirectorySyncConflict{}, identity.ErrActionDenied
+	}
+	if _, err := service.store.GetIdentitySource(ctx, nil, sourceID); err != nil {
+		return DirectorySyncConflict{}, err
+	}
+	preflight, jobStatus, err := service.store.GetDirectorySyncConflict(ctx, sourceID, conflictID)
+	if err != nil {
+		return DirectorySyncConflict{}, err
+	}
+	if err := validateDirectoryConflictResolutionState(preflight, jobStatus, command.Version); err != nil {
+		return DirectorySyncConflict{}, err
+	}
+	if !proof.Confirmed || service.highRisk.Authorize(ctx, actor, string(ReauthenticationOperationDirectoryConflictResolve), proof, request) != nil {
+		return DirectorySyncConflict{}, ErrHighRiskConfirmationRequired
+	}
+	now := service.clock().UTC().Truncate(time.Microsecond)
+	digest := sha256.Sum256([]byte(reason))
+	var resolved DirectorySyncConflict
+	err = service.store.WithinTransaction(ctx, func(tx pgx.Tx) error {
+		current, currentJobStatus, lockErr := service.store.LockDirectorySyncConflict(ctx, tx, sourceID, conflictID)
+		if lockErr != nil {
+			return lockErr
+		}
+		if stateErr := validateDirectoryConflictResolutionState(current, currentJobStatus, command.Version); stateErr != nil {
+			return stateErr
+		}
+		previousVersion := current.Version
+		current.Status = string(DirectorySyncConflictStatusResolved)
+		current.Version++
+		current.ResolutionDecision = command.Decision
+		current.ResolutionReason = reason
+		current.ResolvedBy = governedUserID.String()
+		current.ResolvedAt = &now
+		if saveErr := service.store.ResolveDirectorySyncConflict(ctx, tx, current, previousVersion); saveErr != nil {
+			return saveErr
+		}
+		auditActor := actor
+		auditActor.TokenID = ""
+		_, appendErr := service.auditor.Append(ctx, tx, audit.AppendCommand{
+			Actor: auditActor, Action: directoryConflictResolveAction, ResourceType: "directory_sync_conflict", ResourceID: current.ID.String(),
+			Outcome: audit.OutcomeSuccess, RequestID: request.RequestID, SourceIP: request.SourceIP,
+			Metadata: map[string]any{
+				"identity_source_id": current.IdentitySourceID.String(), "sync_job_id": current.SyncJobID.String(),
+				"object_type": current.ObjectType, "conflict_code": current.Code, "decision": current.ResolutionDecision,
+				"previous_status": DirectorySyncConflictStatusOpen, "new_status": DirectorySyncConflictStatusResolved,
+				"previous_version": previousVersion, "new_version": current.Version,
+				"reason_digest": hex.EncodeToString(digest[:]), "reason_characters": reasonCharacters,
+			},
+		})
+		if appendErr != nil {
+			return appendErr
+		}
+		resolved = current
+		return nil
+	})
+	if err != nil {
+		return DirectorySyncConflict{}, err
+	}
+	return resolved, nil
+}
+
+func validateDirectoryConflictResolutionState(conflict DirectorySyncConflict, jobStatus DirectorySyncStatus, expectedVersion int64) error {
+	if conflict.ID == uuid.Nil {
+		return ErrDirectoryConflictNotFound
+	}
+	if conflict.Version != expectedVersion || conflict.Status != string(DirectorySyncConflictStatusOpen) ||
+		(jobStatus != DirectorySyncStatusCompleted && jobStatus != DirectorySyncStatusFailed) {
+		return ErrIAMConflict
+	}
+	return nil
 }
 
 func redactDirectorySyncJob(job DirectorySyncJob) DirectorySyncJob {

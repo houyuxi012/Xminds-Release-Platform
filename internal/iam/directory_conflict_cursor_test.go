@@ -22,24 +22,29 @@ func TestDirectoryConflictCursorIsOpaqueBoundAuthenticatedAndExpiring(t *testing
 	sourceID, beforeID := uuid.New(), uuid.New()
 	beforeTime := now.Add(-time.Minute)
 	const route = "iam.directory-sync-conflicts"
-	cursor, err := codec.Encode(route, sourceID, 50, beforeTime, beforeID)
+	const status = DirectorySyncConflictStatusOpen
+	cursor, err := codec.Encode(route, sourceID, status, 50, beforeTime, beforeID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(cursor, sourceID.String()) || strings.Contains(cursor, beforeID.String()) || strings.Contains(cursor, beforeTime.Format(time.RFC3339)) {
 		t.Fatalf("cursor is not opaque: %s", cursor)
 	}
-	decodedTime, decodedID, err := codec.Decode(cursor, route, sourceID, 50)
+	decodedTime, decodedID, err := codec.Decode(cursor, route, sourceID, status, 50)
 	if err != nil || !decodedTime.Equal(beforeTime) || decodedID != beforeID {
 		t.Fatalf("Decode() time=%v id=%s error=%v", decodedTime, decodedID, err)
 	}
 	mutated := []byte(cursor)
 	mutated[len(mutated)/2] ^= 1
 	for name, decode := range map[string]func() error{
-		"tampered":      func() error { _, _, err := codec.Decode(string(mutated), route, sourceID, 50); return err },
-		"cross source":  func() error { _, _, err := codec.Decode(cursor, route, uuid.New(), 50); return err },
-		"cross route":   func() error { _, _, err := codec.Decode(cursor, "iam.users", sourceID, 50); return err },
-		"changed limit": func() error { _, _, err := codec.Decode(cursor, route, sourceID, 100); return err },
+		"tampered":      func() error { _, _, err := codec.Decode(string(mutated), route, sourceID, status, 50); return err },
+		"cross source":  func() error { _, _, err := codec.Decode(cursor, route, uuid.New(), status, 50); return err },
+		"cross route":   func() error { _, _, err := codec.Decode(cursor, "iam.users", sourceID, status, 50); return err },
+		"changed limit": func() error { _, _, err := codec.Decode(cursor, route, sourceID, status, 100); return err },
+		"cross status": func() error {
+			_, _, err := codec.Decode(cursor, route, sourceID, DirectorySyncConflictStatusResolved, 50)
+			return err
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if err := decode(); !errors.Is(err, ErrPageInvalid) {
@@ -51,7 +56,7 @@ func TestDirectoryConflictCursorIsOpaqueBoundAuthenticatedAndExpiring(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := replacementCodec.Decode(cursor, route, sourceID, 50); !errors.Is(err, ErrPageInvalid) {
+	if _, _, err := replacementCodec.Decode(cursor, route, sourceID, status, 50); !errors.Is(err, ErrPageInvalid) {
 		t.Fatalf("rotated-key Decode() error=%v", err)
 	}
 	sealed, err := base64.RawURLEncoding.DecodeString(cursor)
@@ -59,7 +64,7 @@ func TestDirectoryConflictCursorIsOpaqueBoundAuthenticatedAndExpiring(t *testing
 		t.Fatal(err)
 	}
 	nonceSize := codec.aead.NonceSize()
-	additionalData, err := directoryConflictCursorAdditionalData(route, sourceID, 50)
+	additionalData, err := directoryConflictCursorAdditionalData(route, sourceID, status, 50)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,11 +86,21 @@ func TestDirectoryConflictCursorIsOpaqueBoundAuthenticatedAndExpiring(t *testing
 	}
 	versionNonce := bytes.Repeat([]byte{0x7d}, codec.aead.NonceSize())
 	versionCursor := base64.RawURLEncoding.EncodeToString(codec.aead.Seal(versionNonce, versionNonce, payloadJSON, additionalData))
-	if _, _, err := codec.Decode(versionCursor, route, sourceID, 50); !errors.Is(err, ErrPageInvalid) {
+	if _, _, err := codec.Decode(versionCursor, route, sourceID, status, 50); !errors.Is(err, ErrPageInvalid) {
 		t.Fatalf("future-version Decode() error=%v", err)
 	}
+	payload.Version = 1
+	payloadJSON, err = json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyNonce := bytes.Repeat([]byte{0x4d}, codec.aead.NonceSize())
+	legacyCursor := base64.RawURLEncoding.EncodeToString(codec.aead.Seal(legacyNonce, legacyNonce, payloadJSON, additionalData))
+	if _, _, err := codec.Decode(legacyCursor, route, sourceID, status, 50); !errors.Is(err, ErrPageInvalid) {
+		t.Fatalf("legacy-version Decode() error=%v", err)
+	}
 	now = now.Add(16 * time.Minute)
-	if _, _, err := codec.Decode(cursor, route, sourceID, 50); !errors.Is(err, ErrPageInvalid) {
+	if _, _, err := codec.Decode(cursor, route, sourceID, status, 50); !errors.Is(err, ErrPageInvalid) {
 		t.Fatalf("expired Decode() error=%v", err)
 	}
 }

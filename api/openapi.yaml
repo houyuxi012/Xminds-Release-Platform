@@ -1625,6 +1625,7 @@ paths:
       x-required-action: identity.manage
       parameters:
         - $ref: '#/components/parameters/IdentitySourceIDPath'
+        - $ref: '#/components/parameters/DirectoryConflictStatus'
         - $ref: '#/components/parameters/Limit'
         - $ref: '#/components/parameters/DirectoryConflictCursor'
       responses:
@@ -1636,6 +1637,35 @@ paths:
         '400': {$ref: '#/components/responses/UnprocessableEntity'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /api/v1/identity-sources/{source_id}/sync-conflicts/{conflict_id}/resolve:
+    post:
+      operationId: resolveIdentitySourceSynchronizationConflict
+      summary: 确认保留目录冲突的最后安全状态
+      description: 仅终结当前冲突证据，不修改用户、组织、成员关系、角色或产品与通道权限；上游冲突持续存在时，后续同步将产生新的开放冲突。
+      tags: [Identity Governance]
+      x-required-action: identity.manage
+      parameters:
+        - $ref: '#/components/parameters/IdentitySourceIDPath'
+        - $ref: '#/components/parameters/DirectorySyncConflictIDPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ResolveDirectorySyncConflictRequest'}
+      responses:
+        '200':
+          description: 冲突已处置，保留最后安全状态
+          headers:
+            Cache-Control:
+              schema: {type: string, const: no-store}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DirectorySyncConflict'}
+        '400': {$ref: '#/components/responses/UnprocessableEntity'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
         '500': {$ref: '#/components/responses/InternalError'}
   /api/v1/identity-sources/{source_id}/enable:
     post:
@@ -1764,6 +1794,13 @@ components:
       schema:
         type: string
         format: uuid
+    DirectorySyncConflictIDPath:
+      name: conflict_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
     UserIDPath:
       name: user_id
       in: path
@@ -1801,6 +1838,14 @@ components:
       schema:
         type: string
         maxLength: 512
+    DirectoryConflictStatus:
+      name: status
+      in: query
+      description: 冲突状态过滤条件；加密认证游标与该值绑定，禁止跨过滤条件重放。
+      schema:
+        type: string
+        enum: [open, resolved, all]
+        default: open
   securitySchemes:
     oidcBearer:
       type: http
@@ -2826,6 +2871,7 @@ components:
         - identity.user.revoke_sessions
         - identity.sso.enable
         - identity.sso.disable
+        - identity.directory_conflict.resolve
     HighRiskProof:
       type: object
       additionalProperties: false
@@ -3039,7 +3085,7 @@ components:
     DirectorySyncConflict:
       type: object
       additionalProperties: false
-      required: [id, sync_job_id, identity_source_id, object_type, external_id, code, details, status, created_at]
+      required: [id, sync_job_id, identity_source_id, object_type, external_id, code, details, status, version, created_at]
       properties:
         id: {type: string, format: uuid}
         sync_job_id: {type: string, format: uuid}
@@ -3052,6 +3098,11 @@ components:
           additionalProperties: true
           maxProperties: 8
         status: {type: string, enum: [open, resolved]}
+        version: {type: integer, minimum: 1}
+        resolution_decision: {type: string, enum: [keep_last_safe]}
+        resolution_reason: {type: string, minLength: 8, maxLength: 512}
+        resolved_by: {type: string, format: uuid}
+        resolved_at: {type: string, format: date-time}
         created_at: {type: string, format: date-time}
     DirectorySyncConflictPage:
       type: object
@@ -3063,6 +3114,19 @@ components:
           maxItems: 200
           items: {$ref: '#/components/schemas/DirectorySyncConflict'}
         next_cursor: {type: string, maxLength: 512}
+    ResolveDirectorySyncConflictRequest:
+      type: object
+      additionalProperties: false
+      required: [version, decision, reason, reauthentication]
+      properties:
+        version: {type: integer, minimum: 1}
+        decision: {type: string, enum: [keep_last_safe]}
+        reason:
+          type: string
+          minLength: 8
+          maxLength: 512
+          description: 管理员处置理由；服务端去除首尾空白后校验并仅在业务表保存原文，审计仅保存 SHA-256 摘要和字符数。
+        reauthentication: {$ref: '#/components/schemas/HighRiskProof'}
     ActivateLocalAccountRequest:
       type: object
       additionalProperties: false

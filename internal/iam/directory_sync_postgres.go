@@ -55,8 +55,8 @@ FROM directory_sync_jobs WHERE id=$1 AND identity_source_id=$2`, jobID, sourceID
 	return job, nil
 }
 
-func (repository *PostgresRepository) ListDirectorySyncConflicts(ctx context.Context, sourceID uuid.UUID, page Page) (DirectorySyncConflictPage, error) {
-	if repository == nil || repository.pool == nil || sourceID == uuid.Nil {
+func (repository *PostgresRepository) ListDirectorySyncConflicts(ctx context.Context, sourceID uuid.UUID, status DirectorySyncConflictStatusFilter, page Page) (DirectorySyncConflictPage, error) {
+	if repository == nil || repository.pool == nil || sourceID == uuid.Nil || !validDirectoryConflictStatusFilter(status) {
 		return DirectorySyncConflictPage{}, ErrDirectorySyncNotFound
 	}
 	limit, err := pageLimit(page)
@@ -64,25 +64,22 @@ func (repository *PostgresRepository) ListDirectorySyncConflicts(ctx context.Con
 		return DirectorySyncConflictPage{}, err
 	}
 	rows, err := repository.pool.Query(ctx, `
-SELECT id, sync_job_id, identity_source_id, object_type, external_id, conflict_code,
-       details, status, created_at
-FROM directory_sync_conflicts
-WHERE identity_source_id=$1
-  AND ($2::timestamptz IS NULL OR (created_at, id) < ($2, $3))
-ORDER BY created_at DESC, id DESC
-LIMIT $4`, sourceID, nullableTime(page.BeforeTime), page.BeforeID, limit+1)
+SELECT `+directorySyncConflictColumns+`
+FROM directory_sync_conflicts AS conflict
+WHERE conflict.identity_source_id=$1
+  AND ($2::text = 'all' OR conflict.status = $2)
+  AND ($3::timestamptz IS NULL OR (conflict.created_at, conflict.id) < ($3, $4))
+ORDER BY conflict.created_at DESC, conflict.id DESC
+LIMIT $5`, sourceID, status, nullableTime(page.BeforeTime), page.BeforeID, limit+1)
 	if err != nil {
 		return DirectorySyncConflictPage{}, fmt.Errorf("list directory synchronization conflicts: %w", err)
 	}
 	defer rows.Close()
 	items := make([]DirectorySyncConflict, 0, limit+1)
 	for rows.Next() {
-		var conflict DirectorySyncConflict
-		if err := rows.Scan(
-			&conflict.ID, &conflict.SyncJobID, &conflict.IdentitySourceID, &conflict.ObjectType, &conflict.ExternalID,
-			&conflict.Code, &conflict.Details, &conflict.Status, &conflict.CreatedAt,
-		); err != nil {
-			return DirectorySyncConflictPage{}, fmt.Errorf("scan directory synchronization conflict: %w", err)
+		conflict, scanErr := scanDirectorySyncConflict(rows)
+		if scanErr != nil {
+			return DirectorySyncConflictPage{}, fmt.Errorf("scan directory synchronization conflict: %w", scanErr)
 		}
 		items = append(items, conflict)
 	}
@@ -96,6 +93,86 @@ LIMIT $4`, sourceID, nullableTime(page.BeforeTime), page.BeforeID, limit+1)
 		result.NextCursor = encodeIAMCursor(last.CreatedAt, last.ID)
 	}
 	return result, nil
+}
+
+const directorySyncConflictColumns = `conflict.id, conflict.sync_job_id, conflict.identity_source_id,
+conflict.object_type, conflict.external_id, conflict.conflict_code, conflict.details, conflict.status,
+conflict.version, COALESCE(conflict.resolution_decision, ''), COALESCE(conflict.resolution_reason, ''),
+COALESCE(conflict.resolved_by, ''), conflict.resolved_at, conflict.created_at`
+
+func (repository *PostgresRepository) GetDirectorySyncConflict(ctx context.Context, sourceID, conflictID uuid.UUID) (DirectorySyncConflict, DirectorySyncStatus, error) {
+	if repository == nil || repository.pool == nil || sourceID == uuid.Nil || conflictID == uuid.Nil {
+		return DirectorySyncConflict{}, "", ErrDirectoryConflictNotFound
+	}
+	return scanDirectorySyncConflictWithJob(repository.pool.QueryRow(ctx, `SELECT `+directorySyncConflictColumns+`, sync_job.status
+FROM directory_sync_conflicts AS conflict
+JOIN directory_sync_jobs AS sync_job ON sync_job.id=conflict.sync_job_id
+WHERE conflict.id=$1 AND conflict.identity_source_id=$2`, conflictID, sourceID))
+}
+
+func (repository *PostgresRepository) LockDirectorySyncConflict(ctx context.Context, tx pgx.Tx, sourceID, conflictID uuid.UUID) (DirectorySyncConflict, DirectorySyncStatus, error) {
+	if repository == nil || repository.pool == nil || tx == nil || sourceID == uuid.Nil || conflictID == uuid.Nil {
+		return DirectorySyncConflict{}, "", ErrDirectoryConflictNotFound
+	}
+	return scanDirectorySyncConflictWithJob(tx.QueryRow(ctx, `SELECT `+directorySyncConflictColumns+`, sync_job.status
+FROM directory_sync_conflicts AS conflict
+JOIN directory_sync_jobs AS sync_job ON sync_job.id=conflict.sync_job_id
+WHERE conflict.id=$1 AND conflict.identity_source_id=$2
+FOR UPDATE OF conflict, sync_job`, conflictID, sourceID))
+}
+
+func (repository *PostgresRepository) ResolveDirectorySyncConflict(ctx context.Context, tx pgx.Tx, conflict DirectorySyncConflict, expectedVersion int64) error {
+	if repository == nil || repository.pool == nil || tx == nil || conflict.ID == uuid.Nil || expectedVersion < 1 ||
+		conflict.Status != string(DirectorySyncConflictStatusResolved) || conflict.ResolutionDecision != DirectoryConflictResolutionKeepLastSafe || conflict.ResolvedAt == nil {
+		return ErrDirectorySyncConfiguration
+	}
+	command, err := tx.Exec(ctx, `
+UPDATE directory_sync_conflicts
+SET status='resolved', resolution_decision=$1, resolution_reason=$2, resolved_by=$3,
+    resolved_at=$4, version=$5
+WHERE id=$6 AND identity_source_id=$7 AND status='open' AND version=$8`,
+		conflict.ResolutionDecision, conflict.ResolutionReason, conflict.ResolvedBy, conflict.ResolvedAt, conflict.Version,
+		conflict.ID, conflict.IdentitySourceID, expectedVersion)
+	if err != nil {
+		return fmt.Errorf("resolve directory synchronization conflict: %w", err)
+	}
+	if command.RowsAffected() != 1 {
+		return ErrIAMConflict
+	}
+	return nil
+}
+
+func scanDirectorySyncConflict(row pgx.Row) (DirectorySyncConflict, error) {
+	var conflict DirectorySyncConflict
+	var resolvedAt *time.Time
+	err := row.Scan(&conflict.ID, &conflict.SyncJobID, &conflict.IdentitySourceID, &conflict.ObjectType, &conflict.ExternalID,
+		&conflict.Code, &conflict.Details, &conflict.Status, &conflict.Version, &conflict.ResolutionDecision,
+		&conflict.ResolutionReason, &conflict.ResolvedBy, &resolvedAt, &conflict.CreatedAt)
+	if resolvedAt != nil {
+		value := resolvedAt.UTC()
+		conflict.ResolvedAt = &value
+	}
+	return conflict, err
+}
+
+func scanDirectorySyncConflictWithJob(row pgx.Row) (DirectorySyncConflict, DirectorySyncStatus, error) {
+	var conflict DirectorySyncConflict
+	var jobStatus DirectorySyncStatus
+	var resolvedAt *time.Time
+	err := row.Scan(&conflict.ID, &conflict.SyncJobID, &conflict.IdentitySourceID, &conflict.ObjectType, &conflict.ExternalID,
+		&conflict.Code, &conflict.Details, &conflict.Status, &conflict.Version, &conflict.ResolutionDecision,
+		&conflict.ResolutionReason, &conflict.ResolvedBy, &resolvedAt, &conflict.CreatedAt, &jobStatus)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return DirectorySyncConflict{}, "", ErrDirectoryConflictNotFound
+	}
+	if err != nil {
+		return DirectorySyncConflict{}, "", fmt.Errorf("get directory synchronization conflict: %w", err)
+	}
+	if resolvedAt != nil {
+		value := resolvedAt.UTC()
+		conflict.ResolvedAt = &value
+	}
+	return conflict, jobStatus, nil
 }
 
 func scanDirectorySyncJob(row pgx.Row) (DirectorySyncJob, error) {

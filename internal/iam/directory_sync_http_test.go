@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -92,6 +93,19 @@ func TestDirectorySyncHTTPRejectsCaseFoldVersionAlias(t *testing.T) {
 	}
 }
 
+func TestDirectoryConflictListStatusDefaultsOpenAndRejectsUnknownValues(t *testing.T) {
+	status, page, err := parseDirectoryConflictPage(httptest.NewRequest(http.MethodGet, "/api/v1/identity-sources/ignored/sync-conflicts?limit=25", nil))
+	if err != nil || status != DirectorySyncConflictStatusOpen || page.Limit != 25 {
+		t.Fatalf("default status=%q page=%#v error=%v", status, page, err)
+	}
+	for _, raw := range []string{"closed", "%20resolved", "ALL"} {
+		request := httptest.NewRequest(http.MethodGet, "/api/v1/identity-sources/ignored/sync-conflicts?status="+raw, nil)
+		if _, _, err := parseDirectoryConflictPage(request); !errors.Is(err, ErrPageInvalid) {
+			t.Fatalf("status %q error=%v", raw, err)
+		}
+	}
+}
+
 func TestDirectorySyncHTTPJobOwnershipMismatchIsNotFoundAndConflictCursorIsOpaque(t *testing.T) {
 	sourceID, jobID := uuid.New(), uuid.New()
 	application := &directoryHTTPApplication{
@@ -113,25 +127,62 @@ func TestDirectorySyncHTTPJobOwnershipMismatchIsNotFoundAndConflictCursorIsOpaqu
 		t.Fatalf("job status=%d body=%s", jobResponse.Code, jobResponse.Body)
 	}
 
-	conflictRequest := httptest.NewRequest(http.MethodGet, "/api/v1/identity-sources/"+sourceID.String()+"/sync-conflicts?limit=25&cursor=opaque-input", nil)
+	conflictRequest := httptest.NewRequest(http.MethodGet, "/api/v1/identity-sources/"+sourceID.String()+"/sync-conflicts?status=resolved&limit=25&cursor=opaque-input", nil)
 	conflictRequest.Header.Set("Authorization", "Bearer token")
 	conflictResponse := httptest.NewRecorder()
 	handler.ServeHTTP(conflictResponse, conflictRequest)
 	if conflictResponse.Code != http.StatusOK || !strings.Contains(conflictResponse.Body.String(), "opaque-list-cursor") || strings.Contains(conflictResponse.Body.String(), "worker-cursor") {
 		t.Fatalf("conflicts status=%d body=%s", conflictResponse.Code, conflictResponse.Body)
 	}
-	if application.listedPage.Limit != 25 || application.listedPage.Cursor != "opaque-input" || !application.listedPage.BeforeTime.IsZero() || application.listedPage.BeforeID != uuid.Nil {
+	for _, absent := range []string{"resolution_decision", "resolution_reason", "resolved_by", "resolved_at"} {
+		if strings.Contains(conflictResponse.Body.String(), absent) {
+			t.Fatalf("open conflict response included optional %s: %s", absent, conflictResponse.Body)
+		}
+	}
+	if application.listedStatus != DirectorySyncConflictStatusResolved || application.listedPage.Limit != 25 || application.listedPage.Cursor != "opaque-input" || !application.listedPage.BeforeTime.IsZero() || application.listedPage.BeforeID != uuid.Nil {
 		t.Fatalf("directory conflict page=%#v", application.listedPage)
 	}
 }
 
+func TestDirectoryConflictResolutionHTTPIsStrictNoStoreAndDoesNotEchoSensitiveInput(t *testing.T) {
+	sourceID, conflictID, challengeID := uuid.New(), uuid.New(), uuid.New()
+	resolvedAt := time.Date(2026, 8, 21, 16, 0, 0, 0, time.UTC)
+	application := &directoryHTTPApplication{
+		stubIAMApplication: &stubIAMApplication{},
+		resolvedConflict:   DirectorySyncConflict{ID: conflictID, IdentitySourceID: sourceID, Status: "resolved", Version: 2, ResolutionDecision: DirectoryConflictResolutionKeepLastSafe, ResolutionReason: "confirmed upstream collision", ResolvedBy: uuid.NewString(), ResolvedAt: &resolvedAt},
+	}
+	handler := authenticatedIAMHandler(application)
+	body := `{"version":1,"decision":"keep_last_safe","reason":"confirmed upstream collision","reauthentication":{"challenge_id":"` + challengeID.String() + `","evidence":"xmr_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ","confirmed":true}}`
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/identity-sources/"+sourceID.String()+"/sync-conflicts/"+conflictID.String()+"/resolve", bytes.NewBufferString(body))
+	request.Header.Set("Authorization", "Bearer token")
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || response.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("status=%d cache=%q body=%s", response.Code, response.Header().Get("Cache-Control"), response.Body)
+	}
+	if application.resolveCommand.Version != 1 || application.resolveCommand.Decision != DirectoryConflictResolutionKeepLastSafe || application.resolveProof.ChallengeID != challengeID.String() || !application.resolveProof.Confirmed {
+		t.Fatalf("resolution command=%#v proof=%#v", application.resolveCommand, application.resolveProof)
+	}
+
+	malformed := httptest.NewRequest(http.MethodPost, "/api/v1/identity-sources/"+sourceID.String()+"/sync-conflicts/"+conflictID.String()+"/resolve", bytes.NewBufferString(`{"version":1,"decision":"keep_last_safe","reason":"do not echo this reason","unexpected":"secret","reauthentication":{"challenge_id":"`+challengeID.String()+`","evidence":"do-not-echo-evidence","confirmed":true}}`))
+	malformed.Header.Set("Authorization", "Bearer token")
+	malformed.Header.Set("Content-Type", "application/json")
+	malformedResponse := httptest.NewRecorder()
+	handler.ServeHTTP(malformedResponse, malformed)
+	if malformedResponse.Code != http.StatusBadRequest || strings.Contains(malformedResponse.Body.String(), "do not echo") || strings.Contains(malformedResponse.Body.String(), "do-not-echo") || strings.Contains(malformedResponse.Body.String(), challengeID.String()) {
+		t.Fatalf("malformed status=%d body=%s", malformedResponse.Code, malformedResponse.Body)
+	}
+}
+
 func TestIAMProblemInstanceTemplatesDirectorySourceJobAndConflictIdentifiers(t *testing.T) {
-	sourceID, jobID := uuid.NewString(), uuid.NewString()
+	sourceID, jobID, conflictID := uuid.NewString(), uuid.NewString(), uuid.NewString()
 	for raw, want := range map[string]string{
-		"/api/v1/identity-sources/" + sourceID:                                        "/api/v1/identity-sources/{source_id}",
-		"/api/v1/identity-sources/" + sourceID + "/sync-jobs/" + jobID:                "/api/v1/identity-sources/{source_id}/sync-jobs/{job_id}",
-		"/api/v1/identity-sources/" + sourceID + "/sync-jobs/" + jobID + "/conflicts": "/api/v1/identity-sources/{source_id}/sync-jobs/{job_id}/conflicts",
-		"/api/v1/identity-sources/" + sourceID + "/sync-conflicts":                    "/api/v1/identity-sources/{source_id}/sync-conflicts",
+		"/api/v1/identity-sources/" + sourceID:                                                "/api/v1/identity-sources/{source_id}",
+		"/api/v1/identity-sources/" + sourceID + "/sync-jobs/" + jobID:                        "/api/v1/identity-sources/{source_id}/sync-jobs/{job_id}",
+		"/api/v1/identity-sources/" + sourceID + "/sync-jobs/" + jobID + "/conflicts":         "/api/v1/identity-sources/{source_id}/sync-jobs/{job_id}/conflicts",
+		"/api/v1/identity-sources/" + sourceID + "/sync-conflicts":                            "/api/v1/identity-sources/{source_id}/sync-conflicts",
+		"/api/v1/identity-sources/" + sourceID + "/sync-conflicts/" + conflictID + "/resolve": "/api/v1/identity-sources/{source_id}/sync-conflicts/{conflict_id}/resolve",
 	} {
 		if got := iamProblemInstance(raw); got != want {
 			t.Errorf("iamProblemInstance(%q)=%q want=%q", raw, got, want)
@@ -153,6 +204,10 @@ type directoryHTTPApplication struct {
 	startedSourceID  uuid.UUID
 	verifiedSourceID uuid.UUID
 	listedPage       Page
+	listedStatus     DirectorySyncConflictStatusFilter
+	resolvedConflict DirectorySyncConflict
+	resolveCommand   ResolveDirectorySyncConflictCommand
+	resolveProof     HighRiskProof
 }
 
 func (application *directoryHTTPApplication) VerifyIdentitySourceVersioned(_ context.Context, _ identity.Principal, sourceID uuid.UUID, version int64, _ RequestContext) (CapabilityReport, error) {
@@ -169,7 +224,13 @@ func (application *directoryHTTPApplication) GetDirectorySyncJob(context.Context
 	return redactDirectorySyncJob(application.job), application.jobError
 }
 
-func (application *directoryHTTPApplication) ListDirectorySyncConflicts(_ context.Context, _ identity.Principal, _ uuid.UUID, page Page) (DirectorySyncConflictPage, error) {
+func (application *directoryHTTPApplication) ListDirectorySyncConflicts(_ context.Context, _ identity.Principal, _ uuid.UUID, status DirectorySyncConflictStatusFilter, page Page) (DirectorySyncConflictPage, error) {
+	application.listedStatus = status
 	application.listedPage = page
 	return application.conflicts, nil
+}
+
+func (application *directoryHTTPApplication) ResolveDirectorySyncConflict(_ context.Context, _ identity.Principal, _, _ uuid.UUID, command ResolveDirectorySyncConflictCommand, proof HighRiskProof, _ RequestContext) (DirectorySyncConflict, error) {
+	application.resolveCommand, application.resolveProof = command, proof
+	return application.resolvedConflict, nil
 }
