@@ -33,6 +33,11 @@ Xminds Release Platform 是面向企业软件交付场景的多产品可信发�
 - 可续租的持久化 Worker、分级退避重试、五次失败死信和领域状态终结；
 - 五角色目录的不可变对象发布、回读摘要校验、数据库原子 current 切换和崩溃后幂等恢复；
 - 发布后撤销目录、Release/attempt 完成与失败回写，以及 UTF-8 JSONL 审计导出的摘要和过期控制。
+- GitHub.com/GHES 与 GitLab Self-Managed 统一 Provider Port、显式 API Base URL 和标准化 Webhook 事件；
+- 固定 DNS 解析地址、系统根加版本化企业 CA、禁用重定向与环境代理的 SSRF/TLS 出站边界；
+- GitHub HMAC-SHA256、GitLab Standard Webhooks/旧版 Secret Token 验签、事件重放幂等和事务审计；
+- 提交查询、Check Run/Commit Status 能力回写、`scm.status.writeback.v1` 持久作业与本地私有 CA 契约测试；
+- AES-256-GCM Provider 凭据密文持久化、AAD 元数据绑定、主密钥 ID 轮换和旧凭据即时撤销。
 
 当前 API 运行时只开放存活、就绪和版本端点。产品、制品和 Release HTTP 适配器已经完成并强制从请求上下文获取已验证身份；在 API 组合根完成 OIDC/工作负载身份配置前不会挂载业务路由，避免暴露未受保护的管理接口。Worker 已挂载目录发布、目录撤销和审计导出处理器，所有签名材料与对象存储凭据必须在启动时显式注入，否则拒绝运行。
 
@@ -97,7 +102,7 @@ go run ./apps/release-worker
 - `GET /health/ready`：PostgreSQL 就绪检查；
 - `GET /version`：构建版本信息。
 
-Worker 依赖预先执行的数据库迁移、可用的 S3/MinIO 桶、经签名的 `root.json`、四类在线角色加密私钥和 32 字节主密钥文件。完整变量见 [`.env.example`](.env.example)，root 与在线密钥边界见[密钥仪式规范](docs/security/key-ceremony.md)。
+Worker 依赖预先执行的数据库迁移、可用的 S3/MinIO 桶、经签名的 `root.json`、四类在线角色加密私钥和 32 字节主密钥文件。SCM Provider 凭据使用独立主密钥目录与当前 key ID，历史 key 仅用于轮换期解密，不能复用于目录签名。完整变量见 [`.env.example`](.env.example)，root 与在线密钥边界见[密钥仪式规范](docs/security/key-ceremony.md)。
 
 ## PostgreSQL 集成测试
 

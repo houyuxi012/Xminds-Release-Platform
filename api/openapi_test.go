@@ -125,3 +125,31 @@ func TestOpenAPIDefinesReleaseApprovalAndPublicationOperations(t *testing.T) {
 		}
 	}
 }
+
+func TestOpenAPIDefinesPrivateSCMManagementAndSignedWebhookOperations(t *testing.T) {
+	t.Parallel()
+
+	loader := openapi3.NewLoader()
+	document, err := loader.LoadFromFile("openapi.yaml")
+	if err != nil {
+		t.Fatalf("load OpenAPI contract: %v", err)
+	}
+	for _, testCase := range []struct {
+		path   string
+		method string
+	}{
+		{path: "/api/v1/scm/connections", method: "POST"},
+		{path: "/api/v1/scm/connections/{connection_id}/verify", method: "POST"},
+		{path: "/api/v1/scm/connections/{connection_id}/credentials", method: "POST"},
+		{path: "/api/v1/scm/webhooks/{connection_id}", method: "POST"},
+	} {
+		pathItem := document.Paths.Find(testCase.path)
+		if pathItem == nil || pathItem.GetOperation(testCase.method) == nil {
+			t.Fatalf("missing %s %s operation", testCase.method, testCase.path)
+		}
+	}
+	webhook := document.Paths.Find("/api/v1/scm/webhooks/{connection_id}").Post
+	if webhook.Security == nil || len(*webhook.Security) != 0 {
+		t.Fatal("SCM webhook must explicitly disable Bearer security and rely on provider signature verification")
+	}
+}

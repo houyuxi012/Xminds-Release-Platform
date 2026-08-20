@@ -24,6 +24,8 @@ tags:
     description: Release 创建、职责分离审批、幂等发布、重试与撤销
   - name: Audit
     description: 产品范围内的不可变审计事件查询与导出
+  - name: SCM
+    description: GitHub、GHES 与 GitLab Self-Managed 连接、密文凭据和 Webhook
 paths:
   /health/live:
     get:
@@ -868,6 +870,101 @@ paths:
             application/problem+json:
               schema:
                 $ref: '#/components/schemas/ProblemDetails'
+  /api/v1/scm/connections:
+    post:
+      operationId: createSCMConnection
+      summary: 创建并验证 SCM 连接
+      description: 仅接受 HTTPS API Base URL；域名解析结果、企业 CA 与代理策略在连接上显式固化。
+      tags: [SCM]
+      x-required-action: product.manage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SCMConnectionRequest'
+      responses:
+        '201':
+          description: 连接已创建并完成 TLS 与能力探测
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SCMConnection'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+  /api/v1/scm/connections/{connection_id}/verify:
+    post:
+      operationId: verifySCMConnection
+      summary: 重新验证 SCM 连接与证书指纹
+      tags: [SCM]
+      x-required-action: product.manage
+      parameters:
+        - $ref: '#/components/parameters/SCMConnectionIDPath'
+      responses:
+        '200':
+          description: 当前能力与 TLS 证据
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SCMCapabilities'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/v1/scm/connections/{connection_id}/credentials:
+    post:
+      operationId: rotateSCMCredential
+      summary: 写入新版本凭据并立即撤销同类型旧版本
+      description: 响应永不包含明文、密文、Nonce 或主密钥标识。
+      tags: [SCM]
+      x-required-action: product.manage
+      parameters:
+        - $ref: '#/components/parameters/SCMConnectionIDPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SCMCredentialRequest'
+      responses:
+        '201':
+          description: 凭据已轮换
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SCMCredentialMetadata'
+  /api/v1/scm/webhooks/{connection_id}:
+    post:
+      operationId: receiveSCMWebhook
+      summary: 接收签名 SCM Webhook
+      description: 无 Bearer 认证；使用连接专属 Webhook 密钥验证并按事件 ID 幂等处理，最大请求体 10 MiB。
+      tags: [SCM]
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/SCMConnectionIDPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '202':
+          description: 首次或重复投递均返回稳定投递标识
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SCMWebhookReceipt'
+        '401':
+          description: Webhook 签名无效
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+        '409':
+          $ref: '#/components/responses/Conflict'
 components:
   parameters:
     ProductIDPath:
@@ -908,6 +1005,13 @@ components:
         minLength: 8
         maxLength: 128
         pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$'
+    SCMConnectionIDPath:
+      name: connection_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
   securitySchemes:
     oidcBearer:
       type: http
@@ -961,6 +1065,145 @@ components:
           schema:
             $ref: '#/components/schemas/ProblemDetails'
   schemas:
+    SCMConnectionRequest:
+      type: object
+      additionalProperties: false
+      required: [product_id, name, provider, api_base_url, resolved_addresses]
+      properties:
+        product_id:
+          type: string
+          pattern: '^[a-z][a-z0-9-]{1,62}$'
+        name:
+          type: string
+          minLength: 1
+          maxLength: 128
+        provider:
+          type: string
+          enum: [github, gitlab]
+        api_base_url:
+          type: string
+          format: uri
+          pattern: '^https://'
+        api_version:
+          type: string
+          maxLength: 32
+        resolved_addresses:
+          type: array
+          minItems: 1
+          maxItems: 16
+          uniqueItems: true
+          items:
+            type: string
+        enterprise_ca_bundle_pem:
+          type: string
+          maxLength: 1048576
+        oidc_issuer:
+          type: string
+          format: uri
+        oidc_audience:
+          type: string
+          maxLength: 256
+        allowed_repositories:
+          type: array
+          maxItems: 256
+          uniqueItems: true
+          items:
+            type: string
+            pattern: '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
+    SCMConnection:
+      allOf:
+        - $ref: '#/components/schemas/SCMConnectionRequest'
+        - type: object
+          required: [id, status, capabilities, certificate_sha256, created_at, updated_at]
+          properties:
+            id:
+              type: string
+              format: uuid
+            status:
+              type: string
+              enum: [active, revoked]
+            capabilities:
+              $ref: '#/components/schemas/SCMCapabilities'
+            certificate_sha256:
+              type: string
+              pattern: '^[0-9a-f]{64}$'
+            created_at:
+              type: string
+              format: date-time
+            updated_at:
+              type: string
+              format: date-time
+    SCMCapabilities:
+      type: object
+      additionalProperties: false
+      required: [commit_statuses, check_runs, workload_oidc, certificate_sha256]
+      properties:
+        commit_statuses:
+          type: boolean
+        check_runs:
+          type: boolean
+        workload_oidc:
+          type: boolean
+        certificate_sha256:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+    SCMCredentialRequest:
+      type: object
+      additionalProperties: false
+      required: [kind, secret]
+      properties:
+        kind:
+          type: string
+          enum: [webhook_secret, webhook_signing_token, github_token, github_app_token, gitlab_access_token]
+        secret:
+          type: string
+          minLength: 8
+          maxLength: 65536
+          writeOnly: true
+        identifier:
+          type: string
+          description: 非敏感凭据标识；响应仅返回末四位，禁止传入 Token 或 Secret。
+          maxLength: 256
+        expires_at:
+          type: string
+          format: date-time
+    SCMCredentialMetadata:
+      type: object
+      additionalProperties: false
+      required: [id, kind, version, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        kind:
+          type: string
+        version:
+          type: integer
+          minimum: 1
+        last_four:
+          type: string
+          maxLength: 4
+        expires_at:
+          type: string
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+        revoked_at:
+          type: string
+          format: date-time
+    SCMWebhookReceipt:
+      type: object
+      additionalProperties: false
+      required: [delivery_id, event_id]
+      properties:
+        delivery_id:
+          type: string
+          format: uuid
+        event_id:
+          type: string
+          minLength: 1
+          maxLength: 256
     HealthStatus:
       type: object
       additionalProperties: false
