@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"mime"
 	"net"
 	"net/http"
@@ -18,6 +17,7 @@ import (
 
 	"xminds-release-platform/internal/identity"
 	"xminds-release-platform/internal/platform/httpx"
+	"xminds-release-platform/internal/platform/strictjson"
 )
 
 const maximumIAMRequestBytes = 16 * 1024
@@ -185,7 +185,7 @@ func listDirectorySyncConflictsHandler(application DirectorySyncApplication) htt
 		if !ok {
 			return
 		}
-		page, err := parseIAMPage(request)
+		page, err := parseDirectoryConflictPage(request)
 		if err != nil {
 			writeIAMApplicationError(writer, request, err)
 			return
@@ -197,6 +197,24 @@ func listDirectorySyncConflictsHandler(application DirectorySyncApplication) htt
 		}
 		writeIAMJSON(writer, http.StatusOK, result)
 	}
+}
+
+func parseDirectoryConflictPage(request *http.Request) (Page, error) {
+	page := Page{}
+	if rawLimit := strings.TrimSpace(request.URL.Query().Get("limit")); rawLimit != "" {
+		limit, err := strconv.Atoi(rawLimit)
+		if err != nil || limit < 1 || limit > 200 {
+			return Page{}, ErrPageInvalid
+		}
+		page.Limit = limit
+	}
+	if cursor := request.URL.Query().Get("cursor"); cursor != "" {
+		if strings.TrimSpace(cursor) != cursor || len(cursor) > 512 {
+			return Page{}, ErrPageInvalid
+		}
+		page.Cursor = cursor
+	}
+	return page, nil
 }
 
 func parseDirectoryPathID(writer http.ResponseWriter, request *http.Request, parameter, code string) (uuid.UUID, bool) {
@@ -620,15 +638,7 @@ func decodeIAMJSON(request *http.Request, target any) error {
 	if err != nil || mediaType != "application/json" {
 		return errors.New("content type must be application/json")
 	}
-	decoder := json.NewDecoder(io.LimitReader(request.Body, maximumIAMRequestBytes+1))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(target); err != nil {
-		return err
-	}
-	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return errors.New("request body must contain one JSON object")
-	}
-	return nil
+	return strictjson.Decode(request.Body, maximumIAMRequestBytes, target)
 }
 
 func requireIAMPrincipal(writer http.ResponseWriter, request *http.Request) (identity.Principal, bool) {

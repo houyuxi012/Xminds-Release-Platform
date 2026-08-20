@@ -20,6 +20,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"xminds-release-platform/internal/platform/egress"
+	"xminds-release-platform/internal/platform/strictjson"
 )
 
 const (
@@ -29,6 +32,7 @@ const (
 	defaultDirectoryMaximumPages   = 10_000
 	defaultDirectoryMaximumObjects = 100_000
 	maximumDirectoryResponseBytes  = 2 * 1024 * 1024
+	maximumDirectorySecretBytes    = 4 * 1024
 	maximumDirectoryStringBytes    = 512
 
 	scimListResponseSchema = "urn:ietf:params:scim:api:messages:2.0:ListResponse"
@@ -45,19 +49,25 @@ var (
 )
 
 type SecretBackedDirectoryAdapterConfig struct {
-	Secrets           SecretResolver
-	RequestTimeout    time.Duration
-	MaximumPages      int
-	MaximumObjects    int
-	AllowLoopbackHTTP bool
+	Secrets              SecretResolver
+	Resolver             egress.IPResolver
+	Dialer               egress.Dialer
+	RequestTimeout       time.Duration
+	MaximumPages         int
+	MaximumObjects       int
+	AllowLoopbackHTTP    bool
+	AllowPrivateNetworks bool
 }
 
 type SecretBackedDirectoryAdapter struct {
-	secrets           SecretResolver
-	requestTimeout    time.Duration
-	maximumPages      int
-	maximumObjects    int
-	allowLoopbackHTTP bool
+	secrets              SecretResolver
+	resolver             egress.IPResolver
+	dialer               egress.Dialer
+	requestTimeout       time.Duration
+	maximumPages         int
+	maximumObjects       int
+	allowLoopbackHTTP    bool
+	allowPrivateNetworks bool
 }
 
 type oidcDirectorySecret struct {
@@ -97,7 +107,10 @@ type oidcJWKSet struct {
 }
 
 type scimServiceProviderConfig struct {
-	Schemas []string `json:"schemas"`
+	Schemas    []string `json:"schemas"`
+	Pagination struct {
+		Supported bool `json:"supported"`
+	} `json:"pagination"`
 }
 
 type scimResourceType struct {
@@ -116,10 +129,11 @@ type scimListResponse struct {
 }
 
 type scimUser struct {
-	ID          string `json:"id"`
-	UserName    string `json:"userName"`
-	DisplayName string `json:"displayName"`
-	Active      *bool  `json:"active"`
+	Schemas     []string `json:"schemas"`
+	ID          string   `json:"id"`
+	UserName    string   `json:"userName"`
+	DisplayName string   `json:"displayName"`
+	Active      *bool    `json:"active"`
 	Emails      []struct {
 		Value   string `json:"value"`
 		Primary bool   `json:"primary"`
@@ -127,8 +141,9 @@ type scimUser struct {
 }
 
 type scimGroup struct {
-	ID          string `json:"id"`
-	DisplayName string `json:"displayName"`
+	Schemas     []string `json:"schemas"`
+	ID          string   `json:"id"`
+	DisplayName string   `json:"displayName"`
 	Members     []struct {
 		Value string `json:"value"`
 		Type  string `json:"type"`
@@ -136,10 +151,12 @@ type scimGroup struct {
 }
 
 type scimCursor struct {
-	Resource   string `json:"resource"`
-	StartIndex int    `json:"start_index"`
-	Pages      int    `json:"pages"`
-	Objects    int    `json:"objects"`
+	Resource    string `json:"resource"`
+	StartIndex  int    `json:"start_index"`
+	Pages       int    `json:"pages"`
+	Objects     int    `json:"objects"`
+	UsersTotal  *int   `json:"users_total,omitempty"`
+	GroupsTotal *int   `json:"groups_total,omitempty"`
 }
 
 func NewSecretBackedDirectoryAdapter(config SecretBackedDirectoryAdapterConfig) (*SecretBackedDirectoryAdapter, error) {
@@ -152,13 +169,22 @@ func NewSecretBackedDirectoryAdapter(config SecretBackedDirectoryAdapterConfig) 
 	if config.MaximumObjects == 0 {
 		config.MaximumObjects = defaultDirectoryMaximumObjects
 	}
+	if config.Resolver == nil {
+		config.Resolver = net.DefaultResolver
+	}
+	if config.Dialer == nil {
+		config.Dialer = &net.Dialer{Timeout: config.RequestTimeout / 2, KeepAlive: 30 * time.Second}
+	}
 	if config.Secrets == nil || config.RequestTimeout < minimumDirectoryRequestTimeout || config.RequestTimeout > maximumDirectoryRequestTimeout ||
-		config.MaximumPages < 1 || config.MaximumPages > defaultDirectoryMaximumPages || config.MaximumObjects < 1 || config.MaximumObjects > defaultDirectoryMaximumObjects {
+		config.MaximumPages < 1 || config.MaximumPages > defaultDirectoryMaximumPages || config.MaximumObjects < 1 || config.MaximumObjects > defaultDirectoryMaximumObjects ||
+		config.Resolver == nil || config.Dialer == nil {
 		return nil, ErrDirectoryConfigurationInvalid
 	}
 	return &SecretBackedDirectoryAdapter{
-		secrets: config.Secrets, requestTimeout: config.RequestTimeout, maximumPages: config.MaximumPages,
+		secrets: config.Secrets, resolver: config.Resolver, dialer: config.Dialer,
+		requestTimeout: config.RequestTimeout, maximumPages: config.MaximumPages,
 		maximumObjects: config.MaximumObjects, allowLoopbackHTTP: config.AllowLoopbackHTTP,
+		allowPrivateNetworks: config.AllowPrivateNetworks,
 	}, nil
 }
 
@@ -216,6 +242,9 @@ func (adapter *SecretBackedDirectoryAdapter) Sync(ctx context.Context, source Id
 		return SyncPage{}, err
 	}
 	if err := validateSCIMListResponse(response, position.StartIndex, configuration.PageSize); err != nil {
+		return SyncPage{}, err
+	}
+	if err := pinSCIMTotalResults(&position, response.TotalResults); err != nil {
 		return SyncPage{}, err
 	}
 	position.Pages++
@@ -285,20 +314,61 @@ func (adapter *SecretBackedDirectoryAdapter) verifySCIM(ctx context.Context, sou
 	if err := adapter.getJSON(ctx, client, configuration.BaseURL+"/ServiceProviderConfig", bearer, &providerConfiguration); err != nil {
 		return CapabilityReport{}, err
 	}
-	if !containsString(providerConfiguration.Schemas, "urn:ietf:params:scim:schemas:core:2.0:ServiceProviderConfig") {
+	if !containsString(providerConfiguration.Schemas, "urn:ietf:params:scim:schemas:core:2.0:ServiceProviderConfig") || !providerConfiguration.Pagination.Supported {
 		return CapabilityReport{}, ErrDirectoryResponseInvalid
 	}
-	var resourceTypes scimListResponse
-	if err := adapter.getJSON(ctx, client, configuration.BaseURL+"/ResourceTypes", bearer, &resourceTypes); err != nil {
-		return CapabilityReport{}, err
-	}
-	if !containsString(resourceTypes.Schemas, scimListResponseSchema) || !validSCIMResourceTypes(resourceTypes.Resources) {
+	resourceTypes, err := adapter.collectSCIMResourceTypes(ctx, client, configuration.BaseURL+"/ResourceTypes", bearer)
+	if err != nil || !validSCIMResourceTypes(resourceTypes) {
+		if err != nil {
+			return CapabilityReport{}, err
+		}
 		return CapabilityReport{}, ErrDirectoryResponseInvalid
 	}
 	return CapabilityReport{
 		Reachable: true, RequiredAttributes: []string{"subject", "display_name", "email", "organizations"},
 		RequiredMappingsComplete: source.RequiredMappingsComplete, SupportsPagination: true,
 	}, nil
+}
+
+func (adapter *SecretBackedDirectoryAdapter) collectSCIMResourceTypes(ctx context.Context, client *http.Client, endpoint, bearer string) ([]json.RawMessage, error) {
+	const resourceTypePageSize = 200
+	resources := make([]json.RawMessage, 0, 2)
+	startIndex := 1
+	totalResults := -1
+	for page := 0; page < adapter.maximumPages; page++ {
+		requestURL, err := url.Parse(endpoint)
+		if err != nil {
+			return nil, ErrDirectoryConfigurationInvalid
+		}
+		query := requestURL.Query()
+		query.Set("startIndex", strconv.Itoa(startIndex))
+		query.Set("count", strconv.Itoa(resourceTypePageSize))
+		requestURL.RawQuery = query.Encode()
+		var response scimListResponse
+		if err := adapter.getJSON(ctx, client, requestURL.String(), bearer, &response); err != nil {
+			return nil, err
+		}
+		if err := validateSCIMListResponse(response, startIndex, resourceTypePageSize); err != nil {
+			return nil, err
+		}
+		if totalResults < 0 {
+			totalResults = response.TotalResults
+		} else if response.TotalResults != totalResults {
+			return nil, ErrDirectoryResponseInvalid
+		}
+		resources = append(resources, response.Resources...)
+		if len(resources) > adapter.maximumObjects || len(resources) > totalResults {
+			return nil, ErrDirectoryLimitExceeded
+		}
+		startIndex = response.StartIndex + len(response.Resources)
+		if startIndex > totalResults {
+			if len(resources) != totalResults {
+				return nil, ErrDirectoryResponseInvalid
+			}
+			return resources, nil
+		}
+	}
+	return nil, ErrDirectoryLimitExceeded
 }
 
 func (adapter *SecretBackedDirectoryAdapter) loadOIDC(ctx context.Context, source IdentitySource) (oidcDirectorySecret, *http.Client, error) {
@@ -313,7 +383,7 @@ func (adapter *SecretBackedDirectoryAdapter) loadOIDC(ctx context.Context, sourc
 		return oidcDirectorySecret{}, nil, ErrDirectoryConfigurationInvalid
 	}
 	configuration.Issuer = strings.TrimSuffix(strings.TrimSpace(configuration.Issuer), "/")
-	client, err := adapter.newHTTPClient(ctx, configuration.CAReference)
+	client, err := adapter.newHTTPClient(ctx, configuration.CAReference, configuration.Issuer)
 	return configuration, client, err
 }
 
@@ -332,14 +402,30 @@ func (adapter *SecretBackedDirectoryAdapter) loadSCIM(ctx context.Context, sourc
 	if err != nil || len(bytes.TrimSpace(bearer)) < 8 || len(bytes.TrimSpace(bearer)) > 4096 || bytes.ContainsAny(bearer, "\r\n") {
 		return scimDirectorySecret{}, "", nil, ErrDirectoryConfigurationInvalid
 	}
-	client, err := adapter.newHTTPClient(ctx, configuration.CAReference)
+	client, err := adapter.newHTTPClient(ctx, configuration.CAReference, configuration.BaseURL)
 	if err != nil {
 		return scimDirectorySecret{}, "", nil, err
 	}
 	return configuration, string(bytes.TrimSpace(bearer)), client, nil
 }
 
-func (adapter *SecretBackedDirectoryAdapter) newHTTPClient(ctx context.Context, caReference string) (*http.Client, error) {
+func (adapter *SecretBackedDirectoryAdapter) newHTTPClient(ctx context.Context, caReference, baseURL string) (*http.Client, error) {
+	parsedBase, err := url.Parse(baseURL)
+	if err != nil || parsedBase.Hostname() == "" {
+		return nil, ErrDirectoryConfigurationInvalid
+	}
+	wantedHost := strings.ToLower(strings.TrimSuffix(parsedBase.Hostname(), "."))
+	addresses, err := egress.ResolvePinnedAddresses(ctx, adapter.resolver, wantedHost, egress.Policy{
+		AllowLoopback: adapter.allowLoopbackHTTP,
+		AllowPrivate:  adapter.allowPrivateNetworks,
+	})
+	if err != nil {
+		return nil, ErrDirectoryConfigurationInvalid
+	}
+	pinnedDialContext, err := egress.NewPinnedDialContext(wantedHost, addresses, adapter.dialer)
+	if err != nil {
+		return nil, ErrDirectoryConfigurationInvalid
+	}
 	roots, err := x509.SystemCertPool()
 	if err != nil || roots == nil {
 		roots = x509.NewCertPool()
@@ -353,10 +439,9 @@ func (adapter *SecretBackedDirectoryAdapter) newHTTPClient(ctx context.Context, 
 			return nil, ErrDirectoryConfigurationInvalid
 		}
 	}
-	dialer := &net.Dialer{Timeout: adapter.requestTimeout / 2, KeepAlive: 30 * time.Second}
 	transport := &http.Transport{
-		Proxy: nil, DialContext: dialer.DialContext, ForceAttemptHTTP2: true,
-		TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots},
+		Proxy: nil, DialContext: pinnedDialContext, ForceAttemptHTTP2: true,
+		TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots, ServerName: wantedHost},
 		TLSHandshakeTimeout: adapter.requestTimeout / 2, ResponseHeaderTimeout: adapter.requestTimeout / 2,
 		IdleConnTimeout: 30 * time.Second, MaxIdleConns: 10, MaxIdleConnsPerHost: 2,
 	}
@@ -390,7 +475,7 @@ func (adapter *SecretBackedDirectoryAdapter) getJSON(ctx context.Context, client
 	}
 	limited := io.LimitReader(response.Body, maximumDirectoryResponseBytes+1)
 	contents, err := io.ReadAll(limited)
-	if err != nil || len(contents) == 0 || len(contents) > maximumDirectoryResponseBytes || !json.Valid(contents) {
+	if err != nil || strictjson.ValidateObject(contents, maximumDirectoryResponseBytes) != nil {
 		return ErrDirectoryResponseInvalid
 	}
 	decoder := json.NewDecoder(bytes.NewReader(contents))
@@ -401,16 +486,7 @@ func (adapter *SecretBackedDirectoryAdapter) getJSON(ctx context.Context, client
 }
 
 func decodeStrictJSON(contents []byte, target any) error {
-	decoder := json.NewDecoder(bytes.NewReader(contents))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(target); err != nil {
-		return err
-	}
-	var trailing any
-	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		return ErrDirectoryConfigurationInvalid
-	}
-	return nil
+	return strictjson.DecodeBytes(contents, maximumDirectorySecretBytes, target)
 }
 
 func validSigningAlgorithms(algorithms []string) bool {
@@ -545,11 +621,30 @@ func validateSCIMListResponse(response scimListResponse, expectedStart, pageSize
 	return nil
 }
 
+func pinSCIMTotalResults(cursor *scimCursor, totalResults int) error {
+	if cursor == nil || totalResults < 0 {
+		return ErrDirectoryResponseInvalid
+	}
+	total := &cursor.UsersTotal
+	if cursor.Resource == "groups" {
+		total = &cursor.GroupsTotal
+	}
+	if *total == nil {
+		pinned := totalResults
+		*total = &pinned
+		return nil
+	}
+	if **total != totalResults {
+		return ErrDirectoryResponseInvalid
+	}
+	return nil
+}
+
 func normalizeSCIMUsers(resources []json.RawMessage) ([]DirectoryUser, error) {
 	users := make([]DirectoryUser, 0, len(resources))
 	for _, raw := range resources {
 		var external scimUser
-		if json.Unmarshal(raw, &external) != nil {
+		if json.Unmarshal(raw, &external) != nil || !containsString(external.Schemas, scimUserSchema) {
 			return nil, ErrDirectoryResponseInvalid
 		}
 		external.ID = strings.TrimSpace(external.ID)
@@ -580,7 +675,7 @@ func normalizeSCIMGroups(resources []json.RawMessage) ([]DirectoryOrganization, 
 	parents := make([]DirectoryOrganizationParent, 0)
 	for _, raw := range resources {
 		var group scimGroup
-		if json.Unmarshal(raw, &group) != nil {
+		if json.Unmarshal(raw, &group) != nil || !containsString(group.Schemas, scimGroupSchema) {
 			return nil, nil, nil, ErrDirectoryResponseInvalid
 		}
 		group.ID = strings.TrimSpace(group.ID)
@@ -591,7 +686,7 @@ func normalizeSCIMGroups(resources []json.RawMessage) ([]DirectoryOrganization, 
 		organizations = append(organizations, DirectoryOrganization{ExternalID: group.ID, Name: group.DisplayName})
 		for _, member := range group.Members {
 			member.Value = strings.TrimSpace(member.Value)
-			if member.Value == "" || len(member.Value) > maximumDirectoryStringBytes || member.Value == group.ID {
+			if member.Value == "" || len(member.Value) > maximumDirectoryStringBytes {
 				return nil, nil, nil, ErrDirectoryResponseInvalid
 			}
 			switch strings.ToLower(strings.TrimSpace(member.Type)) {
@@ -640,7 +735,9 @@ func decodeSCIMCursor(encoded string) (scimCursor, error) {
 		return scimCursor{}, ErrDirectoryCursorInvalid
 	}
 	var cursor scimCursor
-	if decodeStrictJSON(contents, &cursor) != nil || (cursor.Resource != "users" && cursor.Resource != "groups") || cursor.StartIndex < 1 || cursor.Pages < 0 || cursor.Objects < 0 {
+	if decodeStrictJSON(contents, &cursor) != nil || (cursor.Resource != "users" && cursor.Resource != "groups") || cursor.StartIndex < 1 || cursor.Pages < 0 || cursor.Objects < 0 ||
+		(cursor.UsersTotal != nil && *cursor.UsersTotal < 0) || (cursor.GroupsTotal != nil && *cursor.GroupsTotal < 0) ||
+		(cursor.Resource == "groups" && cursor.UsersTotal == nil) {
 		return scimCursor{}, ErrDirectoryCursorInvalid
 	}
 	return cursor, nil

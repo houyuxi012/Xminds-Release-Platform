@@ -1,3 +1,18 @@
+-- Pre-v14 active jobs have no durable stage/progress state and cannot be resumed
+-- safely. Converge every legacy active variant to an explicit, operator-visible
+-- terminal state before installing the one-active-job invariant.
+UPDATE directory_sync_jobs
+SET status = 'failed',
+    error_code = 'directory_migration_restart_required',
+    completed_at = COALESCE(completed_at, clock_timestamp()),
+    updated_at = GREATEST(updated_at, clock_timestamp())
+WHERE status IN ('pending', 'running', 'partial');
+
+ALTER TABLE directory_sync_jobs
+    DROP CONSTRAINT directory_sync_jobs_status_check,
+    ADD CONSTRAINT directory_sync_jobs_status_check
+        CHECK (status IN ('pending', 'running', 'completed', 'failed'));
+
 ALTER TABLE directory_sync_jobs
     ADD COLUMN source_version BIGINT,
     ADD COLUMN run_marker UUID,
@@ -25,7 +40,7 @@ ALTER TABLE directory_sync_jobs
 
 CREATE UNIQUE INDEX directory_sync_jobs_one_active_source_uidx
     ON directory_sync_jobs (identity_source_id)
-    WHERE status IN ('pending', 'running', 'partial');
+    WHERE status IN ('pending', 'running');
 
 CREATE INDEX directory_sync_jobs_source_created_idx
     ON directory_sync_jobs (identity_source_id, created_at DESC, id DESC);
@@ -104,6 +119,5 @@ CREATE TABLE directory_sync_stage_parents (
     organization_external_id TEXT NOT NULL CHECK (length(organization_external_id) BETWEEN 1 AND 512),
     parent_external_id TEXT NOT NULL CHECK (length(parent_external_id) BETWEEN 1 AND 512),
     created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-    PRIMARY KEY (sync_job_id, organization_external_id, parent_external_id),
-    CHECK (organization_external_id <> parent_external_id)
+    PRIMARY KEY (sync_job_id, organization_external_id, parent_external_id)
 );

@@ -158,9 +158,9 @@ SCIM 来源 Secret 只引用另一个 Bearer 文件，禁止将 Token 直接写�
 }
 ```
 
-`POST .../verify` 使用必填来源版本验证真实 OIDC discovery/JWKS 或 SCIM ServiceProviderConfig/ResourceTypes。`POST .../sync-preview` 和 `POST .../sync` 返回 `202 Accepted` 及作业 `Location`，作业通过现有 Outbox 由 `release-worker` 执行。只有 SCIM 来源支持 apply；OIDC 来源只支持连接验证和空快照预览。Worker 持久化每页游标，最终页才会在来源 ID 与本次 run marker 边界内停用缺失对象和清理来源成员关系。重复稳定标识、邮箱/规范用户名冲突、组织循环或缺失/冲突父组织会生成可分页查询的冲突记录，相关对象保留最后安全状态，不会自动猜测、覆盖本地字段或删除角色绑定。
+`POST .../verify` 使用必填来源版本验证真实 OIDC discovery/JWKS 或 SCIM ServiceProviderConfig/ResourceTypes。SCIM 必须声明支持分页，ResourceTypes 会按严格 ListResponse 不变量有界收齐；Users/Groups 每个资源必须包含对应 core schema，后续页 `totalResults` 与首页不一致时立即 fail closed。`POST .../sync-preview` 和 `POST .../sync` 返回 `202 Accepted` 及作业 `Location`，作业通过现有 Outbox 由 `release-worker` 执行。只有 SCIM 来源支持 apply；OIDC 来源只支持连接验证和空快照预览。Worker 持久化每页游标，最终页才会在来源 ID 与本次 run marker 边界内停用缺失对象和清理来源成员关系。重复稳定标识、邮箱/规范用户名冲突、组织循环或缺失/冲突父组织会生成可分页查询的冲突记录，相关对象保留最后安全状态，不会自动猜测、覆盖本地字段或删除角色绑定。每个实际 apply batch 的业务变更、进度和无 PII/Secret 不可变审计在同一事务中提交；审计不可用时整批回滚并可恢复重试。冲突分页游标由独立 Secret-backed AES-256-GCM 密钥加密认证，并将路由、来源、schema 版本、filter 和页大小直接纳入 AEAD 附加认证数据，同时绑定有效期，禁止篡改或跨上下文重放。轮换时原子替换 Secret 并重启 API，旧游标立即 fail closed，客户端按默认 15 分钟短有效期契约从首页重新分页。
 
-目录请求总超时可在 1–30 秒范围内调整，总页数上限为 10000，用户、组织、成员和层级关系总数上限为 100000。只有 `development`/`test` 环境可通过 `XMINDS_RELEASE_IAM_DIRECTORY_ALLOW_LOOPBACK_HTTP=true` 显式允许 loopback HTTP；其他环境配置该值会拒绝启动。具体变量与默认值见 [`.env.example`](.env.example)。
+目录请求总超时可在 1–30 秒范围内调整，总页数上限为 10000，用户、组织、成员和层级关系总数上限为 100000。出站连接在解析后固定 IPv4/IPv6 地址并在拨号层校验目标 host，默认拒绝 loopback、link-local/metadata、unspecified、multicast 和私网地址，禁用环境代理与重定向。只有 `development`/`test` 可通过兼容变量 `XMINDS_RELEASE_IAM_DIRECTORY_ALLOW_LOOPBACK_HTTP=true` 显式允许 loopback HTTP/HTTPS；企业私网必须经审核后显式设置 `XMINDS_RELEASE_IAM_DIRECTORY_ALLOW_PRIVATE_NETWORKS=true`，且仍强制 TLS 1.2+、正确 ServerName 与受控 CA。具体变量与默认值见 [`.env.example`](.env.example)。
 
 默认 Public API 监听 `127.0.0.1:8081`，只提供：
 

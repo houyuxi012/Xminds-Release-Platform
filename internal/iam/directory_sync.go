@@ -16,7 +16,11 @@ import (
 	"xminds-release-platform/internal/platform/jobs"
 )
 
-const JobKindDirectorySync = "iam.directory.sync.v1"
+const (
+	JobKindDirectorySync          = "iam.directory.sync.v1"
+	directorySyncBatchAuditAction = "identity.directory_sync.batch.apply"
+	directoryConflictCursorRoute  = "iam.directory-sync-conflicts"
+)
 
 type DirectorySyncMode string
 
@@ -114,25 +118,27 @@ type DirectorySyncJobEnqueuer interface {
 }
 
 type DirectorySyncServiceConfig struct {
-	Store   DirectorySyncStore
-	Jobs    DirectorySyncJobEnqueuer
-	Auditor AuditAppender
-	Clock   func() time.Time
+	Store           DirectorySyncStore
+	Jobs            DirectorySyncJobEnqueuer
+	Auditor         AuditAppender
+	Clock           func() time.Time
+	ConflictCursors *DirectoryConflictCursorCodec
 }
 
 type DirectorySyncService struct {
-	store      DirectorySyncStore
-	jobs       DirectorySyncJobEnqueuer
-	auditor    AuditAppender
-	authorizer *identity.Authorizer
-	clock      func() time.Time
+	store           DirectorySyncStore
+	jobs            DirectorySyncJobEnqueuer
+	auditor         AuditAppender
+	authorizer      *identity.Authorizer
+	clock           func() time.Time
+	conflictCursors *DirectoryConflictCursorCodec
 }
 
 func NewDirectorySyncService(config DirectorySyncServiceConfig) (*DirectorySyncService, error) {
-	if config.Store == nil || config.Jobs == nil || config.Auditor == nil || config.Clock == nil {
+	if config.Store == nil || config.Jobs == nil || config.Auditor == nil || config.Clock == nil || config.ConflictCursors == nil {
 		return nil, ErrDirectorySyncConfiguration
 	}
-	return &DirectorySyncService{store: config.Store, jobs: config.Jobs, auditor: config.Auditor, authorizer: identity.NewAuthorizer(), clock: config.Clock}, nil
+	return &DirectorySyncService{store: config.Store, jobs: config.Jobs, auditor: config.Auditor, authorizer: identity.NewAuthorizer(), clock: config.Clock, conflictCursors: config.ConflictCursors}, nil
 }
 
 func (service *DirectorySyncService) Start(ctx context.Context, actor identity.Principal, sourceID uuid.UUID, mode DirectorySyncMode, expectedVersion int64, request RequestContext) (DirectorySyncJob, error) {
@@ -223,13 +229,37 @@ func (service *DirectorySyncService) ListConflicts(ctx context.Context, actor id
 	if err := service.authorizer.Require(actor, identity.ActionIdentityManage, ""); err != nil {
 		return DirectorySyncConflictPage{}, err
 	}
-	if !validIAMPage(page) {
+	if !validIAMPage(page) || (page.Cursor != "" && (!page.BeforeTime.IsZero() || page.BeforeID != uuid.Nil)) {
 		return DirectorySyncConflictPage{}, ErrPageInvalid
+	}
+	limit, err := pageLimit(page)
+	if err != nil {
+		return DirectorySyncConflictPage{}, err
+	}
+	if page.Cursor != "" {
+		page.BeforeTime, page.BeforeID, err = service.conflictCursors.Decode(page.Cursor, directoryConflictCursorRoute, sourceID, limit)
+		if err != nil {
+			return DirectorySyncConflictPage{}, err
+		}
 	}
 	if _, err := service.store.GetIdentitySource(ctx, nil, sourceID); err != nil {
 		return DirectorySyncConflictPage{}, err
 	}
-	return service.store.ListDirectorySyncConflicts(ctx, sourceID, page)
+	result, err := service.store.ListDirectorySyncConflicts(ctx, sourceID, page)
+	if err != nil {
+		return DirectorySyncConflictPage{}, err
+	}
+	if result.NextCursor != "" {
+		if len(result.Items) == 0 {
+			return DirectorySyncConflictPage{}, ErrPageInvalid
+		}
+		last := result.Items[len(result.Items)-1]
+		result.NextCursor, err = service.conflictCursors.Encode(directoryConflictCursorRoute, sourceID, limit, last.CreatedAt, last.ID)
+		if err != nil {
+			return DirectorySyncConflictPage{}, err
+		}
+	}
+	return result, nil
 }
 
 func redactDirectorySyncJob(job DirectorySyncJob) DirectorySyncJob {

@@ -1,17 +1,15 @@
 package iam
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
-	"io"
 	"regexp"
 	"strings"
 
 	"github.com/google/uuid"
 
 	"xminds-release-platform/internal/platform/jobs"
+	"xminds-release-platform/internal/platform/strictjson"
 )
 
 const defaultDirectorySyncMaximumTransitions = 20_000
@@ -129,14 +127,8 @@ func decodeDirectorySyncJob(outboxJob jobs.Job) (DirectorySyncJobPayload, error)
 	if outboxJob.ID == uuid.Nil || outboxJob.AggregateID == uuid.Nil || outboxJob.Kind != JobKindDirectorySync || len(outboxJob.Payload) == 0 || len(outboxJob.Payload) > 2048 {
 		return DirectorySyncJobPayload{}, ErrDirectorySyncConfiguration
 	}
-	decoder := json.NewDecoder(bytes.NewReader(outboxJob.Payload))
-	decoder.DisallowUnknownFields()
 	var payload DirectorySyncJobPayload
-	if err := decoder.Decode(&payload); err != nil {
-		return DirectorySyncJobPayload{}, ErrDirectorySyncConfiguration
-	}
-	var trailing any
-	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+	if err := strictjson.DecodeBytes(outboxJob.Payload, 2048, &payload); err != nil {
 		return DirectorySyncJobPayload{}, ErrDirectorySyncConfiguration
 	}
 	if payload.JobID == uuid.Nil || payload.SourceID == uuid.Nil || payload.JobID != outboxJob.AggregateID ||

@@ -1626,7 +1626,7 @@ paths:
       parameters:
         - $ref: '#/components/parameters/IdentitySourceIDPath'
         - $ref: '#/components/parameters/Limit'
-        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/DirectoryConflictCursor'
       responses:
         '200':
           description: 冲突页
@@ -1791,6 +1791,13 @@ components:
       name: cursor
       in: query
       description: 服务端返回的不透明分页游标。
+      schema:
+        type: string
+        maxLength: 512
+    DirectoryConflictCursor:
+      name: cursor
+      in: query
+      description: 服务端返回的加密认证游标；绑定冲突路由、来源、过滤条件、分页大小、schema 版本与有效期，不得修改或跨上下文重放。
       schema:
         type: string
         maxLength: 512

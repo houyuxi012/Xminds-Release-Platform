@@ -136,7 +136,7 @@ func run(ctx context.Context, environ map[string]string) error {
 	directoryAdapter, err := iam.NewSecretBackedDirectoryAdapter(iam.SecretBackedDirectoryAdapterConfig{
 		Secrets: directorySecrets, RequestTimeout: runtimeConfig.Directory.RequestTimeout,
 		MaximumPages: runtimeConfig.Directory.MaximumPages, MaximumObjects: runtimeConfig.Directory.MaximumObjects,
-		AllowLoopbackHTTP: runtimeConfig.Directory.AllowLoopbackHTTP,
+		AllowLoopbackHTTP: runtimeConfig.Directory.AllowLoopbackHTTP, AllowPrivateNetworks: runtimeConfig.Directory.AllowPrivateNetworks,
 	})
 	if err != nil {
 		return fmt.Errorf("configure IAM directory adapter: %w", err)

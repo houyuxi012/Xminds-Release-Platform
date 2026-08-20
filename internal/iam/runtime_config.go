@@ -14,11 +14,14 @@ var (
 )
 
 type DirectoryRuntimeConfig struct {
-	SecretDirectory   string
-	RequestTimeout    time.Duration
-	MaximumPages      int
-	MaximumObjects    int
-	AllowLoopbackHTTP bool
+	SecretDirectory            string
+	ConflictCursorKeyReference string
+	ConflictCursorTTL          time.Duration
+	RequestTimeout             time.Duration
+	MaximumPages               int
+	MaximumObjects             int
+	AllowLoopbackHTTP          bool
+	AllowPrivateNetworks       bool
 }
 
 type LocalAuthRuntimeConfig struct {
@@ -33,15 +36,23 @@ type LocalAuthRuntimeConfig struct {
 
 func LoadDirectoryRuntimeConfig(environ map[string]string, environment string) (DirectoryRuntimeConfig, error) {
 	configuration := DirectoryRuntimeConfig{
-		SecretDirectory: strings.TrimSpace(environ["XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY"]),
-		RequestTimeout:  defaultDirectoryRequestTimeout,
-		MaximumPages:    defaultDirectoryMaximumPages,
-		MaximumObjects:  defaultDirectoryMaximumObjects,
+		SecretDirectory:            strings.TrimSpace(environ["XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY"]),
+		ConflictCursorKeyReference: "secret://iam/directory-conflict-cursor-key",
+		ConflictCursorTTL:          15 * time.Minute,
+		RequestTimeout:             defaultDirectoryRequestTimeout,
+		MaximumPages:               defaultDirectoryMaximumPages,
+		MaximumObjects:             defaultDirectoryMaximumObjects,
 	}
 	if configuration.SecretDirectory == "" || !filepath.IsAbs(configuration.SecretDirectory) {
 		return DirectoryRuntimeConfig{}, ErrDirectoryRuntimeConfiguration
 	}
 	configuration.SecretDirectory = filepath.Clean(configuration.SecretDirectory)
+	if raw := strings.TrimSpace(environ["XMINDS_RELEASE_IAM_DIRECTORY_CONFLICT_CURSOR_KEY_REFERENCE"]); raw != "" {
+		configuration.ConflictCursorKeyReference = raw
+	}
+	if !validSecretReference(configuration.ConflictCursorKeyReference) {
+		return DirectoryRuntimeConfig{}, ErrDirectoryRuntimeConfiguration
+	}
 
 	var err error
 	if raw := strings.TrimSpace(environ["XMINDS_RELEASE_IAM_DIRECTORY_REQUEST_TIMEOUT"]); raw != "" {
@@ -62,15 +73,27 @@ func LoadDirectoryRuntimeConfig(environ map[string]string, environment string) (
 			return DirectoryRuntimeConfig{}, ErrDirectoryRuntimeConfiguration
 		}
 	}
+	if raw := strings.TrimSpace(environ["XMINDS_RELEASE_IAM_DIRECTORY_CONFLICT_CURSOR_TTL"]); raw != "" {
+		configuration.ConflictCursorTTL, err = time.ParseDuration(raw)
+		if err != nil {
+			return DirectoryRuntimeConfig{}, ErrDirectoryRuntimeConfiguration
+		}
+	}
 	loopback := strings.ToLower(strings.TrimSpace(environ["XMINDS_RELEASE_IAM_DIRECTORY_ALLOW_LOOPBACK_HTTP"]))
 	if loopback != "" && loopback != "true" && loopback != "false" {
 		return DirectoryRuntimeConfig{}, ErrDirectoryRuntimeConfiguration
 	}
 	configuration.AllowLoopbackHTTP = loopback == "true"
+	privateNetworks := strings.ToLower(strings.TrimSpace(environ["XMINDS_RELEASE_IAM_DIRECTORY_ALLOW_PRIVATE_NETWORKS"]))
+	if privateNetworks != "" && privateNetworks != "true" && privateNetworks != "false" {
+		return DirectoryRuntimeConfig{}, ErrDirectoryRuntimeConfiguration
+	}
+	configuration.AllowPrivateNetworks = privateNetworks == "true"
 	environment = strings.ToLower(strings.TrimSpace(environment))
 	if configuration.RequestTimeout < minimumDirectoryRequestTimeout || configuration.RequestTimeout > maximumDirectoryRequestTimeout ||
 		configuration.MaximumPages < 1 || configuration.MaximumPages > defaultDirectoryMaximumPages ||
 		configuration.MaximumObjects < 1 || configuration.MaximumObjects > defaultDirectoryMaximumObjects ||
+		configuration.ConflictCursorTTL < time.Minute || configuration.ConflictCursorTTL > 24*time.Hour ||
 		(configuration.AllowLoopbackHTTP && environment != "development" && environment != "test") {
 		return DirectoryRuntimeConfig{}, ErrDirectoryRuntimeConfiguration
 	}

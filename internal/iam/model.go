@@ -293,6 +293,7 @@ type Page struct {
 	Limit      int
 	BeforeTime time.Time
 	BeforeID   uuid.UUID
+	Cursor     string
 }
 
 type UserPage struct {

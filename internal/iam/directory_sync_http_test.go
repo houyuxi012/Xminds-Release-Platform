@@ -95,12 +95,15 @@ func TestDirectorySyncHTTPJobOwnershipMismatchIsNotFoundAndConflictCursorIsOpaqu
 		t.Fatalf("job status=%d body=%s", jobResponse.Code, jobResponse.Body)
 	}
 
-	conflictRequest := httptest.NewRequest(http.MethodGet, "/api/v1/identity-sources/"+sourceID.String()+"/sync-conflicts?limit=25", nil)
+	conflictRequest := httptest.NewRequest(http.MethodGet, "/api/v1/identity-sources/"+sourceID.String()+"/sync-conflicts?limit=25&cursor=opaque-input", nil)
 	conflictRequest.Header.Set("Authorization", "Bearer token")
 	conflictResponse := httptest.NewRecorder()
 	handler.ServeHTTP(conflictResponse, conflictRequest)
 	if conflictResponse.Code != http.StatusOK || !strings.Contains(conflictResponse.Body.String(), "opaque-list-cursor") || strings.Contains(conflictResponse.Body.String(), "worker-cursor") {
 		t.Fatalf("conflicts status=%d body=%s", conflictResponse.Code, conflictResponse.Body)
+	}
+	if application.listedPage.Limit != 25 || application.listedPage.Cursor != "opaque-input" || !application.listedPage.BeforeTime.IsZero() || application.listedPage.BeforeID != uuid.Nil {
+		t.Fatalf("directory conflict page=%#v", application.listedPage)
 	}
 }
 
@@ -114,6 +117,7 @@ type directoryHTTPApplication struct {
 	expectedVersion  int64
 	startedSourceID  uuid.UUID
 	verifiedSourceID uuid.UUID
+	listedPage       Page
 }
 
 func (application *directoryHTTPApplication) VerifyIdentitySourceVersioned(_ context.Context, _ identity.Principal, sourceID uuid.UUID, version int64, _ RequestContext) (CapabilityReport, error) {
@@ -130,6 +134,7 @@ func (application *directoryHTTPApplication) GetDirectorySyncJob(context.Context
 	return redactDirectorySyncJob(application.job), application.jobError
 }
 
-func (application *directoryHTTPApplication) ListDirectorySyncConflicts(context.Context, identity.Principal, uuid.UUID, Page) (DirectorySyncConflictPage, error) {
+func (application *directoryHTTPApplication) ListDirectorySyncConflicts(_ context.Context, _ identity.Principal, _ uuid.UUID, page Page) (DirectorySyncConflictPage, error) {
+	application.listedPage = page
 	return application.conflicts, nil
 }

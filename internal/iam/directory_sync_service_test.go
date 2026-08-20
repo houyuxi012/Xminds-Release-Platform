@@ -26,7 +26,7 @@ func TestDirectorySyncServiceCreatesPreviewJobOutboxAndAuditAtomically(t *testin
 	queue := &directorySyncJobQueueFake{}
 	auditor := &directorySyncAuditFake{}
 	service, err := NewDirectorySyncService(DirectorySyncServiceConfig{
-		Store: store, Jobs: queue, Auditor: auditor, Clock: func() time.Time { return now },
+		Store: store, Jobs: queue, Auditor: auditor, Clock: func() time.Time { return now }, ConflictCursors: newDirectoryTestConflictCursorCodec(t, func() time.Time { return now }),
 	})
 	if err != nil {
 		t.Fatalf("NewDirectorySyncService() error = %v", err)
@@ -78,7 +78,7 @@ func TestDirectorySyncServiceRejectsOIDCApplyAndStaleSourceVersionBeforeEnqueue(
 		t.Run(test.name, func(t *testing.T) {
 			store := &directorySyncStoreFake{source: test.source}
 			queue := &directorySyncJobQueueFake{}
-			service, err := NewDirectorySyncService(DirectorySyncServiceConfig{Store: store, Jobs: queue, Auditor: &directorySyncAuditFake{}, Clock: time.Now})
+			service, err := NewDirectorySyncService(DirectorySyncServiceConfig{Store: store, Jobs: queue, Auditor: &directorySyncAuditFake{}, Clock: time.Now, ConflictCursors: newDirectoryTestConflictCursorCodec(t, time.Now)})
 			if err != nil {
 				t.Fatalf("NewDirectorySyncService() error = %v", err)
 			}
@@ -98,7 +98,7 @@ func TestDirectorySyncServiceRollsBackWhenAuditFails(t *testing.T) {
 	store := &directorySyncStoreFake{source: source}
 	queue := &directorySyncJobQueueFake{}
 	auditor := &directorySyncAuditFake{err: errors.New("audit unavailable")}
-	service, err := NewDirectorySyncService(DirectorySyncServiceConfig{Store: store, Jobs: queue, Auditor: auditor, Clock: time.Now})
+	service, err := NewDirectorySyncService(DirectorySyncServiceConfig{Store: store, Jobs: queue, Auditor: auditor, Clock: time.Now, ConflictCursors: newDirectoryTestConflictCursorCodec(t, time.Now)})
 	if err != nil {
 		t.Fatalf("NewDirectorySyncService() error = %v", err)
 	}
@@ -111,7 +111,7 @@ func TestDirectorySyncServiceRollsBackWhenAuditFails(t *testing.T) {
 func TestDirectorySyncServiceConflictListHidesUnknownSource(t *testing.T) {
 	source := IdentitySource{ID: uuid.New(), Kind: IdentitySourceSCIM, Status: IdentitySourceStatusVerified, VerifiedAt: time.Now(), Version: 2}
 	service, err := NewDirectorySyncService(DirectorySyncServiceConfig{
-		Store: &directorySyncStoreFake{source: source}, Jobs: &directorySyncJobQueueFake{}, Auditor: &directorySyncAuditFake{}, Clock: time.Now,
+		Store: &directorySyncStoreFake{source: source}, Jobs: &directorySyncJobQueueFake{}, Auditor: &directorySyncAuditFake{}, Clock: time.Now, ConflictCursors: newDirectoryTestConflictCursorCodec(t, time.Now),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -122,10 +122,39 @@ func TestDirectorySyncServiceConflictListHidesUnknownSource(t *testing.T) {
 	}
 }
 
+func TestDirectorySyncServiceReplacesRepositoryCursorWithBoundOpaqueCursor(t *testing.T) {
+	now := time.Date(2026, 8, 21, 13, 45, 0, 0, time.UTC)
+	source := IdentitySource{ID: uuid.New(), Kind: IdentitySourceSCIM, Status: IdentitySourceStatusVerified, VerifiedAt: now, Version: 2}
+	conflict := DirectorySyncConflict{ID: uuid.New(), IdentitySourceID: source.ID, CreatedAt: now.Add(-time.Minute)}
+	store := &directorySyncStoreFake{source: source, conflictPage: DirectorySyncConflictPage{Items: []DirectorySyncConflict{conflict}, NextCursor: "repository-cursor-must-not-escape"}}
+	service, err := NewDirectorySyncService(DirectorySyncServiceConfig{
+		Store: store, Jobs: &directorySyncJobQueueFake{}, Auditor: &directorySyncAuditFake{}, Clock: func() time.Time { return now }, ConflictCursors: newDirectoryTestConflictCursorCodec(t, func() time.Time { return now }),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := service.ListConflicts(context.Background(), directorySyncAdmin(), source.ID, Page{Limit: 25})
+	if err != nil || first.NextCursor == "" || first.NextCursor == "repository-cursor-must-not-escape" {
+		t.Fatalf("ListConflicts(first)=%#v error=%v", first, err)
+	}
+	store.conflictPage = DirectorySyncConflictPage{}
+	if _, err := service.ListConflicts(context.Background(), directorySyncAdmin(), source.ID, Page{Limit: 25, Cursor: first.NextCursor}); err != nil {
+		t.Fatal(err)
+	}
+	if !store.listedPage.BeforeTime.Equal(conflict.CreatedAt) || store.listedPage.BeforeID != conflict.ID {
+		t.Fatalf("decoded repository page=%#v", store.listedPage)
+	}
+	if _, err := service.ListConflicts(context.Background(), directorySyncAdmin(), source.ID, Page{Limit: 50, Cursor: first.NextCursor}); !errors.Is(err, ErrPageInvalid) {
+		t.Fatalf("changed limit error=%v", err)
+	}
+}
+
 type directorySyncStoreFake struct {
-	source    IdentitySource
-	inserted  DirectorySyncJob
-	committed bool
+	source       IdentitySource
+	inserted     DirectorySyncJob
+	committed    bool
+	conflictPage DirectorySyncConflictPage
+	listedPage   Page
 }
 
 func (store *directorySyncStoreFake) WithinTransaction(ctx context.Context, function func(pgx.Tx) error) error {
@@ -153,8 +182,9 @@ func (store *directorySyncStoreFake) GetDirectorySyncJob(context.Context, uuid.U
 	return DirectorySyncJob{}, errors.New("unexpected GetDirectorySyncJob call")
 }
 
-func (store *directorySyncStoreFake) ListDirectorySyncConflicts(context.Context, uuid.UUID, Page) (DirectorySyncConflictPage, error) {
-	return DirectorySyncConflictPage{}, errors.New("unexpected ListDirectorySyncConflicts call")
+func (store *directorySyncStoreFake) ListDirectorySyncConflicts(_ context.Context, _ uuid.UUID, page Page) (DirectorySyncConflictPage, error) {
+	store.listedPage = page
+	return store.conflictPage, nil
 }
 
 type directorySyncJobQueueFake struct{ jobs []jobs.Job }

@@ -18,6 +18,18 @@ import (
 	"xminds-release-platform/internal/platform/httpx"
 )
 
+func TestIAMHTTPJSONRejectsBodyWhoseActualBytesExceedLimit(t *testing.T) {
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/local-users", bytes.NewBufferString(`{"username":"alice","display_name":"Alice"}`+strings.Repeat(" ", maximumIAMRequestBytes)))
+	request.Header.Set("Content-Type", "application/json")
+	var target struct {
+		Username    string `json:"username"`
+		DisplayName string `json:"display_name"`
+	}
+	if err := decodeIAMJSON(request, &target); err == nil {
+		t.Fatal("decodeIAMJSON() error=nil, want actual byte limit rejection")
+	}
+}
+
 func TestHTTPHandlerCreatesLocalUserWithoutPersistingSecretInRequestState(t *testing.T) {
 	t.Parallel()
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -11,6 +12,15 @@ import (
 
 	"xminds-release-platform/internal/platform/jobs"
 )
+
+func TestDirectorySyncWorkerPayloadRejectsDuplicateMembers(t *testing.T) {
+	jobID, sourceID := uuid.New(), uuid.New()
+	payload := []byte(fmt.Sprintf(`{"job_id":%q,"source_id":%q,"mode":"apply","mode":"apply"}`, jobID, sourceID))
+	_, err := decodeDirectorySyncJob(jobs.Job{ID: uuid.New(), Kind: JobKindDirectorySync, AggregateID: jobID, Payload: payload})
+	if !errors.Is(err, ErrDirectorySyncConfiguration) {
+		t.Fatalf("decodeDirectorySyncJob() error=%v", err)
+	}
+}
 
 func TestDirectorySyncHandlerRetryResumesFromDurableCursorWithoutRestagingCommittedPage(t *testing.T) {
 	jobID, sourceID := uuid.New(), uuid.New()

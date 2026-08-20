@@ -157,17 +157,40 @@ LIMIT $2`, job.ID, executor.batchSize)
 	}
 	rows.Close()
 	if len(staged) == 0 {
+		phase := job.Phase
 		job.Phase = DirectorySyncPhaseOrganizations
 		job.UpdatedAt = executor.now()
-		_, err := tx.Exec(ctx, `UPDATE directory_sync_jobs SET phase='apply_organizations', updated_at=$2 WHERE id=$1`, job.ID, job.UpdatedAt)
-		return err
+		if _, err := tx.Exec(ctx, `UPDATE directory_sync_jobs SET phase='apply_organizations', updated_at=$2 WHERE id=$1`, job.ID, job.UpdatedAt); err != nil {
+			return err
+		}
+		return executor.appendDirectoryBatchAudit(ctx, tx, *job, phase, 0, job.ProcessedUsers, true)
 	}
 	now := executor.now()
 	for _, stagedUser := range staged {
+		mappingConflicts, err := revalidateDirectoryUserMapping(ctx, tx, job.IdentitySourceID, stagedUser.externalSubject, stagedUser.username, stagedUser.email)
+		if err != nil {
+			return err
+		}
+		if mappingConflicts.ambiguousEmail {
+			if err := executor.insertConflict(ctx, tx, *job, "user", stagedUser.externalSubject, "AMBIGUOUS_EMAIL", "email", 2); err != nil {
+				return err
+			}
+		}
+		if mappingConflicts.usernameConflict {
+			if err := executor.insertConflict(ctx, tx, *job, "user", stagedUser.externalSubject, "CANONICAL_USERNAME_CONFLICT", "username", 1); err != nil {
+				return err
+			}
+		}
+		if mappingConflicts.ambiguousEmail || mappingConflicts.usernameConflict {
+			if _, err := tx.Exec(ctx, `UPDATE directory_sync_stage_users SET processed=TRUE WHERE sync_job_id=$1 AND external_subject=$2`, job.ID, stagedUser.externalSubject); err != nil {
+				return fmt.Errorf("mark conflicting directory user processed: %w", err)
+			}
+			continue
+		}
 		var existingID uuid.UUID
 		var existingStatus UserStatus
 		var existingVersion int64
-		err := tx.QueryRow(ctx, `
+		err = tx.QueryRow(ctx, `
 SELECT id, status, version FROM user_principals
 WHERE identity_source_id=$1 AND external_subject=$2 FOR UPDATE`, job.IdentitySourceID, stagedUser.externalSubject).Scan(&existingID, &existingStatus, &existingVersion)
 		status := UserStatusActive
@@ -216,8 +239,16 @@ WHERE id=$1 AND version=$10`, existingID, stagedUser.username, stagedUser.displa
 	}
 	job.ProcessedUsers += len(staged)
 	job.UpdatedAt = now
-	_, err = tx.Exec(ctx, `UPDATE directory_sync_jobs SET processed_users=$2, updated_at=$3 WHERE id=$1`, job.ID, job.ProcessedUsers, now)
-	return err
+	if err = tx.QueryRow(ctx, `
+UPDATE directory_sync_jobs
+SET processed_users=$2,
+    conflict_count=(SELECT count(*) FROM directory_sync_conflicts WHERE sync_job_id=$1),
+    updated_at=$3
+WHERE id=$1
+RETURNING conflict_count`, job.ID, job.ProcessedUsers, now).Scan(&job.ConflictCount); err != nil {
+		return err
+	}
+	return executor.appendDirectoryBatchAudit(ctx, tx, *job, DirectorySyncPhaseUsers, len(staged), job.ProcessedUsers, false)
 }
 
 func (executor *PostgresDirectorySyncExecutor) applyOrganizations(ctx context.Context, tx pgx.Tx, job *DirectorySyncJob) error {
@@ -265,8 +296,10 @@ WHERE organization.identity_source_id=$2
 		}
 		job.Phase = DirectorySyncPhaseMemberships
 		job.UpdatedAt = now
-		_, err := tx.Exec(ctx, `UPDATE directory_sync_jobs SET phase='apply_memberships', updated_at=$2 WHERE id=$1`, job.ID, now)
-		return err
+		if _, err := tx.Exec(ctx, `UPDATE directory_sync_jobs SET phase='apply_memberships', updated_at=$2 WHERE id=$1`, job.ID, now); err != nil {
+			return err
+		}
+		return executor.appendDirectoryBatchAudit(ctx, tx, *job, DirectorySyncPhaseOrganizations, 0, job.ProcessedOrganizations, true)
 	}
 	for _, stagedOrganization := range staged {
 		var existingID uuid.UUID
@@ -302,8 +335,10 @@ WHERE id=$1 AND version=$5`, existingID, stagedOrganization.name, now, job.RunMa
 	}
 	job.ProcessedOrganizations += len(staged)
 	job.UpdatedAt = now
-	_, err = tx.Exec(ctx, `UPDATE directory_sync_jobs SET processed_organizations=$2, updated_at=$3 WHERE id=$1`, job.ID, job.ProcessedOrganizations, now)
-	return err
+	if _, err = tx.Exec(ctx, `UPDATE directory_sync_jobs SET processed_organizations=$2, updated_at=$3 WHERE id=$1`, job.ID, job.ProcessedOrganizations, now); err != nil {
+		return err
+	}
+	return executor.appendDirectoryBatchAudit(ctx, tx, *job, DirectorySyncPhaseOrganizations, len(staged), job.ProcessedOrganizations, false)
 }
 
 func (executor *PostgresDirectorySyncExecutor) applyMemberships(ctx context.Context, tx pgx.Tx, job *DirectorySyncJob) error {
@@ -334,10 +369,13 @@ LIMIT $2`, job.ID, executor.batchSize)
 	rows.Close()
 	now := executor.now()
 	if len(staged) == 0 {
+		phase := job.Phase
 		job.Phase = DirectorySyncPhaseFinalize
 		job.UpdatedAt = now
-		_, err := tx.Exec(ctx, `UPDATE directory_sync_jobs SET phase='finalize', updated_at=$2 WHERE id=$1`, job.ID, now)
-		return err
+		if _, err := tx.Exec(ctx, `UPDATE directory_sync_jobs SET phase='finalize', updated_at=$2 WHERE id=$1`, job.ID, now); err != nil {
+			return err
+		}
+		return executor.appendDirectoryBatchAudit(ctx, tx, *job, phase, 0, job.ProcessedMemberships, true)
 	}
 	for _, stagedMembership := range staged {
 		if _, err := tx.Exec(ctx, `
@@ -359,8 +397,10 @@ WHERE sync_job_id=$1 AND organization_external_id=$2 AND user_external_subject=$
 	}
 	job.ProcessedMemberships += len(staged)
 	job.UpdatedAt = now
-	_, err = tx.Exec(ctx, `UPDATE directory_sync_jobs SET processed_memberships=$2, updated_at=$3 WHERE id=$1`, job.ID, job.ProcessedMemberships, now)
-	return err
+	if _, err = tx.Exec(ctx, `UPDATE directory_sync_jobs SET processed_memberships=$2, updated_at=$3 WHERE id=$1`, job.ID, job.ProcessedMemberships, now); err != nil {
+		return err
+	}
+	return executor.appendDirectoryBatchAudit(ctx, tx, *job, DirectorySyncPhaseMemberships, len(staged), job.ProcessedMemberships, false)
 }
 
 func (executor *PostgresDirectorySyncExecutor) finalizeApply(ctx context.Context, tx pgx.Tx, job *DirectorySyncJob) error {
@@ -462,6 +502,22 @@ func (executor *PostgresDirectorySyncExecutor) appendCompletionAudit(ctx context
 		RequestID: job.RequestID.String(), Metadata: map[string]any{
 			"identity_source_id": job.IdentitySourceID.String(), "requested_by": job.RequestedBy, "source_version": job.SourceVersion,
 			"create_count": job.CreateCount, "update_count": job.UpdateCount, "disable_count": job.DisableCount, "conflict_count": job.ConflictCount,
+		},
+	})
+	return err
+}
+
+func (executor *PostgresDirectorySyncExecutor) appendDirectoryBatchAudit(ctx context.Context, tx pgx.Tx, job DirectorySyncJob, phase DirectorySyncPhase, batchCount, processedTotal int, phaseCompleted bool) error {
+	if batchCount < 0 || processedTotal < 0 || (phase != DirectorySyncPhaseUsers && phase != DirectorySyncPhaseOrganizations && phase != DirectorySyncPhaseMemberships) {
+		return ErrDirectorySyncConfiguration
+	}
+	_, err := executor.auditor.Append(ctx, tx, audit.AppendCommand{
+		Actor: directorySyncWorkerPrincipal(), Action: directorySyncBatchAuditAction,
+		ResourceType: "directory_sync_job", ResourceID: job.ID.String(), Outcome: audit.OutcomeSuccess,
+		RequestID: job.RequestID.String(), Metadata: map[string]any{
+			"identity_source_id": job.IdentitySourceID.String(), "source_version": job.SourceVersion,
+			"mode": job.Mode, "phase": phase, "batch_count": batchCount,
+			"processed_total": processedTotal, "phase_completed": phaseCompleted,
 		},
 	})
 	return err

@@ -25,17 +25,21 @@ func TestLoadDirectoryRuntimeConfigUsesBoundedSharedSecretRoot(t *testing.T) {
 	t.Parallel()
 	secretDirectory := t.TempDir()
 	configuration, err := LoadDirectoryRuntimeConfig(map[string]string{
-		"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY":          secretDirectory,
-		"XMINDS_RELEASE_IAM_DIRECTORY_REQUEST_TIMEOUT":     "12s",
-		"XMINDS_RELEASE_IAM_DIRECTORY_MAXIMUM_PAGES":       "250",
-		"XMINDS_RELEASE_IAM_DIRECTORY_MAXIMUM_OBJECTS":     "25000",
-		"XMINDS_RELEASE_IAM_DIRECTORY_ALLOW_LOOPBACK_HTTP": "true",
+		"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY":                    secretDirectory,
+		"XMINDS_RELEASE_IAM_DIRECTORY_REQUEST_TIMEOUT":               "12s",
+		"XMINDS_RELEASE_IAM_DIRECTORY_MAXIMUM_PAGES":                 "250",
+		"XMINDS_RELEASE_IAM_DIRECTORY_MAXIMUM_OBJECTS":               "25000",
+		"XMINDS_RELEASE_IAM_DIRECTORY_ALLOW_LOOPBACK_HTTP":           "true",
+		"XMINDS_RELEASE_IAM_DIRECTORY_ALLOW_PRIVATE_NETWORKS":        "true",
+		"XMINDS_RELEASE_IAM_DIRECTORY_CONFLICT_CURSOR_KEY_REFERENCE": "secret://iam/test-directory-cursor-key",
+		"XMINDS_RELEASE_IAM_DIRECTORY_CONFLICT_CURSOR_TTL":           "30m",
 	}, "test")
 	if err != nil {
 		t.Fatalf("LoadDirectoryRuntimeConfig() error = %v", err)
 	}
 	if configuration.SecretDirectory != filepath.Clean(secretDirectory) || configuration.RequestTimeout != 12*time.Second ||
-		configuration.MaximumPages != 250 || configuration.MaximumObjects != 25000 || !configuration.AllowLoopbackHTTP {
+		configuration.MaximumPages != 250 || configuration.MaximumObjects != 25000 || !configuration.AllowLoopbackHTTP || !configuration.AllowPrivateNetworks ||
+		configuration.ConflictCursorKeyReference != "secret://iam/test-directory-cursor-key" || configuration.ConflictCursorTTL != 30*time.Minute {
 		t.Fatalf("configuration = %+v", configuration)
 	}
 }
@@ -47,13 +51,17 @@ func TestLoadDirectoryRuntimeConfigFailsClosedForUnsafeOverrides(t *testing.T) {
 		environment string
 		overrides   map[string]string
 	}{
-		"missing root":           {environment: "production", overrides: map[string]string{"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY": ""}},
-		"relative root":          {environment: "production", overrides: map[string]string{"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY": "relative"}},
-		"short timeout":          {environment: "production", overrides: map[string]string{"XMINDS_RELEASE_IAM_DIRECTORY_REQUEST_TIMEOUT": "500ms"}},
-		"too many pages":         {environment: "production", overrides: map[string]string{"XMINDS_RELEASE_IAM_DIRECTORY_MAXIMUM_PAGES": "10001"}},
-		"too many objects":       {environment: "production", overrides: map[string]string{"XMINDS_RELEASE_IAM_DIRECTORY_MAXIMUM_OBJECTS": "100001"}},
-		"production loopback":    {environment: "production", overrides: map[string]string{"XMINDS_RELEASE_IAM_DIRECTORY_ALLOW_LOOPBACK_HTTP": "true"}},
-		"implicit test loopback": {environment: "test", overrides: map[string]string{"XMINDS_RELEASE_IAM_DIRECTORY_ALLOW_LOOPBACK_HTTP": "yes"}},
+		"missing root":                 {environment: "production", overrides: map[string]string{"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY": ""}},
+		"relative root":                {environment: "production", overrides: map[string]string{"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY": "relative"}},
+		"short timeout":                {environment: "production", overrides: map[string]string{"XMINDS_RELEASE_IAM_DIRECTORY_REQUEST_TIMEOUT": "500ms"}},
+		"too many pages":               {environment: "production", overrides: map[string]string{"XMINDS_RELEASE_IAM_DIRECTORY_MAXIMUM_PAGES": "10001"}},
+		"too many objects":             {environment: "production", overrides: map[string]string{"XMINDS_RELEASE_IAM_DIRECTORY_MAXIMUM_OBJECTS": "100001"}},
+		"production loopback":          {environment: "production", overrides: map[string]string{"XMINDS_RELEASE_IAM_DIRECTORY_ALLOW_LOOPBACK_HTTP": "true"}},
+		"implicit test loopback":       {environment: "test", overrides: map[string]string{"XMINDS_RELEASE_IAM_DIRECTORY_ALLOW_LOOPBACK_HTTP": "yes"}},
+		"invalid private policy":       {environment: "production", overrides: map[string]string{"XMINDS_RELEASE_IAM_DIRECTORY_ALLOW_PRIVATE_NETWORKS": "yes"}},
+		"invalid cursor key reference": {environment: "production", overrides: map[string]string{"XMINDS_RELEASE_IAM_DIRECTORY_CONFLICT_CURSOR_KEY_REFERENCE": "file:///tmp/key"}},
+		"short cursor ttl":             {environment: "production", overrides: map[string]string{"XMINDS_RELEASE_IAM_DIRECTORY_CONFLICT_CURSOR_TTL": "30s"}},
+		"long cursor ttl":              {environment: "production", overrides: map[string]string{"XMINDS_RELEASE_IAM_DIRECTORY_CONFLICT_CURSOR_TTL": "25h"}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			environ := map[string]string{"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY": secretDirectory}

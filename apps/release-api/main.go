@@ -187,10 +187,18 @@ func run(ctx context.Context, arguments []string, environ map[string]string) err
 		return fmt.Errorf("configure IAM secret resolver: %w", err)
 	}
 	defer secretResolver.Close()
+	directoryCursorKey, err := secretResolver.Resolve(ctx, runtimeConfig.Directory.ConflictCursorKeyReference)
+	if err != nil {
+		return fmt.Errorf("configure IAM directory conflict cursor key: %w", err)
+	}
+	directoryCursorCodec, err := iam.NewDirectoryConflictCursorCodec(directoryCursorKey, time.Now, runtimeConfig.Directory.ConflictCursorTTL)
+	if err != nil {
+		return fmt.Errorf("configure IAM directory conflict cursor codec: %w", err)
+	}
 	directoryAdapter, err := iam.NewSecretBackedDirectoryAdapter(iam.SecretBackedDirectoryAdapterConfig{
 		Secrets: secretResolver, RequestTimeout: runtimeConfig.Directory.RequestTimeout,
 		MaximumPages: runtimeConfig.Directory.MaximumPages, MaximumObjects: runtimeConfig.Directory.MaximumObjects,
-		AllowLoopbackHTTP: runtimeConfig.Directory.AllowLoopbackHTTP,
+		AllowLoopbackHTTP: runtimeConfig.Directory.AllowLoopbackHTTP, AllowPrivateNetworks: runtimeConfig.Directory.AllowPrivateNetworks,
 	})
 	if err != nil {
 		return fmt.Errorf("configure IAM directory adapter: %w", err)
@@ -232,7 +240,7 @@ func run(ctx context.Context, arguments []string, environ map[string]string) err
 		return fmt.Errorf("configure governed IAM principal resolver: %w", err)
 	}
 	directorySyncService, err := iam.NewDirectorySyncService(iam.DirectorySyncServiceConfig{
-		Store: iamRepository, Jobs: jobRepository, Auditor: auditor, Clock: time.Now,
+		Store: iamRepository, Jobs: jobRepository, Auditor: auditor, Clock: time.Now, ConflictCursors: directoryCursorCodec,
 	})
 	if err != nil {
 		return fmt.Errorf("configure IAM directory sync service: %w", err)
