@@ -1074,6 +1074,135 @@ VALUES ($1, $2, 'existing-not-in-first-page', 'existing.user', 'Existing User', 
 	}
 }
 
+func TestIAMDirectorySyncBatchesLockCanonicalMappingsInGlobalOrder(t *testing.T) {
+	databaseURL := integrationDatabaseURL(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool, err := database.Open(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if err := database.ApplyMigrations(ctx, pool, migrations.FS); err != nil {
+		t.Fatal(err)
+	}
+	resetDirectoryIntegrationTables(t, ctx, pool)
+
+	// Hold each transaction after its first principal insert. Per-user locking
+	// then deterministically acquires z->a and a->z in opposite transactions;
+	// batch-wide sorted locking must serialize before either insert reaches here.
+	if _, err := pool.Exec(ctx, `
+CREATE OR REPLACE FUNCTION test_pause_directory_batch_insert() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM pg_sleep(0.1);
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER zzz_test_pause_directory_batch_insert
+AFTER INSERT ON user_principals
+FOR EACH ROW WHEN (NEW.user_kind='external')
+EXECUTE FUNCTION test_pause_directory_batch_insert()`); err != nil {
+		t.Fatalf("install directory batch race gate: %v", err)
+	}
+	defer func() {
+		cleanupContext, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanupCancel()
+		_, _ = pool.Exec(cleanupContext, `
+DROP TRIGGER IF EXISTS zzz_test_pause_directory_batch_insert ON user_principals;
+DROP FUNCTION IF EXISTS test_pause_directory_batch_insert()`)
+	}()
+
+	now := time.Date(2026, 8, 21, 18, 0, 0, 0, time.UTC)
+	sourceIDs := []uuid.UUID{uuid.New(), uuid.New()}
+	for _, sourceID := range sourceIDs {
+		seedDirectoryIntegrationSource(t, ctx, pool, sourceID, iam.IdentitySourceSCIM, now, 5)
+	}
+	repository := iam.NewPostgresRepository(pool)
+	auditor := audit.NewService(audit.NewPostgresRepository(pool))
+	service, err := iam.NewDirectorySyncService(iam.DirectorySyncServiceConfig{
+		Store: repository, Jobs: jobs.NewPostgresRepository(pool), Auditor: auditor,
+		Clock: func() time.Time { return now }, ConflictCursors: directoryIntegrationCursorCodec(t, now),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor, err := iam.NewPostgresDirectorySyncExecutor(iam.PostgresDirectorySyncExecutorConfig{
+		Pool: pool, Auditor: auditor, Sessions: repository, Clock: func() time.Time { return now }, BatchSize: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	usersBySource := [][]iam.DirectoryUser{
+		{
+			{ExternalSubject: "01", Username: "z.shared", DisplayName: "Z First", Enabled: true},
+			{ExternalSubject: "02", Username: "a.shared", DisplayName: "A Second", Enabled: true},
+		},
+		{
+			{ExternalSubject: "01", Username: "a.shared", DisplayName: "A First", Enabled: true},
+			{ExternalSubject: "02", Username: "z.shared", DisplayName: "Z Second", Enabled: true},
+		},
+	}
+	preparedJobs := make([]iam.DirectorySyncJob, len(sourceIDs))
+	preparedSources := make([]iam.IdentitySource, len(sourceIDs))
+	for index, sourceID := range sourceIDs {
+		created, err := service.Start(ctx, directorySyncIntegrationAdmin(), sourceID, iam.DirectorySyncModeApply, 5, iam.RequestContext{RequestID: uuid.NewString()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		job, source, err := executor.Load(ctx, created.ID, sourceID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := executor.Stage(ctx, job, source, iam.SyncPage{Users: usersBySource[index], Complete: true}); err != nil {
+			t.Fatal(err)
+		}
+		job, source, err = executor.Load(ctx, created.ID, sourceID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := executor.Advance(ctx, job, source); err != nil {
+			t.Fatal(err)
+		}
+		preparedJobs[index], preparedSources[index], err = executor.Load(ctx, created.ID, sourceID)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	start := make(chan struct{})
+	results := make(chan error, len(preparedJobs))
+	for index := range preparedJobs {
+		index := index
+		go func() {
+			<-start
+			_, advanceErr := executor.Advance(ctx, preparedJobs[index], preparedSources[index])
+			results <- advanceErr
+		}()
+	}
+	close(start)
+	for range preparedJobs {
+		if err := <-results; err != nil {
+			t.Fatalf("reverse-order concurrent directory batch returned an infrastructure error: %v", err)
+		}
+	}
+
+	var users int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM user_principals WHERE identity_source_id=ANY($1)`, sourceIDs).Scan(&users); err != nil {
+		t.Fatal(err)
+	}
+	var conflictingJobs, conflicts int
+	if err := pool.QueryRow(ctx, `
+SELECT count(DISTINCT sync_job_id), count(*)
+FROM directory_sync_conflicts
+WHERE identity_source_id=ANY($1) AND conflict_code='CANONICAL_USERNAME_CONFLICT'`, sourceIDs).Scan(&conflictingJobs, &conflicts); err != nil {
+		t.Fatal(err)
+	}
+	if users != 2 || conflictingJobs != 1 || conflicts != 2 {
+		t.Fatalf("reverse-order batch users=%d conflicting_jobs=%d conflicts=%d, want one source written and one stable conflict set", users, conflictingJobs, conflicts)
+	}
+}
+
 func TestIAMDirectorySyncConcurrentSourcesRevalidateUsernameAndEmailMappings(t *testing.T) {
 	databaseURL := integrationDatabaseURL(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

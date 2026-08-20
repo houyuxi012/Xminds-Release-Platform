@@ -165,9 +165,16 @@ LIMIT $2`, job.ID, executor.batchSize)
 		}
 		return executor.appendDirectoryBatchAudit(ctx, tx, *job, phase, 0, job.ProcessedUsers, true)
 	}
+	mappingCandidates := make([]principalMappingCandidate, 0, len(staged))
+	for _, stagedUser := range staged {
+		mappingCandidates = append(mappingCandidates, principalMappingCandidate{username: stagedUser.username, email: stagedUser.email})
+	}
+	if err := lockPrincipalMappingCandidates(ctx, tx, mappingCandidates); err != nil {
+		return err
+	}
 	now := executor.now()
 	for _, stagedUser := range staged {
-		mappingConflicts, err := revalidateDirectoryUserMapping(ctx, tx, job.IdentitySourceID, stagedUser.externalSubject, stagedUser.username, stagedUser.email)
+		mappingConflicts, err := directoryUserMappingConflictsUnderLock(ctx, tx, job.IdentitySourceID, stagedUser.externalSubject, stagedUser.username, stagedUser.email)
 		if err != nil {
 			return err
 		}

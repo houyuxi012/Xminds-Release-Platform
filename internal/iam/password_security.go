@@ -122,6 +122,7 @@ type DirectorySecretResolver struct {
 	mutex    sync.RWMutex
 	root     *os.File
 	executor *secretIOExecutor
+	shutdown sync.Once
 }
 
 func NewDirectorySecretResolver(root string) (*DirectorySecretResolver, error) {
@@ -190,17 +191,28 @@ func (resolver *DirectorySecretResolver) Close() error {
 	if resolver == nil {
 		return nil
 	}
-	if resolver.executor != nil {
-		resolver.executor.Close()
-	}
-	resolver.mutex.Lock()
-	defer resolver.mutex.Unlock()
-	if resolver.root == nil {
-		return nil
-	}
-	err := resolver.root.Close()
-	resolver.root = nil
-	return err
+	resolver.shutdown.Do(func() {
+		workersDone := closedSignal()
+		if resolver.executor != nil {
+			workersDone = resolver.executor.Close()
+		}
+		go func() {
+			<-workersDone
+			resolver.mutex.Lock()
+			defer resolver.mutex.Unlock()
+			if resolver.root != nil {
+				_ = resolver.root.Close()
+				resolver.root = nil
+			}
+		}()
+	})
+	return nil
+}
+
+func closedSignal() <-chan struct{} {
+	done := make(chan struct{})
+	close(done)
+	return done
 }
 
 func openDirectoryPathNoFollow(path string) (*os.File, error) {

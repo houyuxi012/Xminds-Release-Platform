@@ -40,6 +40,100 @@ func TestOIDCTrustKeySetNegativeCachesUnknownKeyID(t *testing.T) {
 	}
 }
 
+func TestOIDCTrustKeySetGloballyThrottlesDistinctUnknownKeyIDs(t *testing.T) {
+	fixture := newBoundedJWKSFixture(t)
+	verifier := fixture.humanVerifier(t)
+	for index := range maximumOIDCNegativeKeyIDs {
+		token := fixture.sign(t, fixture.rotatedKey, fmt.Sprintf("unknown-%03d", index), fmt.Sprintf("token-%03d", index))
+		if _, err := verifier.Verify(context.Background(), token); err == nil {
+			t.Fatalf("Verify(distinct unknown kid %d) error=nil", index)
+		}
+	}
+	if calls := fixture.jwksCalls.Load(); calls != 2 {
+		t.Fatalf("JWKS requests=%d, want one prefetch plus one globally throttled refresh", calls)
+	}
+}
+
+func TestOIDCTrustKeySetFailureBackoffAndJitterAreDeterministic(t *testing.T) {
+	fixture := newBoundedJWKSFixture(t)
+	fixture.jwksResponse = func(writer http.ResponseWriter, _ *http.Request, _ int32) {
+		writer.WriteHeader(http.StatusServiceUnavailable)
+	}
+	keySet := fixture.directKeySet(t)
+	now := time.Date(2026, 8, 21, 20, 0, 0, 0, time.UTC)
+	keySet.now = func() time.Time { return now }
+	keySet.refreshJitter = func(maximum time.Duration) time.Duration { return maximum }
+
+	verifyUnknown := func(keyID string) {
+		t.Helper()
+		if _, err := keySet.VerifySignature(context.Background(), fixture.sign(t, fixture.rotatedKey, keyID, keyID)); err == nil {
+			t.Fatalf("VerifySignature(%s) error=nil", keyID)
+		}
+	}
+	verifyUnknown("failure-1")
+	firstDelay := oidcRefreshFailureBase + oidcRefreshFailureBase/oidcRefreshJitterDivisor
+	keySet.mu.RLock()
+	firstAllowed, firstFailures := keySet.nextAllowedRefresh, keySet.refreshFailures
+	keySet.mu.RUnlock()
+	if firstFailures != 1 || !firstAllowed.Equal(now.Add(firstDelay)) {
+		t.Fatalf("first failure count=%d next=%s, want %s", firstFailures, firstAllowed, now.Add(firstDelay))
+	}
+	verifyUnknown("failure-suppressed")
+	if calls := fixture.jwksCalls.Load(); calls != 1 {
+		t.Fatalf("JWKS calls during first backoff=%d", calls)
+	}
+
+	now = firstAllowed
+	verifyUnknown("failure-2")
+	secondBase := 2 * oidcRefreshFailureBase
+	secondDelay := secondBase + secondBase/oidcRefreshJitterDivisor
+	keySet.mu.RLock()
+	secondAllowed, secondFailures := keySet.nextAllowedRefresh, keySet.refreshFailures
+	keySet.mu.RUnlock()
+	if secondFailures != 2 || !secondAllowed.Equal(now.Add(secondDelay)) {
+		t.Fatalf("second failure count=%d next=%s, want %s", secondFailures, secondAllowed, now.Add(secondDelay))
+	}
+	now = now.Add(firstDelay)
+	verifyUnknown("failure-still-suppressed")
+	if calls := fixture.jwksCalls.Load(); calls != 2 {
+		t.Fatalf("JWKS calls during exponential backoff=%d", calls)
+	}
+}
+
+func TestOIDCTrustKeySetRefreshesLegalRotationAfterGlobalCooldown(t *testing.T) {
+	fixture := newBoundedJWKSFixture(t)
+	fixture.jwksResponse = func(writer http.ResponseWriter, _ *http.Request, call int32) {
+		if call == 1 {
+			fixture.writeKeys(t, writer, fixture.initialKey, "initial-key")
+			return
+		}
+		fixture.writeKeys(t, writer, fixture.rotatedKey, "rotated-key")
+	}
+	keySet := fixture.directKeySet(t)
+	now := time.Date(2026, 8, 21, 20, 30, 0, 0, time.UTC)
+	keySet.now = func() time.Time { return now }
+	keySet.refreshJitter = func(time.Duration) time.Duration { return 0 }
+
+	missing := fixture.sign(t, fixture.rotatedKey, "unknown-before-rotation", "missing")
+	if _, err := keySet.VerifySignature(context.Background(), missing); err == nil {
+		t.Fatal("VerifySignature(missing key) error=nil")
+	}
+	rotated := fixture.sign(t, fixture.rotatedKey, "rotated-key", "rotated")
+	if _, err := keySet.VerifySignature(context.Background(), rotated); err == nil {
+		t.Fatal("VerifySignature(rotation during cooldown) error=nil")
+	}
+	if calls := fixture.jwksCalls.Load(); calls != 1 {
+		t.Fatalf("JWKS calls during successful-missing cooldown=%d", calls)
+	}
+	now = now.Add(oidcRefreshSuccessCooldown)
+	if _, err := keySet.VerifySignature(context.Background(), rotated); err != nil {
+		t.Fatalf("VerifySignature(rotation after cooldown) error=%v", err)
+	}
+	if calls := fixture.jwksCalls.Load(); calls != 2 {
+		t.Fatalf("JWKS calls after legal rotation=%d", calls)
+	}
+}
+
 func TestOIDCTrustKeySetNegativeCacheRemainsBoundedAcrossExpiryCycles(t *testing.T) {
 	now := time.Date(2026, 8, 21, 19, 0, 0, 0, time.UTC)
 	keySet := &boundedOIDCKeySet{now: func() time.Time { return now }, negative: make(map[string]time.Time)}
@@ -282,6 +376,25 @@ func (fixture *boundedJWKSFixture) humanVerifier(t *testing.T) identity.Verifier
 		t.Fatal(err)
 	}
 	return verifier
+}
+
+func (fixture *boundedJWKSFixture) directKeySet(t *testing.T) *boundedOIDCKeySet {
+	t.Helper()
+	contents, err := json.Marshal(map[string]any{"keys": []map[string]any{boundedJWKSMap(fixture.initialKey, "initial-key")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var initial oidcJWKSet
+	if err := json.Unmarshal(contents, &initial); err != nil {
+		t.Fatal(err)
+	}
+	client := fixture.server.Client()
+	client.Timeout = 3 * time.Second
+	keySet, err := newBoundedOIDCKeySet(client, fixture.server.URL+"/jwks", []string{"RS256"}, initial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return keySet
 }
 
 func (fixture *boundedJWKSFixture) writeKeys(t *testing.T, writer http.ResponseWriter, key *rsa.PrivateKey, keyID string) {

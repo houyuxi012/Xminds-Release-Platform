@@ -166,6 +166,157 @@ func TestDirectorySecretResolverReturnsWhenContextExpiresDuringBlockedFileOpen(t
 	}
 }
 
+func TestDirectorySecretResolverCloseReturnsWhileFIFOOpenIsPermanentlyBlocked(t *testing.T) {
+	root := resolvedTempDir(t)
+	fifo := filepath.Join(root, "permanently-blocked-secret")
+	if err := unix.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resolver, err := NewDirectorySecretResolver(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	resolveResult := make(chan error, 1)
+	go func() {
+		_, resolveErr := resolver.Resolve(ctx, "secret://iam/permanently-blocked-secret")
+		resolveResult <- resolveErr
+	}()
+	if resolveErr := <-resolveResult; !errors.Is(resolveErr, context.DeadlineExceeded) {
+		t.Fatalf("Resolve() error=%v, want context deadline exceeded", resolveErr)
+	}
+	closeResult := make(chan error, 1)
+	go func() { closeResult <- resolver.Close() }()
+	select {
+	case closeErr := <-closeResult:
+		if closeErr != nil {
+			t.Fatalf("Close() error=%v", closeErr)
+		}
+	case <-time.After(150 * time.Millisecond):
+		writer, openErr := unix.Open(fifo, unix.O_WRONLY|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+		if openErr == nil {
+			_ = unix.Close(writer)
+		}
+		<-closeResult
+		t.Fatal("Close() waited for a worker blocked in an uncancelable FIFO open")
+	}
+	resolver.mutex.RLock()
+	rootStillPinned := resolver.root != nil
+	resolver.mutex.RUnlock()
+	if !rootStillPinned {
+		t.Fatal("Close() closed the pinned root while a Secret worker was still using it")
+	}
+	writer, err := unix.Open(fifo, unix.O_WRONLY|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatalf("release blocked FIFO open: %v", err)
+	}
+	_ = unix.Close(writer)
+	deadline := time.Now().Add(time.Second)
+	for {
+		resolver.mutex.RLock()
+		rootClosed := resolver.root == nil
+		resolver.mutex.RUnlock()
+		if rootClosed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("pinned root was not closed after the blocked Secret worker exited")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestSecretIOExecutorCloseFailsQueuedAndNewRequestsWithoutWaitingForWorkers(t *testing.T) {
+	const (
+		workers = 2
+		queued  = 8
+	)
+	started := make(chan struct{}, workers)
+	release := make(chan struct{})
+	var reads atomic.Int32
+	executor := newSecretIOExecutor(workers, queued, func(string) ([]byte, error) {
+		reads.Add(1)
+		started <- struct{}{}
+		<-release
+		return []byte("snapshot"), nil
+	})
+
+	results := make(chan error, workers+queued)
+	for range workers + queued {
+		go func() {
+			_, err := executor.Resolve(context.Background(), "blocked-secret")
+			results <- err
+		}()
+	}
+	for range workers {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("Secret worker did not begin its blocking read")
+		}
+	}
+
+	workersDone := executor.Close()
+	if _, err := executor.Resolve(context.Background(), "after-close"); !errors.Is(err, ErrSecretReferenceInvalid) {
+		t.Fatalf("Resolve(after Close) error=%v, want secret reference invalid", err)
+	}
+	for range workers + queued {
+		select {
+		case err := <-results:
+			if !errors.Is(err, ErrSecretReferenceInvalid) {
+				t.Fatalf("Resolve(during Close) error=%v, want secret reference invalid", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("Close did not release a Secret caller")
+		}
+	}
+	select {
+	case <-workersDone:
+		t.Fatal("executor reported shutdown while fixed workers remained blocked")
+	default:
+	}
+	if got := reads.Load(); got != workers {
+		t.Fatalf("Secret reads after Close=%d, want only %d reads already in progress", got, workers)
+	}
+	close(release)
+	select {
+	case <-workersDone:
+	case <-time.After(time.Second):
+		t.Fatal("executor did not report shutdown after its fixed workers exited")
+	}
+}
+
+func TestSecretIOExecutorResolveCloseRaceIsFailClosed(t *testing.T) {
+	for range 100 {
+		executor := newSecretIOExecutor(1, 1, func(string) ([]byte, error) {
+			return []byte("snapshot"), nil
+		})
+		start := make(chan struct{})
+		result := make(chan error, 1)
+		go func() {
+			<-start
+			_, err := executor.Resolve(context.Background(), "racing-secret")
+			result <- err
+		}()
+		close(start)
+		workersDone := executor.Close()
+		select {
+		case err := <-result:
+			if err != nil && !errors.Is(err, ErrSecretReferenceInvalid) {
+				t.Fatalf("Resolve racing with Close error=%v", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("Resolve racing with Close did not return")
+		}
+		select {
+		case <-workersDone:
+		case <-time.After(time.Second):
+			t.Fatal("executor did not finish after Resolve/Close race")
+		}
+	}
+}
+
 func TestSecretIOExecutorCapsBlockedWorkersAndReturnsCanceledCallers(t *testing.T) {
 	const (
 		workers   = 2

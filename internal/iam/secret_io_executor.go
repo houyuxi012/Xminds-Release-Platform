@@ -3,6 +3,7 @@ package iam
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 )
 
 const (
@@ -18,6 +19,8 @@ type secretIOExecutor struct {
 	read     secretSnapshotRead
 	once     sync.Once
 	workers  sync.WaitGroup
+	done     chan struct{}
+	closed   atomic.Bool
 }
 
 type secretIORequest struct {
@@ -39,6 +42,7 @@ func newSecretIOExecutor(workerCount, queueSize int, read secretSnapshotRead) *s
 		requests: make(chan secretIORequest, queueSize),
 		stop:     make(chan struct{}),
 		read:     read,
+		done:     make(chan struct{}),
 	}
 	executor.workers.Add(workerCount)
 	for range workerCount {
@@ -48,7 +52,7 @@ func newSecretIOExecutor(workerCount, queueSize int, read secretSnapshotRead) *s
 }
 
 func (executor *secretIOExecutor) Resolve(ctx context.Context, name string) ([]byte, error) {
-	if executor == nil || ctx == nil || name == "" {
+	if executor == nil || ctx == nil || name == "" || executor.closed.Load() {
 		return nil, ErrSecretReferenceInvalid
 	}
 	request := secretIORequest{ctx: ctx, name: name, result: make(chan secretIOResult, 1)}
@@ -58,6 +62,9 @@ func (executor *secretIOExecutor) Resolve(ctx context.Context, name string) ([]b
 	case <-executor.stop:
 		return nil, ErrSecretReferenceInvalid
 	case executor.requests <- request:
+	}
+	if executor.closed.Load() {
+		return nil, ErrSecretReferenceInvalid
 	}
 	select {
 	case <-ctx.Done():
@@ -69,12 +76,21 @@ func (executor *secretIOExecutor) Resolve(ctx context.Context, name string) ([]b
 	}
 }
 
-func (executor *secretIOExecutor) Close() {
+func (executor *secretIOExecutor) Close() <-chan struct{} {
 	if executor == nil {
-		return
+		done := make(chan struct{})
+		close(done)
+		return done
 	}
-	executor.once.Do(func() { close(executor.stop) })
-	executor.workers.Wait()
+	executor.closed.Store(true)
+	executor.once.Do(func() {
+		close(executor.stop)
+		go func() {
+			executor.workers.Wait()
+			close(executor.done)
+		}()
+	})
+	return executor.done
 }
 
 func (executor *secretIOExecutor) run() {
@@ -83,7 +99,17 @@ func (executor *secretIOExecutor) run() {
 		select {
 		case <-executor.stop:
 			return
+		default:
+		}
+		select {
+		case <-executor.stop:
+			return
 		case request := <-executor.requests:
+			select {
+			case <-executor.stop:
+				return
+			default:
+			}
 			select {
 			case <-request.ctx.Done():
 				request.result <- secretIOResult{err: request.ctx.Err()}

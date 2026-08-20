@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto"
 	"errors"
+	"math/rand/v2"
 	"net/http"
 	"strings"
 	"sync"
@@ -17,6 +18,10 @@ const (
 	maximumOIDCKeyIDBytes       = 128
 	maximumOIDCNegativeKeyIDs   = 128
 	oidcNegativeKeyIDTTL        = 5 * time.Second
+	oidcRefreshSuccessCooldown  = 5 * time.Second
+	oidcRefreshFailureBase      = time.Second
+	oidcRefreshFailureMaximum   = 30 * time.Second
+	oidcRefreshJitterDivisor    = 4
 )
 
 var errOIDCKeySetRejected = errors.New("OIDC key set rejected")
@@ -28,11 +33,14 @@ type boundedOIDCKeySet struct {
 	allowed    map[string]struct{}
 	now        func() time.Time
 
-	mu            sync.RWMutex
-	keys          map[string]oidcVerificationKey
-	negative      map[string]time.Time
-	negativeOrder []string
-	refreshing    *oidcKeyRefresh
+	mu                 sync.RWMutex
+	keys               map[string]oidcVerificationKey
+	negative           map[string]time.Time
+	negativeOrder      []string
+	refreshing         *oidcKeyRefresh
+	nextAllowedRefresh time.Time
+	refreshFailures    int
+	refreshJitter      func(time.Duration) time.Duration
 }
 
 type oidcVerificationKey struct {
@@ -63,7 +71,7 @@ func newBoundedOIDCKeySet(client *http.Client, jwksURL string, algorithms []stri
 	}
 	return &boundedOIDCKeySet{
 		client: client, jwksURL: jwksURL, algorithms: joseAlgorithms, allowed: allowed, now: time.Now,
-		keys: keys, negative: make(map[string]time.Time),
+		keys: keys, negative: make(map[string]time.Time), refreshJitter: randomOIDCRefreshJitter,
 	}, nil
 }
 
@@ -161,6 +169,10 @@ func (keySet *boundedOIDCKeySet) refresh(ctx context.Context, wantedKeyID string
 			return current.err
 		}
 	}
+	if keySet.nextAllowedRefresh.After(keySet.now()) {
+		keySet.mu.Unlock()
+		return errOIDCKeySetRejected
+	}
 	refresh := &oidcKeyRefresh{done: make(chan struct{})}
 	keySet.refreshing = refresh
 	keySet.mu.Unlock()
@@ -172,12 +184,55 @@ func (keySet *boundedOIDCKeySet) refresh(ctx context.Context, wantedKeyID string
 		keySet.keys = keys
 		keySet.negative = make(map[string]time.Time)
 		keySet.negativeOrder = nil
+		keySet.refreshFailures = 0
+		keySet.nextAllowedRefresh = keySet.now().Add(keySet.refreshDelay(oidcRefreshSuccessCooldown))
+	} else {
+		if keySet.refreshFailures < 32 {
+			keySet.refreshFailures++
+		}
+		keySet.nextAllowedRefresh = keySet.now().Add(keySet.refreshDelay(oidcRefreshFailureBackoff(keySet.refreshFailures)))
 	}
 	refresh.err = err
 	keySet.refreshing = nil
 	close(refresh.done)
 	keySet.mu.Unlock()
 	return err
+}
+
+func (keySet *boundedOIDCKeySet) refreshDelay(base time.Duration) time.Duration {
+	maximumJitter := base / oidcRefreshJitterDivisor
+	if maximumJitter <= 0 || keySet.refreshJitter == nil {
+		return base
+	}
+	jitter := keySet.refreshJitter(maximumJitter)
+	if jitter < 0 {
+		jitter = 0
+	}
+	if jitter > maximumJitter {
+		jitter = maximumJitter
+	}
+	return base + jitter
+}
+
+func oidcRefreshFailureBackoff(failures int) time.Duration {
+	delay := oidcRefreshFailureBase
+	for step := 1; step < failures && delay < oidcRefreshFailureMaximum; step++ {
+		if delay > oidcRefreshFailureMaximum/2 {
+			return oidcRefreshFailureMaximum
+		}
+		delay *= 2
+	}
+	if delay > oidcRefreshFailureMaximum {
+		return oidcRefreshFailureMaximum
+	}
+	return delay
+}
+
+func randomOIDCRefreshJitter(maximum time.Duration) time.Duration {
+	if maximum <= 0 {
+		return 0
+	}
+	return time.Duration(rand.Uint64N(uint64(maximum) + 1))
 }
 
 func (keySet *boundedOIDCKeySet) fetch(ctx context.Context) (map[string]oidcVerificationKey, error) {
