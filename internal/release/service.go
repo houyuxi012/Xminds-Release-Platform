@@ -150,7 +150,7 @@ func (service *Service) Approve(ctx context.Context, principal identity.Principa
 		return Release{}, err
 	}
 	productID = strings.TrimSpace(productID)
-	if err := service.requireReleaseLookup(principal, productID); err != nil {
+	if err := service.requireReleaseLookup(principal, identity.ActionReleaseApprove, productID); err != nil {
 		return Release{}, err
 	}
 	if err := requireExplicitApprover(principal); err != nil {
@@ -177,7 +177,7 @@ func (service *Service) Reject(ctx context.Context, principal identity.Principal
 		return Release{}, err
 	}
 	productID = strings.TrimSpace(productID)
-	if err := service.requireReleaseLookup(principal, productID); err != nil {
+	if err := service.requireReleaseLookup(principal, identity.ActionReleaseApprove, productID); err != nil {
 		return Release{}, err
 	}
 	if err := requireExplicitApprover(principal); err != nil {
@@ -216,7 +216,7 @@ func (service *Service) Revoke(ctx context.Context, principal identity.Principal
 		return OperationResult{}, err
 	}
 	productID = strings.TrimSpace(productID)
-	if err := service.requireReleaseLookup(principal, productID); err != nil {
+	if err := service.requireReleaseLookup(principal, identity.ActionReleaseApprove, productID); err != nil {
 		return OperationResult{}, err
 	}
 	if err := requireExplicitApprover(principal); err != nil {
@@ -309,7 +309,7 @@ func (service *Service) startPublication(ctx context.Context, principal identity
 		return OperationResult{}, err
 	}
 	productID = strings.TrimSpace(productID)
-	if err := service.requireReleaseLookup(principal, productID); err != nil {
+	if err := service.requireReleaseLookup(principal, action, productID); err != nil {
 		return OperationResult{}, err
 	}
 	if kind == AttemptKindRetry {
@@ -420,7 +420,7 @@ func (service *Service) Get(ctx context.Context, principal identity.Principal, p
 		return Release{}, err
 	}
 	productID = strings.TrimSpace(productID)
-	if err := service.requireReleaseLookup(principal, productID); err != nil {
+	if err := service.requireReleaseLookup(principal, identity.ActionProductRead, productID); err != nil {
 		return Release{}, err
 	}
 	current, err := service.repository.Get(ctx, productID, releaseID)
@@ -438,7 +438,7 @@ func (service *Service) transition(ctx context.Context, principal identity.Princ
 		return Release{}, err
 	}
 	productID = strings.TrimSpace(productID)
-	if err := service.requireReleaseLookup(principal, productID); err != nil {
+	if err := service.requireReleaseLookup(principal, action, productID); err != nil {
 		return Release{}, err
 	}
 	current, err := service.repository.Get(ctx, productID, releaseID)
@@ -499,8 +499,8 @@ func (service *Service) validateDependencies() error {
 	}
 }
 
-func (service *Service) requireReleaseLookup(principal identity.Principal, productID string) error {
-	if err := service.authorizer.RequireProductReadCandidate(principal, productID); err != nil {
+func (service *Service) requireReleaseLookup(principal identity.Principal, action identity.Action, productID string) error {
+	if err := service.authorizer.RequireProductActionCandidate(principal, action, productID); err != nil {
 		if principal.Governed {
 			return ErrReleaseNotFound
 		}

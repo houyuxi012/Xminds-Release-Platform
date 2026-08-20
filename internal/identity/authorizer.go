@@ -84,7 +84,7 @@ func (authorizer *Authorizer) Require(principal Principal, action Action, produc
 		}
 	}
 	for _, role := range principal.Roles {
-		if _, allowed := authorizer.permissions[role][action]; allowed {
+		if authorizer.rolePermitsAction(role, action) {
 			return nil
 		}
 	}
@@ -97,7 +97,7 @@ func (authorizer *Authorizer) requireGoverned(principal Principal, action Action
 	}
 	allowed := false
 	for _, scope := range principal.RoleScopes {
-		if _, permits := authorizer.permissions[scope.Role][action]; !permits || !scopeMatches(scope, productID, channel, isProductScoped(action)) {
+		if !authorizer.rolePermitsAction(scope.Role, action) || !scopeMatches(scope, productID, channel, isProductScoped(action)) {
 			continue
 		}
 		if scope.Effect == "deny" {
@@ -130,17 +130,18 @@ func (authorizer *Authorizer) Allowed(principal Principal, action Action, produc
 	return authorizer.Require(principal, action, productID) == nil
 }
 
-// RequireProductReadCandidate performs the coarse authorization required before
-// loading a product-scoped resource whose persisted channel is not known yet.
-// A matching channel allow is sufficient to cross the product boundary, while
-// platform and product denies still fail closed. The caller must immediately
-// follow a successful resource lookup with RequireInChannel.
-func (authorizer *Authorizer) RequireProductReadCandidate(principal Principal, productID string) error {
+// RequireProductActionCandidate performs the coarse authorization required
+// before loading a product-scoped resource whose persisted channel is not known
+// yet. A matching channel allow is sufficient to cross the product boundary,
+// while platform and product denies from roles that grant the requested action
+// still fail closed. The caller must immediately follow a successful resource
+// lookup with RequireInChannel for the same action.
+func (authorizer *Authorizer) RequireProductActionCandidate(principal Principal, action Action, productID string) error {
 	if err := principal.Validate(); err != nil {
 		return err
 	}
 	if !principal.Governed {
-		return authorizer.Require(principal, ActionProductRead, productID)
+		return authorizer.Require(principal, action, productID)
 	}
 	productID = strings.TrimSpace(productID)
 	if productID == "" {
@@ -148,7 +149,7 @@ func (authorizer *Authorizer) RequireProductReadCandidate(principal Principal, p
 	}
 	allowed := false
 	for _, scope := range principal.RoleScopes {
-		if _, permits := authorizer.permissions[scope.Role][ActionProductRead]; !permits {
+		if !authorizer.rolePermitsAction(scope.Role, action) {
 			continue
 		}
 		switch scope.ScopeType {
@@ -185,6 +186,11 @@ func (authorizer *Authorizer) RequireInChannel(principal Principal, action Actio
 		return authorizer.requireGoverned(principal, action, productID, channel)
 	}
 	return authorizer.Require(principal, action, productID)
+}
+
+func (authorizer *Authorizer) rolePermitsAction(role Role, action Action) bool {
+	_, permits := authorizer.permissions[role][action]
+	return permits
 }
 
 func actionSet(actions ...Action) map[Action]struct{} {

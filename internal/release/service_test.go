@@ -138,6 +138,192 @@ func TestGovernedChannelScopesControlProtectedReleaseCreate(t *testing.T) {
 	}
 }
 
+func TestGovernedReleaseOperationsFilterRoleScopesByTargetAction(t *testing.T) {
+	t.Parallel()
+
+	type operationResult struct {
+		release Release
+		attempt Attempt
+		err     error
+	}
+	tests := []struct {
+		name               string
+		initialStatus      Status
+		allowedRole        identity.Role
+		call               func(*Service, identity.Principal, Release) operationResult
+		wantStatus         Status
+		wantAttemptKind    AttemptKind
+		wantRevoked        bool
+		wantErr            error
+		wantRepositoryRead int
+	}{
+		{
+			name: "get", initialStatus: StatusDraft, allowedRole: identity.RolePublisher,
+			call: func(service *Service, principal identity.Principal, record Release) operationResult {
+				result, err := service.Get(context.Background(), principal, record.ProductID, record.ID)
+				return operationResult{release: result, err: err}
+			},
+			wantErr: ErrReleaseNotFound,
+		},
+		{
+			name: "create", allowedRole: identity.RolePublisher,
+			call: func(service *Service, principal identity.Principal, _ Release) operationResult {
+				result, err := service.Create(context.Background(), principal, validCreateCommand(), testRequestContext())
+				return operationResult{release: result, err: err}
+			},
+			wantStatus: StatusDraft,
+		},
+		{
+			name: "submit", initialStatus: StatusDraft, allowedRole: identity.RolePublisher,
+			call: func(service *Service, principal identity.Principal, record Release) operationResult {
+				result, err := service.Submit(context.Background(), principal, record.ProductID, record.ID, record.LockVersion, testRequestContext())
+				return operationResult{release: result, err: err}
+			},
+			wantStatus: StatusSubmitted, wantRepositoryRead: 1,
+		},
+		{
+			name: "approve", initialStatus: StatusSubmitted, allowedRole: identity.RoleApprover,
+			call: func(service *Service, principal identity.Principal, record Release) operationResult {
+				result, err := service.Approve(context.Background(), principal, record.ProductID, record.ID, record.LockVersion, testRequestContext())
+				return operationResult{release: result, err: err}
+			},
+			wantStatus: StatusApproved, wantRepositoryRead: 1,
+		},
+		{
+			name: "reject", initialStatus: StatusSubmitted, allowedRole: identity.RoleApprover,
+			call: func(service *Service, principal identity.Principal, record Release) operationResult {
+				result, err := service.Reject(context.Background(), principal, record.ProductID, record.ID, record.LockVersion, "policy rejection", testRequestContext())
+				return operationResult{release: result, err: err}
+			},
+			wantStatus: StatusRejected, wantRepositoryRead: 1,
+		},
+		{
+			name: "publish", initialStatus: StatusApproved, allowedRole: identity.RolePublisher,
+			call: func(service *Service, principal identity.Principal, record Release) operationResult {
+				result, err := service.Publish(context.Background(), principal, record.ProductID, record.ID, record.LockVersion, "publish-cross-role-12345678", testRequestContext())
+				return operationResult{release: result.Release, attempt: result.Attempt, err: err}
+			},
+			wantStatus: StatusPublishing, wantAttemptKind: AttemptKindPublish, wantRepositoryRead: 1,
+		},
+		{
+			name: "retry", initialStatus: StatusFailed, allowedRole: identity.RoleApprover,
+			call: func(service *Service, principal identity.Principal, record Release) operationResult {
+				result, err := service.Retry(context.Background(), principal, record.ProductID, record.ID, record.LockVersion, "retry-cross-role-12345678", testRequestContext())
+				return operationResult{release: result.Release, attempt: result.Attempt, err: err}
+			},
+			wantStatus: StatusPublishing, wantAttemptKind: AttemptKindRetry, wantRepositoryRead: 1,
+		},
+		{
+			name: "revoke", initialStatus: StatusPublished, allowedRole: identity.RoleApprover,
+			call: func(service *Service, principal identity.Principal, record Release) operationResult {
+				result, err := service.Revoke(context.Background(), principal, record.ProductID, record.ID, record.LockVersion, "security revocation", "revoke-cross-role-12345678", testRequestContext())
+				return operationResult{release: result.Release, attempt: result.Attempt, err: err}
+			},
+			wantStatus: StatusPublished, wantAttemptKind: AttemptKindRevoke, wantRevoked: true, wantRepositoryRead: 1,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			service := newTestReleaseService()
+			repository := service.repository.(*memoryReleaseRepository)
+			record := Release{
+				ID: uuid.New(), ProductID: "ngep", Channel: "stable", Status: test.initialStatus, LockVersion: 4,
+				SubmittedBy: "original-publisher",
+			}
+			if test.initialStatus != "" {
+				repository.releases[record.ID] = record
+			}
+			principal := identity.Principal{
+				Subject: "governed-operator", Kind: identity.PrincipalKindHuman, Governed: true,
+				RoleScopes: []identity.RoleScope{
+					{Role: identity.RoleViewer, Effect: "deny", ScopeType: "product", ProductID: "ngep"},
+					{Role: test.allowedRole, Effect: "allow", ScopeType: "channel", ProductID: "ngep", ChannelName: "stable"},
+				},
+			}
+
+			outcome := test.call(service, principal, record)
+			if test.wantErr != nil {
+				if !errors.Is(outcome.err, test.wantErr) {
+					t.Fatalf("%s error = %v, want %v", test.name, outcome.err, test.wantErr)
+				}
+				if !reflect.DeepEqual(outcome.release, Release{}) || !reflect.DeepEqual(outcome.attempt, Attempt{}) {
+					t.Fatalf("%s leaked release=%#v attempt=%#v", test.name, outcome.release, outcome.attempt)
+				}
+			} else {
+				if outcome.err != nil {
+					t.Fatalf("%s error = %v", test.name, outcome.err)
+				}
+				if outcome.release.Status != test.wantStatus {
+					t.Fatalf("%s status = %s, want %s", test.name, outcome.release.Status, test.wantStatus)
+				}
+				if test.wantAttemptKind != "" && outcome.attempt.Kind != test.wantAttemptKind {
+					t.Fatalf("%s attempt kind = %s, want %s", test.name, outcome.attempt.Kind, test.wantAttemptKind)
+				}
+				if test.wantRevoked && outcome.release.RevokedAt == nil {
+					t.Fatalf("%s did not revoke release", test.name)
+				}
+			}
+			if repository.getCalls != test.wantRepositoryRead {
+				t.Fatalf("%s repository reads = %d, want %d", test.name, repository.getCalls, test.wantRepositoryRead)
+			}
+		})
+	}
+}
+
+func TestGovernedPublisherTargetActionDenyWinsOverChannelAllow(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name          string
+		initialStatus Status
+		call          func(*Service, identity.Principal, Release) error
+	}{
+		{
+			name: "submit", initialStatus: StatusDraft,
+			call: func(service *Service, principal identity.Principal, record Release) error {
+				_, err := service.Submit(context.Background(), principal, record.ProductID, record.ID, record.LockVersion, testRequestContext())
+				return err
+			},
+		},
+		{
+			name: "publish", initialStatus: StatusApproved,
+			call: func(service *Service, principal identity.Principal, record Release) error {
+				_, err := service.Publish(context.Background(), principal, record.ProductID, record.ID, record.LockVersion, "publish-target-deny-12345678", testRequestContext())
+				return err
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			service := newTestReleaseService()
+			repository := service.repository.(*memoryReleaseRepository)
+			record := Release{ID: uuid.New(), ProductID: "ngep", Channel: "stable", Status: test.initialStatus, LockVersion: 4}
+			repository.releases[record.ID] = record
+			principal := identity.Principal{
+				Subject: "governed-publisher", Kind: identity.PrincipalKindHuman, Governed: true,
+				RoleScopes: []identity.RoleScope{
+					{Role: identity.RolePublisher, Effect: "allow", ScopeType: "channel", ProductID: "ngep", ChannelName: "stable"},
+					{Role: identity.RolePublisher, Effect: "deny", ScopeType: "product", ProductID: "ngep"},
+				},
+			}
+
+			if err := test.call(service, principal, record); !errors.Is(err, ErrReleaseNotFound) {
+				t.Fatalf("%s error = %v, want %v", test.name, err, ErrReleaseNotFound)
+			}
+			if repository.getCalls != 0 {
+				t.Fatalf("%s queried denied release %d times", test.name, repository.getCalls)
+			}
+			if stored := repository.releases[record.ID]; !reflect.DeepEqual(stored, record) {
+				t.Fatalf("%s changed denied release: got=%#v want=%#v", test.name, stored, record)
+			}
+		})
+	}
+}
+
 func TestGovernedSubjectWithoutProductOrChannelPermissionCannotReplayPublication(t *testing.T) {
 	t.Parallel()
 
