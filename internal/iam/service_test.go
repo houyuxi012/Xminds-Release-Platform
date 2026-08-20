@@ -2,6 +2,8 @@ package iam
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"testing"
 	"time"
@@ -94,6 +96,52 @@ func TestDisableSSORequiresFreshConfirmationAndReturnsToLocalMode(t *testing.T) 
 	}
 }
 
+func TestCreateLocalUserStoresOnlyActivationDigestAndAuditsProvisioning(t *testing.T) {
+	t.Parallel()
+
+	harness := newIAMHarness(t)
+	provisioning, err := harness.service.CreateLocalUser(context.Background(), harness.admin, CreateLocalUserCommand{
+		Username: "  Release.Operator ", DisplayName: "Release Operator", Email: "OPERATOR@example.com",
+	}, harness.request)
+	if err != nil {
+		t.Fatalf("CreateLocalUser() error = %v", err)
+	}
+	if provisioning.ActivationToken == "" || provisioning.User.Status != UserStatusPending || provisioning.User.Username != "release.operator" {
+		t.Fatalf("provisioning = %+v", provisioning)
+	}
+	credential := harness.repository.credentials[provisioning.User.ID]
+	wantDigest := sha256.Sum256([]byte(provisioning.ActivationToken))
+	if credential.ActivationDigest != hex.EncodeToString(wantDigest[:]) {
+		t.Fatalf("activation digest = %q", credential.ActivationDigest)
+	}
+	if credential.ActivationDigest == provisioning.ActivationToken || string(credential.Password.DerivedKey) == provisioning.ActivationToken {
+		t.Fatal("activation token was stored in plaintext")
+	}
+	if len(harness.auditor.commands) != 1 || harness.auditor.commands[0].Action != "identity.local_user.create" {
+		t.Fatalf("audit commands = %+v", harness.auditor.commands)
+	}
+	if _, leaked := harness.auditor.commands[0].Metadata["activation_token"]; leaked {
+		t.Fatal("activation token leaked into audit metadata")
+	}
+}
+
+func TestCreateLocalUserRejectsInvalidIdentityFields(t *testing.T) {
+	t.Parallel()
+
+	harness := newIAMHarness(t)
+	for name, command := range map[string]CreateLocalUserCommand{
+		"username": {Username: "../admin", DisplayName: "Admin"},
+		"display":  {Username: "valid.user", DisplayName: ""},
+		"email":    {Username: "valid.user", DisplayName: "Valid User", Email: "not-an-email"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := harness.service.CreateLocalUser(context.Background(), harness.admin, command, harness.request); !errors.Is(err, ErrUserInputInvalid) {
+				t.Fatalf("CreateLocalUser() error = %v", err)
+			}
+		})
+	}
+}
+
 type iamHarness struct {
 	service          *Service
 	repository       *memoryIAMRepository
@@ -103,6 +151,7 @@ type iamHarness struct {
 	admin            identity.Principal
 	system           identity.Principal
 	request          RequestContext
+	auditor          *iamAuditRecorder
 }
 
 func newIAMHarness(t *testing.T) *iamHarness {
@@ -121,8 +170,9 @@ func newIAMHarness(t *testing.T) *iamHarness {
 			MFAEnrolled: true, CredentialRotatedAt: now.Add(-24 * time.Hour),
 		}},
 	}
+	auditor := &iamAuditRecorder{}
 	service, err := NewService(ServiceConfig{
-		Repository: repository, Auditor: iamAuditRecorder{}, Sessions: iamSessionRecorder{}, Passwords: rejectingPasswordVerifier{},
+		Repository: repository, Auditor: auditor, Sessions: iamSessionRecorder{}, Passwords: deterministicPasswordManager{},
 		Clock: func() time.Time { return now },
 	})
 	if err != nil {
@@ -130,6 +180,7 @@ func newIAMHarness(t *testing.T) *iamHarness {
 	}
 	return &iamHarness{
 		service: service, repository: repository, now: now, sourceID: sourceID, emergencyAdminID: emergencyID,
+		auditor: auditor,
 		admin:   identity.Principal{Subject: "admin", Kind: identity.PrincipalKindHuman, Roles: []identity.Role{identity.RoleAdmin}, TokenID: "admin-token"},
 		system:  identity.Principal{Subject: "identity-monitor", Kind: identity.PrincipalKindWorkload, Roles: []identity.Role{identity.RoleAdmin}, TokenID: "monitor-token", Provider: identity.WorkloadProviderAPIToken},
 		request: RequestContext{RequestID: "018f835d-7e4b-7abc-9f42-67a2f5f48e13", SourceIP: "127.0.0.1"},
@@ -141,9 +192,10 @@ func (harness *iamHarness) confirmation() HighRiskConfirmation {
 }
 
 type memoryIAMRepository struct {
-	login   LoginState
-	sources map[uuid.UUID]IdentitySource
-	users   map[uuid.UUID]UserPrincipal
+	login       LoginState
+	sources     map[uuid.UUID]IdentitySource
+	users       map[uuid.UUID]UserPrincipal
+	credentials map[uuid.UUID]LocalCredential
 }
 
 func (repository *memoryIAMRepository) WithinTransaction(_ context.Context, function func(pgx.Tx) error) error {
@@ -216,9 +268,34 @@ func (repository *memoryIAMRepository) FindLocalAuthentication(context.Context, 
 	return repository.login, UserPrincipal{}, LocalCredential{}, ErrLocalCredentialInvalid
 }
 
-type iamAuditRecorder struct{}
+func (repository *memoryIAMRepository) InsertLocalUser(_ context.Context, _ pgx.Tx, user UserPrincipal, credential LocalCredential) error {
+	if repository.credentials == nil {
+		repository.credentials = make(map[uuid.UUID]LocalCredential)
+	}
+	for _, existing := range repository.users {
+		if existing.Username == user.Username {
+			return ErrIAMConflict
+		}
+	}
+	repository.users[user.ID] = user
+	repository.credentials[user.ID] = credential
+	return nil
+}
 
-func (iamAuditRecorder) Append(context.Context, pgx.Tx, audit.AppendCommand) (audit.Event, error) {
+func (repository *memoryIAMRepository) ListUsers(context.Context, Page) (UserPage, error) {
+	items := make([]UserPrincipal, 0, len(repository.users))
+	for _, user := range repository.users {
+		items = append(items, user)
+	}
+	return UserPage{Items: items}, nil
+}
+
+type iamAuditRecorder struct {
+	commands []audit.AppendCommand
+}
+
+func (recorder *iamAuditRecorder) Append(_ context.Context, _ pgx.Tx, command audit.AppendCommand) (audit.Event, error) {
+	recorder.commands = append(recorder.commands, command)
 	return audit.Event{}, nil
 }
 
@@ -226,8 +303,13 @@ type iamSessionRecorder struct{}
 
 func (iamSessionRecorder) RevokeSubject(context.Context, uuid.UUID, string) error { return nil }
 
-type rejectingPasswordVerifier struct{}
+type deterministicPasswordManager struct{}
 
-func (rejectingPasswordVerifier) Verify(string, PasswordDigest) error {
+func (deterministicPasswordManager) Hash(_ context.Context, password string) (PasswordDigest, error) {
+	digest := sha256.Sum256([]byte("password-digest:" + password))
+	return PasswordDigest{Algorithm: "argon2id", Parameters: "m=65536,t=3,p=2,l=32", Salt: make([]byte, 16), DerivedKey: digest[:]}, nil
+}
+
+func (deterministicPasswordManager) Verify(string, PasswordDigest) error {
 	return ErrLocalCredentialInvalid
 }

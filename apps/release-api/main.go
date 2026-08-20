@@ -18,6 +18,7 @@ import (
 	"xminds-release-platform/internal/audit"
 	"xminds-release-platform/internal/catalog"
 	"xminds-release-platform/internal/endpoint"
+	"xminds-release-platform/internal/iam"
 	"xminds-release-platform/internal/identity"
 	"xminds-release-platform/internal/platform/buildinfo"
 	"xminds-release-platform/internal/platform/config"
@@ -171,6 +172,16 @@ func run(ctx context.Context, arguments []string, environ map[string]string) err
 	if err != nil {
 		return fmt.Errorf("configure distribution endpoint service: %w", err)
 	}
+	iamPasswords, err := iam.NewActivationCredentialManager()
+	if err != nil {
+		return fmt.Errorf("configure IAM activation credentials: %w", err)
+	}
+	iamService, err := iam.NewService(iam.ServiceConfig{
+		Repository: iam.NewPostgresRepository(pool), Auditor: auditor, Passwords: iamPasswords, Clock: time.Now,
+	})
+	if err != nil {
+		return fmt.Errorf("configure IAM service: %w", err)
+	}
 
 	managementServer := &http.Server{
 		Addr: configuration.APIListen,
@@ -187,6 +198,7 @@ func run(ctx context.Context, arguments []string, environ map[string]string) err
 					Application: auditor,
 					Transactor:  audit.PoolTransactor{Pool: pool},
 				},
+				IAM: iamService,
 			}),
 		),
 		ReadHeaderTimeout: 5 * time.Second,
@@ -213,6 +225,7 @@ type managementApplications struct {
 	Releases  release.ReleaseApplication
 	Endpoints endpoint.EndpointApplication
 	Audits    auditManagementApplication
+	IAM       iam.IAMApplication
 }
 
 type auditManagementApplication struct {
@@ -236,6 +249,9 @@ func managementRoutes(applications managementApplications) httpserver.RouteRegis
 		}
 		if applications.Audits.Application != nil && applications.Audits.Transactor != nil {
 			audit.RegisterRoutes(router, applications.Audits.Application, applications.Audits.Transactor)
+		}
+		if applications.IAM != nil {
+			iam.RegisterRoutes(router, applications.IAM)
 		}
 	}
 }

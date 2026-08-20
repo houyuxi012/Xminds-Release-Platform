@@ -101,6 +101,72 @@ INSERT INTO user_principals (
 	}
 }
 
+func TestIAMRepositoryCreatesAndPaginatesLocalUsersWithoutPlaintextActivationToken(t *testing.T) {
+	databaseURL := integrationDatabaseURL(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool, err := database.Open(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if err := database.ApplyMigrations(ctx, pool, migrations.FS); err != nil {
+		t.Fatalf("ApplyMigrations() error = %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+TRUNCATE TABLE emergency_access_events, directory_sync_conflicts, directory_sync_jobs,
+role_bindings, organization_memberships, organization_units, local_password_history,
+local_credentials, user_principals, iam_login_state, identity_sources CASCADE;
+INSERT INTO iam_login_state (singleton, login_mode, version, updated_by, updated_at)
+VALUES (TRUE, 'local', 1, 'test:bootstrap', clock_timestamp())
+`); err != nil {
+		t.Fatalf("reset IAM test tables: %v", err)
+	}
+
+	now := time.Date(2026, 8, 20, 9, 0, 0, 0, time.UTC)
+	passwords, err := iam.NewActivationCredentialManager()
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository := iam.NewPostgresRepository(pool)
+	service, err := iam.NewService(iam.ServiceConfig{
+		Repository: repository, Auditor: audit.NewService(audit.NewPostgresRepository(pool)), Passwords: passwords,
+		Clock: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	actor := identity.Principal{Subject: "admin", Kind: identity.PrincipalKindHuman, Roles: []identity.Role{identity.RoleAdmin}}
+	provisioning, err := service.CreateLocalUser(ctx, actor, iam.CreateLocalUserCommand{
+		Username: "release.operator", DisplayName: "发布操作员", Email: "operator@example.com",
+	}, iam.RequestContext{RequestID: uuid.New().String(), SourceIP: "127.0.0.1"})
+	if err != nil {
+		t.Fatalf("CreateLocalUser() error = %v", err)
+	}
+
+	var activationDigest string
+	if err := pool.QueryRow(ctx, `SELECT activation_digest FROM local_credentials WHERE user_id = $1`, provisioning.User.ID).Scan(&activationDigest); err != nil {
+		t.Fatal(err)
+	}
+	if activationDigest == provisioning.ActivationToken || len(activationDigest) != 64 {
+		t.Fatalf("stored activation digest is unsafe: %q", activationDigest)
+	}
+	page, err := service.ListUsers(ctx, actor, iam.Page{Limit: 1})
+	if err != nil {
+		t.Fatalf("ListUsers() error = %v", err)
+	}
+	if len(page.Items) != 1 || page.Items[0].ID != provisioning.User.ID || page.Items[0].Status != iam.UserStatusPending {
+		t.Fatalf("user page = %+v", page)
+	}
+	var auditCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM audit_events WHERE action = 'identity.local_user.create' AND resource_id = $1`, provisioning.User.ID.String()).Scan(&auditCount); err != nil {
+		t.Fatal(err)
+	}
+	if auditCount != 1 {
+		t.Fatalf("local user audit count = %d", auditCount)
+	}
+}
+
 type integrationBreachChecker struct{}
 
 func (integrationBreachChecker) IsBreached(context.Context, string) (bool, error) { return false, nil }

@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"xminds-release-platform/internal/platform/database"
@@ -184,6 +185,76 @@ WHERE id = $1 AND version = $9
 		return ErrIAMConflict
 	}
 	return nil
+}
+
+func (repository *PostgresRepository) InsertLocalUser(ctx context.Context, tx pgx.Tx, user UserPrincipal, credential LocalCredential) error {
+	if tx == nil || user.ID == uuid.Nil || credential.UserID != user.ID || user.Kind != UserKindLocal {
+		return ErrIAMConfiguration
+	}
+	_, err := tx.Exec(ctx, `
+INSERT INTO user_principals (
+    id, identity_source_id, external_subject, username, display_name, email, user_kind, status,
+    mfa_enrolled, credential_rotated_at, version, created_at, updated_at, disabled_at, disabled_reason
+) VALUES ($1, NULL, '', $2, $3, $4, $5, $6, FALSE, NULL, $7, $8, $9, NULL, '')
+`, user.ID, user.Username, user.DisplayName, user.Email, user.Kind, user.Status, user.Version, user.CreatedAt.UTC(), user.UpdatedAt.UTC())
+	if err != nil {
+		var postgresError *pgconn.PgError
+		if errors.As(err, &postgresError) && postgresError.Code == "23505" {
+			return ErrIAMConflict
+		}
+		return fmt.Errorf("insert local user principal: %w", err)
+	}
+	_, err = tx.Exec(ctx, `
+INSERT INTO local_credentials (
+    user_id, algorithm, parameters, salt, derived_key, failed_attempts, locked_until,
+    password_changed_at, activation_digest, activation_expires_at
+) VALUES ($1, $2, $3, $4, $5, 0, NULL, $6, $7, $8)
+`, credential.UserID, credential.Password.Algorithm, credential.Password.Parameters, credential.Password.Salt,
+		credential.Password.DerivedKey, credential.PasswordChangedAt.UTC(), credential.ActivationDigest, credential.ActivationExpiresAt.UTC())
+	if err != nil {
+		return fmt.Errorf("insert local credential: %w", err)
+	}
+	return nil
+}
+
+func (repository *PostgresRepository) ListUsers(ctx context.Context, page Page) (UserPage, error) {
+	if repository == nil || repository.pool == nil {
+		return UserPage{}, ErrIAMConfiguration
+	}
+	limit := page.Limit
+	if limit == 0 {
+		limit = 50
+	}
+	if limit < 1 || limit > 200 || (page.BeforeTime.IsZero() != (page.BeforeID == uuid.Nil)) {
+		return UserPage{}, ErrPageInvalid
+	}
+	rows, err := repository.pool.Query(ctx, userSelect+`
+WHERE ($1::timestamptz IS NULL OR (created_at, id) < ($1, $2))
+ORDER BY created_at DESC, id DESC
+LIMIT $3
+`, nullableTime(page.BeforeTime), page.BeforeID, limit+1)
+	if err != nil {
+		return UserPage{}, fmt.Errorf("list user principals: %w", err)
+	}
+	defer rows.Close()
+	items := make([]UserPrincipal, 0, limit+1)
+	for rows.Next() {
+		item, scanErr := scanUser(rows)
+		if scanErr != nil {
+			return UserPage{}, scanErr
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return UserPage{}, fmt.Errorf("iterate user principals: %w", err)
+	}
+	result := UserPage{Items: items}
+	if len(items) > limit {
+		last := items[limit-1]
+		result.Items = items[:limit]
+		result.NextCursor = encodeIAMCursor(last.CreatedAt, last.ID)
+	}
+	return result, nil
 }
 
 func (repository *PostgresRepository) FindLocalAuthentication(ctx context.Context, canonicalUsername string) (LoginState, UserPrincipal, LocalCredential, error) {

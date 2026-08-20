@@ -2,7 +2,12 @@ package iam
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"fmt"
+	"net/mail"
 	"regexp"
 	"strings"
 	"time"
@@ -16,13 +21,16 @@ import (
 
 const maximumReauthenticationAge = 5 * time.Minute
 
+const localActivationLifetime = 24 * time.Hour
+
 var identityFaultCodePattern = regexp.MustCompile(`^[A-Z][A-Z0-9_]{2,63}$`)
+var localUsernamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{2,127}$`)
 
 type ServiceConfig struct {
 	Repository Repository
 	Auditor    AuditAppender
 	Sessions   SessionRevoker
-	Passwords  PasswordVerifier
+	Passwords  PasswordService
 	Clock      func() time.Time
 }
 
@@ -30,13 +38,96 @@ type Service struct {
 	repository Repository
 	auditor    AuditAppender
 	sessions   SessionRevoker
-	passwords  PasswordVerifier
+	passwords  PasswordService
 	authorizer *identity.Authorizer
 	clock      func() time.Time
 }
 
+func (service *Service) CreateLocalUser(ctx context.Context, actor identity.Principal, command CreateLocalUserCommand, request RequestContext) (LocalUserProvisioning, error) {
+	if err := service.authorizer.Require(actor, identity.ActionIdentityManage, ""); err != nil {
+		return LocalUserProvisioning{}, err
+	}
+	username := canonicalUsername(command.Username)
+	displayName := strings.TrimSpace(command.DisplayName)
+	emailAddress, err := normalizeEmail(command.Email)
+	if !localUsernamePattern.MatchString(username) || displayName == "" || len([]rune(displayName)) > 256 || err != nil {
+		return LocalUserProvisioning{}, ErrUserInputInvalid
+	}
+	activationToken, err := generateActivationToken()
+	if err != nil {
+		return LocalUserProvisioning{}, err
+	}
+	password, err := service.passwords.Hash(ctx, activationToken)
+	if err != nil {
+		return LocalUserProvisioning{}, fmt.Errorf("hash initial local credential: %w", err)
+	}
+	now := service.clock().UTC().Truncate(time.Microsecond)
+	activationExpires := now.Add(localActivationLifetime)
+	activationDigest := sha256.Sum256([]byte(activationToken))
+	user := UserPrincipal{
+		ID: uuid.New(), Username: username, DisplayName: displayName, Email: emailAddress,
+		Kind: UserKindLocal, Status: UserStatusPending, Version: 1, CreatedAt: now, UpdatedAt: now,
+	}
+	credential := LocalCredential{
+		UserID: user.ID, Password: password, PasswordChangedAt: now,
+		ActivationDigest: hex.EncodeToString(activationDigest[:]), ActivationExpiresAt: activationExpires,
+	}
+	err = service.repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
+		if insertErr := service.repository.InsertLocalUser(ctx, tx, user, credential); insertErr != nil {
+			return insertErr
+		}
+		_, appendErr := service.auditor.Append(ctx, tx, audit.AppendCommand{
+			Actor: actor, Action: "identity.local_user.create", ResourceType: "user_principal", ResourceID: user.ID.String(),
+			Outcome: audit.OutcomeSuccess, RequestID: request.RequestID, SourceIP: request.SourceIP,
+			Metadata: map[string]any{"username": user.Username, "user_kind": user.Kind, "status": user.Status},
+		})
+		return appendErr
+	})
+	if err != nil {
+		return LocalUserProvisioning{}, err
+	}
+	return LocalUserProvisioning{User: user, ActivationToken: activationToken, ActivationExpires: activationExpires}, nil
+}
+
+func (service *Service) GetUser(ctx context.Context, actor identity.Principal, userID uuid.UUID) (UserPrincipal, error) {
+	if err := service.authorizer.Require(actor, identity.ActionIdentityManage, ""); err != nil {
+		return UserPrincipal{}, err
+	}
+	return service.repository.GetUser(ctx, nil, userID)
+}
+
+func (service *Service) ListUsers(ctx context.Context, actor identity.Principal, page Page) (UserPage, error) {
+	if err := service.authorizer.Require(actor, identity.ActionIdentityManage, ""); err != nil {
+		return UserPage{}, err
+	}
+	if page.Limit < 0 || page.Limit > 200 || (page.BeforeTime.IsZero() != (page.BeforeID == uuid.Nil)) {
+		return UserPage{}, ErrPageInvalid
+	}
+	return service.repository.ListUsers(ctx, page)
+}
+
+func generateActivationToken() (string, error) {
+	buffer := make([]byte, 32)
+	if _, err := rand.Read(buffer); err != nil {
+		return "", fmt.Errorf("generate activation token: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(buffer), nil
+}
+
+func normalizeEmail(raw string) (string, error) {
+	raw = strings.ToLower(strings.TrimSpace(raw))
+	if raw == "" {
+		return "", nil
+	}
+	address, err := mail.ParseAddress(raw)
+	if err != nil || address.Address != raw || len(raw) > 320 {
+		return "", ErrUserInputInvalid
+	}
+	return raw, nil
+}
+
 func NewService(config ServiceConfig) (*Service, error) {
-	if config.Repository == nil || config.Auditor == nil || config.Sessions == nil || config.Passwords == nil || config.Clock == nil {
+	if config.Repository == nil || config.Auditor == nil || config.Passwords == nil || config.Clock == nil {
 		return nil, ErrIAMConfiguration
 	}
 	return &Service{
@@ -192,6 +283,9 @@ func (service *Service) DisableSSO(ctx context.Context, actor identity.Principal
 }
 
 func (service *Service) DisableUser(ctx context.Context, actor identity.Principal, userID uuid.UUID, reason string, confirmation HighRiskConfirmation, request RequestContext) error {
+	if service.sessions == nil {
+		return ErrIAMConfiguration
+	}
 	if err := service.requireHighRisk(actor, confirmation); err != nil {
 		return err
 	}

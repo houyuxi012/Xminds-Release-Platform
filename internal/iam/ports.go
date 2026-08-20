@@ -19,6 +19,8 @@ type Repository interface {
 	CountUsableEmergencyAdministrators(ctx context.Context, tx pgx.Tx, excluding uuid.UUID, at time.Time) (int, error)
 	GetUser(ctx context.Context, tx pgx.Tx, id uuid.UUID) (UserPrincipal, error)
 	SaveUser(ctx context.Context, tx pgx.Tx, user UserPrincipal, expectedVersion int64) error
+	InsertLocalUser(ctx context.Context, tx pgx.Tx, user UserPrincipal, credential LocalCredential) error
+	ListUsers(ctx context.Context, page Page) (UserPage, error)
 	FindLocalAuthentication(ctx context.Context, canonicalUsername string) (LoginState, UserPrincipal, LocalCredential, error)
 }
 
@@ -32,6 +34,11 @@ type SessionRevoker interface {
 
 type PasswordVerifier interface {
 	Verify(password string, digest PasswordDigest) error
+}
+
+type PasswordService interface {
+	PasswordVerifier
+	Hash(ctx context.Context, password string) (PasswordDigest, error)
 }
 
 type DirectoryAdapter interface {

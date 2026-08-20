@@ -36,6 +36,22 @@ type PasswordManager struct {
 	breaches BreachChecker
 }
 
+// NewActivationCredentialManager returns the bounded Argon2id manager used only
+// for server-generated, high-entropy activation credentials. Human-selected
+// passwords must be hashed by a PasswordManager backed by a real breach corpus.
+func NewActivationCredentialManager() (*PasswordManager, error) {
+	return NewPasswordManager(PasswordPolicyConfig{
+		MinimumLength: 16, MemoryKiB: 64 * 1024, Iterations: 3, Parallelism: 2,
+		SaltBytes: 16, DerivedKeyBytes: 32,
+	}, generatedActivationCredentialChecker{})
+}
+
+type generatedActivationCredentialChecker struct{}
+
+func (generatedActivationCredentialChecker) IsBreached(context.Context, string) (bool, error) {
+	return false, nil
+}
+
 func NewPasswordManager(policy PasswordPolicyConfig, breaches BreachChecker) (*PasswordManager, error) {
 	if breaches == nil || !validPasswordPolicy(policy) {
 		return nil, ErrPasswordPolicyInvalid

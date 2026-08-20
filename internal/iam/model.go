@@ -5,6 +5,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"xminds-release-platform/internal/identity"
 )
 
 type LoginMode string
@@ -51,6 +53,28 @@ const (
 	UserStatusLocked   UserStatus = "locked"
 )
 
+type SubjectType string
+
+const (
+	SubjectTypeUser         SubjectType = "user"
+	SubjectTypeOrganization SubjectType = "organization"
+)
+
+type ScopeType string
+
+const (
+	ScopeTypePlatform ScopeType = "platform"
+	ScopeTypeProduct  ScopeType = "product"
+	ScopeTypeChannel  ScopeType = "channel"
+)
+
+type BindingEffect string
+
+const (
+	BindingEffectAllow BindingEffect = "allow"
+	BindingEffectDeny  BindingEffect = "deny"
+)
+
 var (
 	ErrIAMConfiguration             = errors.New("IAM service configuration is invalid")
 	ErrIAMConflict                  = errors.New("IAM record changed concurrently")
@@ -66,6 +90,8 @@ var (
 	ErrLocalCredentialLocked        = errors.New("local credential is locked")
 	ErrDisableReasonRequired        = errors.New("user disable reason is required")
 	ErrIdentityFaultCodeInvalid     = errors.New("identity source fault code is invalid")
+	ErrUserInputInvalid             = errors.New("user input is invalid")
+	ErrPageInvalid                  = errors.New("IAM page parameters are invalid")
 )
 
 type LoginState struct {
@@ -78,36 +104,66 @@ type LoginState struct {
 }
 
 type IdentitySource struct {
-	ID                       uuid.UUID
-	Name                     string
-	Kind                     IdentitySourceKind
-	Status                   IdentitySourceStatus
-	SecretReference          string
-	RequiredMappingsComplete bool
-	VerifiedAt               time.Time
-	PreviewedAt              time.Time
-	FaultCode                string
-	Version                  int64
-	CreatedAt                time.Time
-	UpdatedAt                time.Time
+	ID                       uuid.UUID            `json:"id"`
+	Name                     string               `json:"name"`
+	Kind                     IdentitySourceKind   `json:"kind"`
+	Status                   IdentitySourceStatus `json:"status"`
+	SecretReference          string               `json:"-"`
+	RequiredMappingsComplete bool                 `json:"required_mappings_complete"`
+	VerifiedAt               time.Time            `json:"verified_at,omitempty"`
+	PreviewedAt              time.Time            `json:"previewed_at,omitempty"`
+	FaultCode                string               `json:"fault_code,omitempty"`
+	Version                  int64                `json:"version"`
+	CreatedAt                time.Time            `json:"created_at"`
+	UpdatedAt                time.Time            `json:"updated_at"`
 }
 
 type UserPrincipal struct {
-	ID                  uuid.UUID
-	IdentitySourceID    uuid.UUID
-	ExternalSubject     string
-	Username            string
-	DisplayName         string
-	Email               string
-	Kind                UserKind
-	Status              UserStatus
-	MFAEnrolled         bool
-	CredentialRotatedAt time.Time
-	Version             int64
-	CreatedAt           time.Time
-	UpdatedAt           time.Time
-	DisabledAt          time.Time
-	DisabledReason      string
+	ID                  uuid.UUID  `json:"id"`
+	IdentitySourceID    uuid.UUID  `json:"identity_source_id,omitempty"`
+	ExternalSubject     string     `json:"external_subject,omitempty"`
+	Username            string     `json:"username"`
+	DisplayName         string     `json:"display_name"`
+	Email               string     `json:"email,omitempty"`
+	Kind                UserKind   `json:"kind"`
+	Status              UserStatus `json:"status"`
+	MFAEnrolled         bool       `json:"mfa_enrolled"`
+	CredentialRotatedAt time.Time  `json:"credential_rotated_at,omitempty"`
+	Version             int64      `json:"version"`
+	CreatedAt           time.Time  `json:"created_at"`
+	UpdatedAt           time.Time  `json:"updated_at"`
+	DisabledAt          time.Time  `json:"disabled_at,omitempty"`
+	DisabledReason      string     `json:"disabled_reason,omitempty"`
+}
+
+type OrganizationUnit struct {
+	ID               uuid.UUID `json:"id"`
+	IdentitySourceID uuid.UUID `json:"identity_source_id,omitempty"`
+	ExternalID       string    `json:"external_id,omitempty"`
+	ParentID         uuid.UUID `json:"parent_id,omitempty"`
+	Name             string    `json:"name"`
+	SourceOwned      bool      `json:"source_owned"`
+	Status           string    `json:"status"`
+	Version          int64     `json:"version"`
+	CreatedAt        time.Time `json:"created_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
+}
+
+type RoleBinding struct {
+	ID          uuid.UUID     `json:"id"`
+	SubjectType SubjectType   `json:"subject_type"`
+	SubjectID   uuid.UUID     `json:"subject_id"`
+	Role        identity.Role `json:"role"`
+	ScopeType   ScopeType     `json:"scope_type"`
+	ProductID   string        `json:"product_id,omitempty"`
+	ChannelName string        `json:"channel_name,omitempty"`
+	Effect      BindingEffect `json:"effect"`
+	ValidFrom   time.Time     `json:"valid_from"`
+	ValidUntil  time.Time     `json:"valid_until,omitempty"`
+	CreatedBy   string        `json:"created_by"`
+	Version     int64         `json:"version"`
+	CreatedAt   time.Time     `json:"created_at"`
+	UpdatedAt   time.Time     `json:"updated_at"`
 }
 
 type PasswordDigest struct {
@@ -135,4 +191,27 @@ type HighRiskConfirmation struct {
 type RequestContext struct {
 	RequestID string
 	SourceIP  string
+}
+
+type Page struct {
+	Limit      int
+	BeforeTime time.Time
+	BeforeID   uuid.UUID
+}
+
+type UserPage struct {
+	Items      []UserPrincipal `json:"items"`
+	NextCursor string          `json:"next_cursor,omitempty"`
+}
+
+type CreateLocalUserCommand struct {
+	Username    string
+	DisplayName string
+	Email       string
+}
+
+type LocalUserProvisioning struct {
+	User              UserPrincipal `json:"user"`
+	ActivationToken   string        `json:"activation_token"`
+	ActivationExpires time.Time     `json:"activation_expires_at"`
 }
