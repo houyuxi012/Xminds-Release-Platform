@@ -31,6 +31,7 @@ type ServiceConfig struct {
 	Auditor    AuditAppender
 	Sessions   SessionRevoker
 	Passwords  PasswordService
+	Directory  DirectoryAdapter
 	Clock      func() time.Time
 }
 
@@ -39,8 +40,296 @@ type Service struct {
 	auditor    AuditAppender
 	sessions   SessionRevoker
 	passwords  PasswordService
+	directory  DirectoryAdapter
 	authorizer *identity.Authorizer
 	clock      func() time.Time
+}
+
+func (service *Service) CreateOrganization(ctx context.Context, actor identity.Principal, command CreateOrganizationCommand, request RequestContext) (OrganizationUnit, error) {
+	if err := service.authorizer.Require(actor, identity.ActionIdentityManage, ""); err != nil {
+		return OrganizationUnit{}, err
+	}
+	name := strings.TrimSpace(command.Name)
+	if name == "" || len([]rune(name)) > 256 {
+		return OrganizationUnit{}, ErrUserInputInvalid
+	}
+	now := service.clock().UTC().Truncate(time.Microsecond)
+	id, err := uuid.NewV7()
+	if err != nil {
+		return OrganizationUnit{}, fmt.Errorf("generate organization ID: %w", err)
+	}
+	organization := OrganizationUnit{ID: id, ParentID: command.ParentID, Name: name, SourceOwned: false, Status: OrganizationStatusActive, Version: 1, CreatedAt: now, UpdatedAt: now}
+	err = service.repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
+		if command.ParentID != uuid.Nil {
+			parent, parentErr := service.repository.GetOrganization(ctx, tx, command.ParentID)
+			if parentErr != nil {
+				return parentErr
+			}
+			if parent.Status != OrganizationStatusActive {
+				return ErrUserInputInvalid
+			}
+		}
+		if insertErr := service.repository.InsertOrganization(ctx, tx, organization); insertErr != nil {
+			return insertErr
+		}
+		_, appendErr := service.auditor.Append(ctx, tx, audit.AppendCommand{Actor: actor, Action: "identity.organization.create", ResourceType: "organization_unit", ResourceID: organization.ID.String(), Outcome: audit.OutcomeSuccess, RequestID: request.RequestID, SourceIP: request.SourceIP, Metadata: map[string]any{"name": organization.Name, "parent_id": organization.ParentID.String()}})
+		return appendErr
+	})
+	if err != nil {
+		return OrganizationUnit{}, err
+	}
+	return organization, nil
+}
+
+func (service *Service) ListOrganizations(ctx context.Context, actor identity.Principal, page Page) (OrganizationPage, error) {
+	if err := service.authorizer.Require(actor, identity.ActionIdentityManage, ""); err != nil {
+		return OrganizationPage{}, err
+	}
+	if !validIAMPage(page) {
+		return OrganizationPage{}, ErrPageInvalid
+	}
+	return service.repository.ListOrganizations(ctx, page)
+}
+
+func (service *Service) CreateRoleBinding(ctx context.Context, actor identity.Principal, command CreateRoleBindingCommand, request RequestContext) (RoleBinding, error) {
+	if err := service.authorizer.Require(actor, identity.ActionIdentityManage, ""); err != nil {
+		return RoleBinding{}, err
+	}
+	if err := validateRoleBindingCommand(command); err != nil {
+		return RoleBinding{}, err
+	}
+	now := service.clock().UTC().Truncate(time.Microsecond)
+	if command.ValidFrom.IsZero() {
+		command.ValidFrom = now
+	} else {
+		command.ValidFrom = command.ValidFrom.UTC().Truncate(time.Microsecond)
+	}
+	if !command.ValidUntil.IsZero() {
+		command.ValidUntil = command.ValidUntil.UTC().Truncate(time.Microsecond)
+		if !command.ValidUntil.After(command.ValidFrom) {
+			return RoleBinding{}, ErrRoleBindingInvalid
+		}
+	}
+	id, err := uuid.NewV7()
+	if err != nil {
+		return RoleBinding{}, fmt.Errorf("generate role binding ID: %w", err)
+	}
+	binding := RoleBinding{ID: id, SubjectType: command.SubjectType, SubjectID: command.SubjectID, Role: command.Role, ScopeType: command.ScopeType, ProductID: strings.TrimSpace(command.ProductID), ChannelName: strings.TrimSpace(command.ChannelName), Effect: command.Effect, ValidFrom: command.ValidFrom, ValidUntil: command.ValidUntil, CreatedBy: actor.Subject, Version: 1, CreatedAt: now, UpdatedAt: now}
+	err = service.repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
+		if binding.SubjectType == SubjectTypeUser {
+			if _, subjectErr := service.repository.GetUser(ctx, tx, binding.SubjectID); subjectErr != nil {
+				return subjectErr
+			}
+		} else if _, subjectErr := service.repository.GetOrganization(ctx, tx, binding.SubjectID); subjectErr != nil {
+			return subjectErr
+		}
+		if insertErr := service.repository.InsertRoleBinding(ctx, tx, binding); insertErr != nil {
+			return insertErr
+		}
+		_, appendErr := service.auditor.Append(ctx, tx, audit.AppendCommand{Actor: actor, Action: "identity.role_binding.create", ResourceType: "role_binding", ResourceID: binding.ID.String(), Outcome: audit.OutcomeSuccess, RequestID: request.RequestID, SourceIP: request.SourceIP, Metadata: map[string]any{"subject_type": binding.SubjectType, "subject_id": binding.SubjectID.String(), "role": binding.Role, "scope_type": binding.ScopeType, "effect": binding.Effect}})
+		return appendErr
+	})
+	if err != nil {
+		return RoleBinding{}, err
+	}
+	return binding, nil
+}
+
+func (service *Service) ListRoleBindings(ctx context.Context, actor identity.Principal, page Page) (RoleBindingPage, error) {
+	if err := service.authorizer.Require(actor, identity.ActionIdentityManage, ""); err != nil {
+		return RoleBindingPage{}, err
+	}
+	if !validIAMPage(page) {
+		return RoleBindingPage{}, ErrPageInvalid
+	}
+	return service.repository.ListRoleBindings(ctx, page)
+}
+
+func (service *Service) DeleteRoleBinding(ctx context.Context, actor identity.Principal, bindingID uuid.UUID, expectedVersion int64, request RequestContext) error {
+	if err := service.authorizer.Require(actor, identity.ActionIdentityManage, ""); err != nil {
+		return err
+	}
+	if bindingID == uuid.Nil || expectedVersion < 1 {
+		return ErrRoleBindingInvalid
+	}
+	return service.repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
+		binding, err := service.repository.GetRoleBinding(ctx, tx, bindingID)
+		if err != nil {
+			return err
+		}
+		if binding.Version != expectedVersion {
+			return ErrIAMConflict
+		}
+		if err := service.repository.DeleteRoleBinding(ctx, tx, bindingID, expectedVersion); err != nil {
+			return err
+		}
+		_, err = service.auditor.Append(ctx, tx, audit.AppendCommand{Actor: actor, Action: "identity.role_binding.delete", ResourceType: "role_binding", ResourceID: binding.ID.String(), Outcome: audit.OutcomeSuccess, RequestID: request.RequestID, SourceIP: request.SourceIP, Metadata: map[string]any{"subject_type": binding.SubjectType, "subject_id": binding.SubjectID.String(), "role": binding.Role, "scope_type": binding.ScopeType, "effect": binding.Effect, "version": binding.Version}})
+		return err
+	})
+}
+
+func (service *Service) CreateIdentitySource(ctx context.Context, actor identity.Principal, command CreateIdentitySourceCommand, request RequestContext) (IdentitySource, error) {
+	if err := service.authorizer.Require(actor, identity.ActionIdentityManage, ""); err != nil {
+		return IdentitySource{}, err
+	}
+	name, secretReference := strings.TrimSpace(command.Name), strings.TrimSpace(command.SecretReference)
+	if name == "" || len([]rune(name)) > 128 || len(secretReference) > 256 || secretReference == "" || (command.Kind != IdentitySourceOIDC && command.Kind != IdentitySourceSCIM) {
+		return IdentitySource{}, ErrIdentitySourceInputInvalid
+	}
+	now := service.clock().UTC().Truncate(time.Microsecond)
+	id, err := uuid.NewV7()
+	if err != nil {
+		return IdentitySource{}, fmt.Errorf("generate identity source ID: %w", err)
+	}
+	source := IdentitySource{ID: id, Name: name, Kind: command.Kind, Status: IdentitySourceStatusDraft, SecretReference: secretReference, RequiredMappingsComplete: command.RequiredMappingsComplete, Version: 1, CreatedAt: now, UpdatedAt: now}
+	err = service.repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
+		if insertErr := service.repository.InsertIdentitySource(ctx, tx, source); insertErr != nil {
+			return insertErr
+		}
+		_, appendErr := service.auditor.Append(ctx, tx, audit.AppendCommand{Actor: actor, Action: "identity.source.create", ResourceType: "identity_source", ResourceID: source.ID.String(), Outcome: audit.OutcomeSuccess, RequestID: request.RequestID, SourceIP: request.SourceIP, Metadata: map[string]any{"name": source.Name, "source_kind": source.Kind, "required_mappings_complete": source.RequiredMappingsComplete}})
+		return appendErr
+	})
+	if err != nil {
+		return IdentitySource{}, err
+	}
+	return source, nil
+}
+
+func (service *Service) ListIdentitySources(ctx context.Context, actor identity.Principal, page Page) (IdentitySourcePage, error) {
+	if err := service.authorizer.Require(actor, identity.ActionIdentityManage, ""); err != nil {
+		return IdentitySourcePage{}, err
+	}
+	if !validIAMPage(page) {
+		return IdentitySourcePage{}, ErrPageInvalid
+	}
+	return service.repository.ListIdentitySources(ctx, page)
+}
+
+func (service *Service) PatchIdentitySourceDraft(ctx context.Context, actor identity.Principal, sourceID uuid.UUID, command PatchIdentitySourceCommand, request RequestContext) (IdentitySource, error) {
+	if err := service.authorizer.Require(actor, identity.ActionIdentityManage, ""); err != nil {
+		return IdentitySource{}, err
+	}
+	if sourceID == uuid.Nil || command.Version < 1 || (command.Name == nil && command.SecretReference == nil && command.RequiredMappingsComplete == nil) {
+		return IdentitySource{}, ErrIdentitySourceInputInvalid
+	}
+	now := service.clock().UTC().Truncate(time.Microsecond)
+	var patched IdentitySource
+	err := service.repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
+		source, err := service.repository.GetIdentitySource(ctx, tx, sourceID)
+		if err != nil {
+			return err
+		}
+		if source.Status != IdentitySourceStatusDraft || source.Version != command.Version {
+			if source.Version != command.Version {
+				return ErrIAMConflict
+			}
+			return ErrIdentitySourceInputInvalid
+		}
+		if command.Name != nil {
+			source.Name = strings.TrimSpace(*command.Name)
+			if source.Name == "" || len([]rune(source.Name)) > 128 {
+				return ErrIdentitySourceInputInvalid
+			}
+		}
+		if command.SecretReference != nil {
+			source.SecretReference = strings.TrimSpace(*command.SecretReference)
+			if source.SecretReference == "" || len(source.SecretReference) > 256 {
+				return ErrIdentitySourceInputInvalid
+			}
+		}
+		if command.RequiredMappingsComplete != nil {
+			source.RequiredMappingsComplete = *command.RequiredMappingsComplete
+		}
+		source.Version++
+		source.UpdatedAt = now
+		if err := service.repository.UpdateIdentitySourceDraft(ctx, tx, source, command.Version); err != nil {
+			return err
+		}
+		_, err = service.auditor.Append(ctx, tx, audit.AppendCommand{Actor: actor, Action: "identity.source.patch", ResourceType: "identity_source", ResourceID: source.ID.String(), Outcome: audit.OutcomeSuccess, RequestID: request.RequestID, SourceIP: request.SourceIP, Metadata: map[string]any{"name": source.Name, "required_mappings_complete": source.RequiredMappingsComplete, "version": source.Version}})
+		patched = source
+		return err
+	})
+	if err != nil {
+		return IdentitySource{}, err
+	}
+	return patched, nil
+}
+
+func (service *Service) VerifyIdentitySource(ctx context.Context, actor identity.Principal, sourceID uuid.UUID, request RequestContext) (CapabilityReport, error) {
+	if err := service.authorizer.Require(actor, identity.ActionIdentityManage, ""); err != nil {
+		return CapabilityReport{}, err
+	}
+	if service.directory == nil {
+		return CapabilityReport{}, ErrDirectoryAdapterUnavailable
+	}
+	source, err := service.repository.GetIdentitySource(ctx, nil, sourceID)
+	if err != nil {
+		return CapabilityReport{}, err
+	}
+	if source.Status != IdentitySourceStatusDraft && source.Status != IdentitySourceStatusVerified {
+		return CapabilityReport{}, ErrIdentitySourceInputInvalid
+	}
+	report, err := service.directory.Verify(ctx, source)
+	if err != nil {
+		return CapabilityReport{}, err
+	}
+	if !report.Reachable {
+		return CapabilityReport{}, ErrIdentitySourceInputInvalid
+	}
+	now := service.clock().UTC().Truncate(time.Microsecond)
+	err = service.repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
+		current, err := service.repository.GetIdentitySource(ctx, tx, sourceID)
+		if err != nil {
+			return err
+		}
+		if current.Version != source.Version || (current.Status != IdentitySourceStatusDraft && current.Status != IdentitySourceStatusVerified) {
+			return ErrIAMConflict
+		}
+		current.Status, current.VerifiedAt, current.Version, current.UpdatedAt = IdentitySourceStatusVerified, now, current.Version+1, now
+		if err := service.repository.SaveIdentitySource(ctx, tx, current, current.Version-1); err != nil {
+			return err
+		}
+		_, err = service.auditor.Append(ctx, tx, audit.AppendCommand{Actor: actor, Action: "identity.source.verify", ResourceType: "identity_source", ResourceID: current.ID.String(), Outcome: audit.OutcomeSuccess, RequestID: request.RequestID, SourceIP: request.SourceIP, Metadata: map[string]any{"source_kind": current.Kind, "supports_incremental": report.SupportsIncremental}})
+		return err
+	})
+	return report, err
+}
+
+func (service *Service) PreviewIdentitySource(ctx context.Context, actor identity.Principal, sourceID uuid.UUID, request RequestContext) (SyncDiff, error) {
+	if err := service.authorizer.Require(actor, identity.ActionIdentityManage, ""); err != nil {
+		return SyncDiff{}, err
+	}
+	if service.directory == nil {
+		return SyncDiff{}, ErrDirectoryAdapterUnavailable
+	}
+	source, err := service.repository.GetIdentitySource(ctx, nil, sourceID)
+	if err != nil {
+		return SyncDiff{}, err
+	}
+	if source.Status != IdentitySourceStatusVerified || source.VerifiedAt.IsZero() {
+		return SyncDiff{}, ErrIdentitySourceInputInvalid
+	}
+	diff, err := service.directory.Preview(ctx, source)
+	if err != nil {
+		return SyncDiff{}, err
+	}
+	now := service.clock().UTC().Truncate(time.Microsecond)
+	err = service.repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
+		current, err := service.repository.GetIdentitySource(ctx, tx, sourceID)
+		if err != nil {
+			return err
+		}
+		if current.Version != source.Version || current.Status != IdentitySourceStatusVerified || current.VerifiedAt.IsZero() {
+			return ErrIAMConflict
+		}
+		current.PreviewedAt, current.Version, current.UpdatedAt = now, current.Version+1, now
+		if err := service.repository.SaveIdentitySource(ctx, tx, current, current.Version-1); err != nil {
+			return err
+		}
+		_, err = service.auditor.Append(ctx, tx, audit.AppendCommand{Actor: actor, Action: "identity.source.sync_preview", ResourceType: "identity_source", ResourceID: current.ID.String(), Outcome: audit.OutcomeSuccess, RequestID: request.RequestID, SourceIP: request.SourceIP, Metadata: map[string]any{"create_count": diff.CreateCount, "update_count": diff.UpdateCount, "disable_count": diff.DisableCount, "conflict_count": diff.ConflictCount}})
+		return err
+	})
+	return diff, err
 }
 
 func (service *Service) CreateLocalUser(ctx context.Context, actor identity.Principal, command CreateLocalUserCommand, request RequestContext) (LocalUserProvisioning, error) {
@@ -131,9 +420,43 @@ func NewService(config ServiceConfig) (*Service, error) {
 		return nil, ErrIAMConfiguration
 	}
 	return &Service{
-		repository: config.Repository, auditor: config.Auditor, sessions: config.Sessions,
+		repository: config.Repository, auditor: config.Auditor, sessions: config.Sessions, directory: config.Directory,
 		passwords: config.Passwords, authorizer: identity.NewAuthorizer(), clock: config.Clock,
 	}, nil
+}
+
+func validIAMPage(page Page) bool {
+	return page.Limit >= 0 && page.Limit <= 200 && (page.BeforeTime.IsZero() == (page.BeforeID == uuid.Nil))
+}
+
+func validateRoleBindingCommand(command CreateRoleBindingCommand) error {
+	if command.SubjectID == uuid.Nil || (command.SubjectType != SubjectTypeUser && command.SubjectType != SubjectTypeOrganization) ||
+		(command.Effect != BindingEffectAllow && command.Effect != BindingEffectDeny) {
+		return ErrRoleBindingInvalid
+	}
+	switch command.Role {
+	case identity.RoleAdmin, identity.RolePublisher, identity.RoleApprover, identity.RoleAuditor, identity.RoleViewer:
+	default:
+		return ErrRoleBindingInvalid
+	}
+	productID, channelName := strings.TrimSpace(command.ProductID), strings.TrimSpace(command.ChannelName)
+	switch command.ScopeType {
+	case ScopeTypePlatform:
+		if productID != "" || channelName != "" {
+			return ErrRoleBindingInvalid
+		}
+	case ScopeTypeProduct:
+		if productID == "" || channelName != "" {
+			return ErrRoleBindingInvalid
+		}
+	case ScopeTypeChannel:
+		if productID == "" || channelName == "" {
+			return ErrRoleBindingInvalid
+		}
+	default:
+		return ErrRoleBindingInvalid
+	}
+	return nil
 }
 
 func (service *Service) EnableSSO(ctx context.Context, actor identity.Principal, sourceID uuid.UUID, confirmation HighRiskConfirmation, request RequestContext) error {

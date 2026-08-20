@@ -75,6 +75,13 @@ const (
 	BindingEffectDeny  BindingEffect = "deny"
 )
 
+type OrganizationStatus string
+
+const (
+	OrganizationStatusActive   OrganizationStatus = "active"
+	OrganizationStatusDisabled OrganizationStatus = "disabled"
+)
+
 var (
 	ErrIAMConfiguration             = errors.New("IAM service configuration is invalid")
 	ErrIAMConflict                  = errors.New("IAM record changed concurrently")
@@ -92,6 +99,11 @@ var (
 	ErrIdentityFaultCodeInvalid     = errors.New("identity source fault code is invalid")
 	ErrUserInputInvalid             = errors.New("user input is invalid")
 	ErrPageInvalid                  = errors.New("IAM page parameters are invalid")
+	ErrOrganizationNotFound         = errors.New("organization was not found")
+	ErrRoleBindingNotFound          = errors.New("role binding was not found")
+	ErrRoleBindingInvalid           = errors.New("role binding input is invalid")
+	ErrIdentitySourceInputInvalid   = errors.New("identity source input is invalid")
+	ErrDirectoryAdapterUnavailable  = errors.New("directory adapter is unavailable")
 )
 
 type LoginState struct {
@@ -137,16 +149,16 @@ type UserPrincipal struct {
 }
 
 type OrganizationUnit struct {
-	ID               uuid.UUID `json:"id"`
-	IdentitySourceID uuid.UUID `json:"identity_source_id,omitempty"`
-	ExternalID       string    `json:"external_id,omitempty"`
-	ParentID         uuid.UUID `json:"parent_id,omitempty"`
-	Name             string    `json:"name"`
-	SourceOwned      bool      `json:"source_owned"`
-	Status           string    `json:"status"`
-	Version          int64     `json:"version"`
-	CreatedAt        time.Time `json:"created_at"`
-	UpdatedAt        time.Time `json:"updated_at"`
+	ID               uuid.UUID          `json:"id"`
+	IdentitySourceID uuid.UUID          `json:"identity_source_id,omitempty"`
+	ExternalID       string             `json:"external_id,omitempty"`
+	ParentID         uuid.UUID          `json:"parent_id,omitempty"`
+	Name             string             `json:"name"`
+	SourceOwned      bool               `json:"source_owned"`
+	Status           OrganizationStatus `json:"status"`
+	Version          int64              `json:"version"`
+	CreatedAt        time.Time          `json:"created_at"`
+	UpdatedAt        time.Time          `json:"updated_at"`
 }
 
 type RoleBinding struct {
@@ -214,4 +226,50 @@ type LocalUserProvisioning struct {
 	User              UserPrincipal `json:"user"`
 	ActivationToken   string        `json:"activation_token"`
 	ActivationExpires time.Time     `json:"activation_expires_at"`
+}
+
+type OrganizationPage struct {
+	Items      []OrganizationUnit `json:"items"`
+	NextCursor string             `json:"next_cursor,omitempty"`
+}
+
+type RoleBindingPage struct {
+	Items      []RoleBinding `json:"items"`
+	NextCursor string        `json:"next_cursor,omitempty"`
+}
+
+type IdentitySourcePage struct {
+	Items      []IdentitySource `json:"items"`
+	NextCursor string           `json:"next_cursor,omitempty"`
+}
+
+type CreateOrganizationCommand struct {
+	Name     string
+	ParentID uuid.UUID
+}
+
+type CreateRoleBindingCommand struct {
+	SubjectType SubjectType
+	SubjectID   uuid.UUID
+	Role        identity.Role
+	ScopeType   ScopeType
+	ProductID   string
+	ChannelName string
+	Effect      BindingEffect
+	ValidFrom   time.Time
+	ValidUntil  time.Time
+}
+
+type CreateIdentitySourceCommand struct {
+	Name                     string
+	Kind                     IdentitySourceKind
+	SecretReference          string
+	RequiredMappingsComplete bool
+}
+
+type PatchIdentitySourceCommand struct {
+	Name                     *string
+	SecretReference          *string
+	RequiredMappingsComplete *bool
+	Version                  int64
 }

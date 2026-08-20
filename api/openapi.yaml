@@ -28,6 +28,8 @@ tags:
     description: GitHub、GHES 与 GitLab Self-Managed 连接、密文凭据和 Webhook
   - name: Endpoints
     description: 分发端点注册、目录摘要探测与健康状态管理
+  - name: Identity Governance
+    description: 组织单元、角色绑定及身份源草稿的受控管理
   - name: Public Distribution
     description: 无需登录的 TUF 元数据兼容下载与产品范围制品下载
 paths:
@@ -1159,6 +1161,117 @@ paths:
                 $ref: '#/components/schemas/ProblemDetails'
         '409':
           $ref: '#/components/responses/Conflict'
+  /api/v1/organizations:
+    get:
+      operationId: listOrganizations
+      summary: 查询组织单元
+      tags: [Identity Governance]
+      x-required-action: identity.manage
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: 组织单元页
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrganizationPage'
+    post:
+      operationId: createOrganization
+      summary: 创建平台本地组织单元
+      description: 仅创建平台本地组织，不可伪造外部目录主数据。
+      tags: [Identity Governance]
+      x-required-action: identity.manage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOrganizationRequest'
+      responses:
+        '201':
+          description: 组织单元已创建并审计
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Organization'
+  /api/v1/role-bindings:
+    get:
+      operationId: listRoleBindings
+      summary: 查询角色绑定
+      description: 此 P0 增量仅公开只读查询；创建和删除仍限服务层受控调用。
+      tags: [Identity Governance]
+      x-required-action: identity.manage
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: 角色绑定页
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoleBindingPage'
+  /api/v1/identity-sources:
+    get:
+      operationId: listIdentitySources
+      summary: 查询身份源
+      tags: [Identity Governance]
+      x-required-action: identity.manage
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: 身份源页；不包含 Secret 引用。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IdentitySourcePage'
+    post:
+      operationId: createIdentitySourceDraft
+      summary: 创建身份源草稿
+      description: Secret 引用仅可写入；任何响应均不返回该引用。
+      tags: [Identity Governance]
+      x-required-action: identity.manage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateIdentitySourceRequest'
+      responses:
+        '201':
+          description: 身份源草稿已创建并审计
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IdentitySource'
+  /api/v1/identity-sources/{source_id}:
+    patch:
+      operationId: patchIdentitySourceDraft
+      summary: 更新身份源草稿
+      description: 仅草稿可更新；`version` 是必填乐观锁。该增量不提供启用、停用、同步或任何客户端自报重新认证时间戳接口。
+      tags: [Identity Governance]
+      x-required-action: identity.manage
+      parameters:
+        - $ref: '#/components/parameters/IdentitySourceIDPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PatchIdentitySourceRequest'
+      responses:
+        '200':
+          description: 草稿已更新并审计
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IdentitySource'
+        '409':
+          $ref: '#/components/responses/Conflict'
 components:
   parameters:
     ProductIDPath:
@@ -1234,6 +1347,28 @@ components:
       schema:
         type: string
         enum: [root, targets, snapshot, timestamp, revocation]
+    IdentitySourceIDPath:
+      name: source_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    Limit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 200
+        default: 50
+    Cursor:
+      name: cursor
+      in: query
+      description: 服务端返回的不透明分页游标。
+      schema:
+        type: string
+        maxLength: 512
   securitySchemes:
     oidcBearer:
       type: http
@@ -2188,6 +2323,121 @@ components:
         updated_at:
           type: string
           format: date-time
+    CreateOrganizationRequest:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 256
+        parent_id:
+          type: string
+          format: uuid
+    Organization:
+      type: object
+      additionalProperties: false
+      required: [id, name, source_owned, status, version, created_at, updated_at]
+      properties:
+        id: {type: string, format: uuid}
+        identity_source_id: {type: string, format: uuid}
+        external_id: {type: string}
+        parent_id: {type: string, format: uuid}
+        name: {type: string}
+        source_owned: {type: boolean}
+        status: {type: string, enum: [active, disabled]}
+        version: {type: integer, minimum: 1}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+    OrganizationPage:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/Organization'}
+        next_cursor: {type: string}
+    RoleBinding:
+      type: object
+      additionalProperties: false
+      required: [id, subject_type, subject_id, role, scope_type, effect, valid_from, created_by, version, created_at, updated_at]
+      properties:
+        id: {type: string, format: uuid}
+        subject_type: {type: string, enum: [user, organization]}
+        subject_id: {type: string, format: uuid}
+        role: {type: string, enum: [admin, publisher, approver, auditor, viewer]}
+        scope_type: {type: string, enum: [platform, product, channel]}
+        product_id: {type: string}
+        channel_name: {type: string}
+        effect: {type: string, enum: [allow, deny]}
+        valid_from: {type: string, format: date-time}
+        valid_until: {type: string, format: date-time}
+        created_by: {type: string}
+        version: {type: integer, minimum: 1}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+    RoleBindingPage:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/RoleBinding'}
+        next_cursor: {type: string}
+    CreateIdentitySourceRequest:
+      type: object
+      additionalProperties: false
+      required: [name, kind, secret_reference]
+      properties:
+        name: {type: string, minLength: 1, maxLength: 128}
+        kind: {type: string, enum: [oidc, scim]}
+        secret_reference:
+          type: string
+          minLength: 1
+          maxLength: 256
+          writeOnly: true
+        required_mappings_complete: {type: boolean}
+    PatchIdentitySourceRequest:
+      type: object
+      additionalProperties: false
+      required: [version]
+      properties:
+        name: {type: string, minLength: 1, maxLength: 128}
+        secret_reference:
+          type: string
+          minLength: 1
+          maxLength: 256
+          writeOnly: true
+        required_mappings_complete: {type: boolean}
+        version: {type: integer, minimum: 1}
+    IdentitySource:
+      type: object
+      additionalProperties: false
+      required: [id, name, kind, status, required_mappings_complete, version, created_at, updated_at]
+      properties:
+        id: {type: string, format: uuid}
+        name: {type: string}
+        kind: {type: string, enum: [local, oidc, scim]}
+        status: {type: string, enum: [draft, verified, enabled, fault, disabled]}
+        required_mappings_complete: {type: boolean}
+        verified_at: {type: string, format: date-time}
+        previewed_at: {type: string, format: date-time}
+        fault_code: {type: string}
+        version: {type: integer, minimum: 1}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+    IdentitySourcePage:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/IdentitySource'}
+        next_cursor: {type: string}
     ProblemDetails:
       type: object
       additionalProperties: false

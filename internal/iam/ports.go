@@ -22,6 +22,16 @@ type Repository interface {
 	InsertLocalUser(ctx context.Context, tx pgx.Tx, user UserPrincipal, credential LocalCredential) error
 	ListUsers(ctx context.Context, page Page) (UserPage, error)
 	FindLocalAuthentication(ctx context.Context, canonicalUsername string) (LoginState, UserPrincipal, LocalCredential, error)
+	InsertOrganization(ctx context.Context, tx pgx.Tx, organization OrganizationUnit) error
+	GetOrganization(ctx context.Context, tx pgx.Tx, id uuid.UUID) (OrganizationUnit, error)
+	ListOrganizations(ctx context.Context, page Page) (OrganizationPage, error)
+	InsertRoleBinding(ctx context.Context, tx pgx.Tx, binding RoleBinding) error
+	GetRoleBinding(ctx context.Context, tx pgx.Tx, id uuid.UUID) (RoleBinding, error)
+	ListRoleBindings(ctx context.Context, page Page) (RoleBindingPage, error)
+	DeleteRoleBinding(ctx context.Context, tx pgx.Tx, id uuid.UUID, expectedVersion int64) error
+	InsertIdentitySource(ctx context.Context, tx pgx.Tx, source IdentitySource) error
+	ListIdentitySources(ctx context.Context, page Page) (IdentitySourcePage, error)
+	UpdateIdentitySourceDraft(ctx context.Context, tx pgx.Tx, source IdentitySource, expectedVersion int64) error
 }
 
 type AuditAppender interface {

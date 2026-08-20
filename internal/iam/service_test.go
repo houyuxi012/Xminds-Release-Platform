@@ -142,6 +142,84 @@ func TestCreateLocalUserRejectsInvalidIdentityFields(t *testing.T) {
 	}
 }
 
+func TestCreateOrganizationPersistsLocalUnitAndAuditsInOneTransaction(t *testing.T) {
+	t.Parallel()
+
+	harness := newIAMHarness(t)
+	organization, err := harness.service.CreateOrganization(context.Background(), harness.admin, CreateOrganizationCommand{
+		Name: "Release Engineering",
+	}, harness.request)
+
+	if err != nil {
+		t.Fatalf("CreateOrganization() error = %v", err)
+	}
+	if organization.ID == uuid.Nil || organization.SourceOwned || organization.Status != OrganizationStatusActive || organization.Version != 1 {
+		t.Fatalf("organization = %+v", organization)
+	}
+	if got := harness.repository.organizations[organization.ID]; got.Name != "Release Engineering" {
+		t.Fatalf("stored organization = %+v", got)
+	}
+	if len(harness.auditor.commands) != 1 || harness.auditor.commands[0].Action != "identity.organization.create" {
+		t.Fatalf("audit commands = %+v", harness.auditor.commands)
+	}
+}
+
+func TestRoleBindingCreateAndDeleteAreAuditedAndOptimistic(t *testing.T) {
+	t.Parallel()
+
+	harness := newIAMHarness(t)
+	binding, err := harness.service.CreateRoleBinding(context.Background(), harness.admin, CreateRoleBindingCommand{
+		SubjectType: SubjectTypeUser,
+		SubjectID:   harness.emergencyAdminID,
+		Role:        identity.RoleAuditor,
+		ScopeType:   ScopeTypePlatform,
+		Effect:      BindingEffectAllow,
+	}, harness.request)
+	if err != nil {
+		t.Fatalf("CreateRoleBinding() error = %v", err)
+	}
+	if binding.ID == uuid.Nil || binding.Version != 1 {
+		t.Fatalf("binding = %+v", binding)
+	}
+	if err := harness.service.DeleteRoleBinding(context.Background(), harness.admin, binding.ID, binding.Version, harness.request); err != nil {
+		t.Fatalf("DeleteRoleBinding() error = %v", err)
+	}
+	if _, exists := harness.repository.roleBindings[binding.ID]; exists {
+		t.Fatal("role binding was not deleted")
+	}
+	if len(harness.auditor.commands) != 2 || harness.auditor.commands[1].Action != "identity.role_binding.delete" {
+		t.Fatalf("audit commands = %+v", harness.auditor.commands)
+	}
+}
+
+func TestIdentitySourceDraftVerifyAndPreviewDoNotExposeSecretReference(t *testing.T) {
+	t.Parallel()
+
+	harness := newIAMHarness(t)
+	source, err := harness.service.CreateIdentitySource(context.Background(), harness.admin, CreateIdentitySourceCommand{
+		Name: "Corporate SCIM", Kind: IdentitySourceSCIM, SecretReference: "secret://iam/corporate-scim",
+	}, harness.request)
+	if err != nil {
+		t.Fatalf("CreateIdentitySource() error = %v", err)
+	}
+	if source.SecretReference != "secret://iam/corporate-scim" || source.Status != IdentitySourceStatusDraft || source.ID == uuid.Nil {
+		t.Fatalf("source = %+v", source)
+	}
+	if _, err := harness.service.VerifyIdentitySource(context.Background(), harness.admin, source.ID, harness.request); err != nil {
+		t.Fatalf("VerifyIdentitySource() error = %v", err)
+	}
+	if _, err := harness.service.PreviewIdentitySource(context.Background(), harness.admin, source.ID, harness.request); err != nil {
+		t.Fatalf("PreviewIdentitySource() error = %v", err)
+	}
+	stored := harness.repository.sources[source.ID]
+	if stored.Status != IdentitySourceStatusVerified || stored.VerifiedAt.IsZero() || stored.PreviewedAt.IsZero() {
+		t.Fatalf("stored source = %+v", stored)
+	}
+	if len(harness.auditor.commands) != 3 || harness.auditor.commands[0].Metadata["secret_reference"] != nil {
+		t.Fatalf("audit commands = %+v", harness.auditor.commands)
+	}
+}
+
 type iamHarness struct {
 	service          *Service
 	repository       *memoryIAMRepository
@@ -169,10 +247,12 @@ func newIAMHarness(t *testing.T) *iamHarness {
 			ID: emergencyID, Username: "break-glass", Kind: UserKindEmergency, Status: UserStatusActive,
 			MFAEnrolled: true, CredentialRotatedAt: now.Add(-24 * time.Hour),
 		}},
+		organizations: make(map[uuid.UUID]OrganizationUnit),
+		roleBindings:  make(map[uuid.UUID]RoleBinding),
 	}
 	auditor := &iamAuditRecorder{}
 	service, err := NewService(ServiceConfig{
-		Repository: repository, Auditor: auditor, Sessions: iamSessionRecorder{}, Passwords: deterministicPasswordManager{},
+		Repository: repository, Auditor: auditor, Sessions: iamSessionRecorder{}, Passwords: deterministicPasswordManager{}, Directory: iamDirectoryAdapter{},
 		Clock: func() time.Time { return now },
 	})
 	if err != nil {
@@ -192,10 +272,12 @@ func (harness *iamHarness) confirmation() HighRiskConfirmation {
 }
 
 type memoryIAMRepository struct {
-	login       LoginState
-	sources     map[uuid.UUID]IdentitySource
-	users       map[uuid.UUID]UserPrincipal
-	credentials map[uuid.UUID]LocalCredential
+	login         LoginState
+	sources       map[uuid.UUID]IdentitySource
+	users         map[uuid.UUID]UserPrincipal
+	credentials   map[uuid.UUID]LocalCredential
+	organizations map[uuid.UUID]OrganizationUnit
+	roleBindings  map[uuid.UUID]RoleBinding
 }
 
 func (repository *memoryIAMRepository) WithinTransaction(_ context.Context, function func(pgx.Tx) error) error {
@@ -290,6 +372,77 @@ func (repository *memoryIAMRepository) ListUsers(context.Context, Page) (UserPag
 	return UserPage{Items: items}, nil
 }
 
+func (repository *memoryIAMRepository) InsertOrganization(_ context.Context, _ pgx.Tx, organization OrganizationUnit) error {
+	repository.organizations[organization.ID] = organization
+	return nil
+}
+
+func (repository *memoryIAMRepository) GetOrganization(_ context.Context, _ pgx.Tx, id uuid.UUID) (OrganizationUnit, error) {
+	organization, exists := repository.organizations[id]
+	if !exists {
+		return OrganizationUnit{}, ErrOrganizationNotFound
+	}
+	return organization, nil
+}
+
+func (repository *memoryIAMRepository) ListOrganizations(context.Context, Page) (OrganizationPage, error) {
+	items := make([]OrganizationUnit, 0, len(repository.organizations))
+	for _, organization := range repository.organizations {
+		items = append(items, organization)
+	}
+	return OrganizationPage{Items: items}, nil
+}
+
+func (repository *memoryIAMRepository) InsertRoleBinding(_ context.Context, _ pgx.Tx, binding RoleBinding) error {
+	repository.roleBindings[binding.ID] = binding
+	return nil
+}
+
+func (repository *memoryIAMRepository) GetRoleBinding(_ context.Context, _ pgx.Tx, id uuid.UUID) (RoleBinding, error) {
+	binding, exists := repository.roleBindings[id]
+	if !exists {
+		return RoleBinding{}, ErrRoleBindingNotFound
+	}
+	return binding, nil
+}
+
+func (repository *memoryIAMRepository) ListRoleBindings(context.Context, Page) (RoleBindingPage, error) {
+	items := make([]RoleBinding, 0, len(repository.roleBindings))
+	for _, binding := range repository.roleBindings {
+		items = append(items, binding)
+	}
+	return RoleBindingPage{Items: items}, nil
+}
+
+func (repository *memoryIAMRepository) DeleteRoleBinding(_ context.Context, _ pgx.Tx, id uuid.UUID, expectedVersion int64) error {
+	binding, exists := repository.roleBindings[id]
+	if !exists {
+		return ErrRoleBindingNotFound
+	}
+	if binding.Version != expectedVersion {
+		return ErrIAMConflict
+	}
+	delete(repository.roleBindings, id)
+	return nil
+}
+
+func (repository *memoryIAMRepository) InsertIdentitySource(_ context.Context, _ pgx.Tx, source IdentitySource) error {
+	repository.sources[source.ID] = source
+	return nil
+}
+
+func (repository *memoryIAMRepository) ListIdentitySources(context.Context, Page) (IdentitySourcePage, error) {
+	items := make([]IdentitySource, 0, len(repository.sources))
+	for _, source := range repository.sources {
+		items = append(items, source)
+	}
+	return IdentitySourcePage{Items: items}, nil
+}
+
+func (repository *memoryIAMRepository) UpdateIdentitySourceDraft(_ context.Context, _ pgx.Tx, source IdentitySource, expectedVersion int64) error {
+	return repository.SaveIdentitySource(context.Background(), nil, source, expectedVersion)
+}
+
 type iamAuditRecorder struct {
 	commands []audit.AppendCommand
 }
@@ -302,6 +455,20 @@ func (recorder *iamAuditRecorder) Append(_ context.Context, _ pgx.Tx, command au
 type iamSessionRecorder struct{}
 
 func (iamSessionRecorder) RevokeSubject(context.Context, uuid.UUID, string) error { return nil }
+
+type iamDirectoryAdapter struct{}
+
+func (iamDirectoryAdapter) Verify(context.Context, IdentitySource) (CapabilityReport, error) {
+	return CapabilityReport{Reachable: true, SupportsIncremental: true}, nil
+}
+
+func (iamDirectoryAdapter) Preview(context.Context, IdentitySource) (SyncDiff, error) {
+	return SyncDiff{CreateCount: 1}, nil
+}
+
+func (iamDirectoryAdapter) Sync(context.Context, IdentitySource, string) (SyncPage, error) {
+	return SyncPage{}, nil
+}
 
 type deterministicPasswordManager struct{}
 

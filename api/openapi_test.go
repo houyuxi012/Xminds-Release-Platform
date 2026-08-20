@@ -188,3 +188,36 @@ func TestOpenAPIDefinesEndpointManagementAndUnauthenticatedDistributionOperation
 		}
 	}
 }
+
+func TestOpenAPIDefinesReadOnlyRoleBindingsAndDraftIdentityGovernanceOperations(t *testing.T) {
+	t.Parallel()
+
+	loader := openapi3.NewLoader()
+	document, err := loader.LoadFromFile("openapi.yaml")
+	if err != nil {
+		t.Fatalf("load OpenAPI contract: %v", err)
+	}
+	for _, testCase := range []struct {
+		path   string
+		method string
+	}{
+		{path: "/api/v1/organizations", method: "GET"},
+		{path: "/api/v1/organizations", method: "POST"},
+		{path: "/api/v1/role-bindings", method: "GET"},
+		{path: "/api/v1/identity-sources", method: "GET"},
+		{path: "/api/v1/identity-sources", method: "POST"},
+		{path: "/api/v1/identity-sources/{source_id}", method: "PATCH"},
+	} {
+		pathItem := document.Paths.Find(testCase.path)
+		if pathItem == nil || pathItem.GetOperation(testCase.method) == nil {
+			t.Fatalf("missing %s %s operation", testCase.method, testCase.path)
+		}
+	}
+	if operation := document.Paths.Find("/api/v1/role-bindings").Post; operation != nil {
+		t.Fatal("role binding creation must remain unavailable over HTTP in this P0 increment")
+	}
+	identitySource := document.Components.Schemas["IdentitySource"].Value
+	if _, leaked := identitySource.Properties["secret_reference"]; leaked {
+		t.Fatal("identity source read schema must not expose secret_reference")
+	}
+}

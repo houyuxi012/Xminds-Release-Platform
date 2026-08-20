@@ -284,12 +284,228 @@ WHERE lower(user_record.username) = $1
 	return state, user, credential, nil
 }
 
+func (repository *PostgresRepository) InsertOrganization(ctx context.Context, tx pgx.Tx, organization OrganizationUnit) error {
+	if tx == nil || organization.ID == uuid.Nil || organization.SourceOwned || organization.Status != OrganizationStatusActive || organization.Version != 1 {
+		return ErrIAMConfiguration
+	}
+	_, err := tx.Exec(ctx, `
+INSERT INTO organization_units (id, identity_source_id, external_id, parent_id, name, source_owned, status, version, created_at, updated_at)
+VALUES ($1, NULL, '', $2, $3, FALSE, $4, $5, $6, $7)`, organization.ID, nullableUUID(organization.ParentID), organization.Name, organization.Status, organization.Version, organization.CreatedAt.UTC(), organization.UpdatedAt.UTC())
+	if err != nil {
+		return fmt.Errorf("insert organization unit: %w", err)
+	}
+	return nil
+}
+
+func (repository *PostgresRepository) GetOrganization(ctx context.Context, tx pgx.Tx, id uuid.UUID) (OrganizationUnit, error) {
+	if repository == nil || repository.pool == nil || id == uuid.Nil {
+		return OrganizationUnit{}, ErrOrganizationNotFound
+	}
+	query := organizationSelect + " WHERE id = $1"
+	queryer := iamQueryer(repository.pool)
+	if tx != nil {
+		query += " FOR UPDATE"
+		queryer = tx
+	}
+	return scanOrganization(queryer.QueryRow(ctx, query, id))
+}
+
+func (repository *PostgresRepository) ListOrganizations(ctx context.Context, page Page) (OrganizationPage, error) {
+	if repository == nil || repository.pool == nil {
+		return OrganizationPage{}, ErrIAMConfiguration
+	}
+	limit, err := pageLimit(page)
+	if err != nil {
+		return OrganizationPage{}, err
+	}
+	rows, err := repository.pool.Query(ctx, organizationSelect+`
+WHERE ($1::timestamptz IS NULL OR (created_at, id) < ($1, $2))
+ORDER BY created_at DESC, id DESC
+LIMIT $3`, nullableTime(page.BeforeTime), page.BeforeID, limit+1)
+	if err != nil {
+		return OrganizationPage{}, fmt.Errorf("list organization units: %w", err)
+	}
+	defer rows.Close()
+	items := make([]OrganizationUnit, 0, limit+1)
+	for rows.Next() {
+		item, scanErr := scanOrganization(rows)
+		if scanErr != nil {
+			return OrganizationPage{}, scanErr
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return OrganizationPage{}, fmt.Errorf("iterate organization units: %w", err)
+	}
+	result := OrganizationPage{Items: items}
+	if len(items) > limit {
+		last := items[limit-1]
+		result.Items, result.NextCursor = items[:limit], encodeIAMCursor(last.CreatedAt, last.ID)
+	}
+	return result, nil
+}
+
+func (repository *PostgresRepository) InsertRoleBinding(ctx context.Context, tx pgx.Tx, binding RoleBinding) error {
+	if tx == nil || binding.ID == uuid.Nil || binding.Version != 1 {
+		return ErrIAMConfiguration
+	}
+	_, err := tx.Exec(ctx, `
+INSERT INTO role_bindings (id, subject_type, subject_id, role_name, scope_type, product_id, channel_name, effect, valid_from, valid_until, created_by, version, created_at, updated_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`, binding.ID, binding.SubjectType, binding.SubjectID, binding.Role, binding.ScopeType, nullableString(binding.ProductID), nullableString(binding.ChannelName), binding.Effect, binding.ValidFrom.UTC(), nullableTime(binding.ValidUntil), binding.CreatedBy, binding.Version, binding.CreatedAt.UTC(), binding.UpdatedAt.UTC())
+	if err != nil {
+		return fmt.Errorf("insert role binding: %w", err)
+	}
+	return nil
+}
+
+func (repository *PostgresRepository) GetRoleBinding(ctx context.Context, tx pgx.Tx, id uuid.UUID) (RoleBinding, error) {
+	if repository == nil || repository.pool == nil || id == uuid.Nil {
+		return RoleBinding{}, ErrRoleBindingNotFound
+	}
+	query := roleBindingSelect + " WHERE id = $1"
+	queryer := iamQueryer(repository.pool)
+	if tx != nil {
+		query += " FOR UPDATE"
+		queryer = tx
+	}
+	return scanRoleBinding(queryer.QueryRow(ctx, query, id))
+}
+
+func (repository *PostgresRepository) ListRoleBindings(ctx context.Context, page Page) (RoleBindingPage, error) {
+	if repository == nil || repository.pool == nil {
+		return RoleBindingPage{}, ErrIAMConfiguration
+	}
+	limit, err := pageLimit(page)
+	if err != nil {
+		return RoleBindingPage{}, err
+	}
+	rows, err := repository.pool.Query(ctx, roleBindingSelect+`
+WHERE ($1::timestamptz IS NULL OR (created_at, id) < ($1, $2))
+ORDER BY created_at DESC, id DESC
+LIMIT $3`, nullableTime(page.BeforeTime), page.BeforeID, limit+1)
+	if err != nil {
+		return RoleBindingPage{}, fmt.Errorf("list role bindings: %w", err)
+	}
+	defer rows.Close()
+	items := make([]RoleBinding, 0, limit+1)
+	for rows.Next() {
+		item, scanErr := scanRoleBinding(rows)
+		if scanErr != nil {
+			return RoleBindingPage{}, scanErr
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return RoleBindingPage{}, fmt.Errorf("iterate role bindings: %w", err)
+	}
+	result := RoleBindingPage{Items: items}
+	if len(items) > limit {
+		last := items[limit-1]
+		result.Items, result.NextCursor = items[:limit], encodeIAMCursor(last.CreatedAt, last.ID)
+	}
+	return result, nil
+}
+
+func (repository *PostgresRepository) DeleteRoleBinding(ctx context.Context, tx pgx.Tx, id uuid.UUID, expectedVersion int64) error {
+	if tx == nil || id == uuid.Nil || expectedVersion < 1 {
+		return ErrIAMConfiguration
+	}
+	result, err := tx.Exec(ctx, `DELETE FROM role_bindings WHERE id = $1 AND version = $2`, id, expectedVersion)
+	if err != nil {
+		return fmt.Errorf("delete role binding: %w", err)
+	}
+	if result.RowsAffected() != 1 {
+		return ErrIAMConflict
+	}
+	return nil
+}
+
+func (repository *PostgresRepository) InsertIdentitySource(ctx context.Context, tx pgx.Tx, source IdentitySource) error {
+	if tx == nil || source.ID == uuid.Nil || source.Status != IdentitySourceStatusDraft || source.Version != 1 {
+		return ErrIAMConfiguration
+	}
+	_, err := tx.Exec(ctx, `
+INSERT INTO identity_sources (id, name, source_kind, status, secret_reference, required_mappings_complete, verified_at, previewed_at, fault_code, version, created_at, updated_at)
+VALUES ($1, $2, $3, 'draft', $4, $5, NULL, NULL, '', 1, $6, $7)`, source.ID, source.Name, source.Kind, source.SecretReference, source.RequiredMappingsComplete, source.CreatedAt.UTC(), source.UpdatedAt.UTC())
+	if err != nil {
+		var postgresError *pgconn.PgError
+		if errors.As(err, &postgresError) && postgresError.Code == "23505" {
+			return ErrIAMConflict
+		}
+		return fmt.Errorf("insert identity source: %w", err)
+	}
+	return nil
+}
+
+func (repository *PostgresRepository) ListIdentitySources(ctx context.Context, page Page) (IdentitySourcePage, error) {
+	if repository == nil || repository.pool == nil {
+		return IdentitySourcePage{}, ErrIAMConfiguration
+	}
+	limit, err := pageLimit(page)
+	if err != nil {
+		return IdentitySourcePage{}, err
+	}
+	rows, err := repository.pool.Query(ctx, identitySourceSelect+`
+WHERE ($1::timestamptz IS NULL OR (created_at, id) < ($1, $2))
+ORDER BY created_at DESC, id DESC
+LIMIT $3`, nullableTime(page.BeforeTime), page.BeforeID, limit+1)
+	if err != nil {
+		return IdentitySourcePage{}, fmt.Errorf("list identity sources: %w", err)
+	}
+	defer rows.Close()
+	items := make([]IdentitySource, 0, limit+1)
+	for rows.Next() {
+		item, scanErr := scanIdentitySource(rows)
+		if scanErr != nil {
+			return IdentitySourcePage{}, scanErr
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return IdentitySourcePage{}, fmt.Errorf("iterate identity sources: %w", err)
+	}
+	result := IdentitySourcePage{Items: items}
+	if len(items) > limit {
+		last := items[limit-1]
+		result.Items, result.NextCursor = items[:limit], encodeIAMCursor(last.CreatedAt, last.ID)
+	}
+	return result, nil
+}
+
+func (repository *PostgresRepository) UpdateIdentitySourceDraft(ctx context.Context, tx pgx.Tx, source IdentitySource, expectedVersion int64) error {
+	if tx == nil || source.ID == uuid.Nil || expectedVersion < 1 || source.Version != expectedVersion+1 {
+		return ErrIAMConfiguration
+	}
+	result, err := tx.Exec(ctx, `
+UPDATE identity_sources SET name = $2, secret_reference = $3, required_mappings_complete = $4, version = $5, updated_at = $6
+WHERE id = $1 AND status = 'draft' AND version = $7`, source.ID, source.Name, source.SecretReference, source.RequiredMappingsComplete, source.Version, source.UpdatedAt.UTC(), expectedVersion)
+	if err != nil {
+		return fmt.Errorf("update identity source draft: %w", err)
+	}
+	if result.RowsAffected() != 1 {
+		return ErrIAMConflict
+	}
+	return nil
+}
+
 const userColumns = `user_record.id, COALESCE(user_record.identity_source_id, '00000000-0000-0000-0000-000000000000'::uuid),
        external_subject, username, display_name, email, user_kind, status, mfa_enrolled,
        credential_rotated_at, version, created_at, updated_at, disabled_at, disabled_reason
 `
 
 const userSelect = `SELECT ` + userColumns + ` FROM user_principals AS user_record`
+
+const organizationSelect = `SELECT id, COALESCE(identity_source_id, '00000000-0000-0000-0000-000000000000'::uuid), external_id,
+       COALESCE(parent_id, '00000000-0000-0000-0000-000000000000'::uuid), name, source_owned, status, version, created_at, updated_at
+FROM organization_units`
+
+const roleBindingSelect = `SELECT id, subject_type, subject_id, role_name, scope_type, COALESCE(product_id, ''), COALESCE(channel_name, ''), effect,
+       valid_from, valid_until, created_by, version, created_at, updated_at
+FROM role_bindings`
+
+const identitySourceSelect = `SELECT id, name, source_kind, status, secret_reference, required_mappings_complete,
+       verified_at, previewed_at, fault_code, version, created_at, updated_at
+FROM identity_sources`
 
 type iamQueryer interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
@@ -316,6 +532,53 @@ func scanUser(row pgx.Row) (UserPrincipal, error) {
 		user.DisabledAt = disabledAt.UTC()
 	}
 	return user, nil
+}
+
+func scanOrganization(row pgx.Row) (OrganizationUnit, error) {
+	var organization OrganizationUnit
+	err := row.Scan(&organization.ID, &organization.IdentitySourceID, &organization.ExternalID, &organization.ParentID, &organization.Name, &organization.SourceOwned, &organization.Status, &organization.Version, &organization.CreatedAt, &organization.UpdatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return OrganizationUnit{}, ErrOrganizationNotFound
+	}
+	if err != nil {
+		return OrganizationUnit{}, fmt.Errorf("scan organization unit: %w", err)
+	}
+	return organization, nil
+}
+
+func scanRoleBinding(row pgx.Row) (RoleBinding, error) {
+	var binding RoleBinding
+	var validUntil *time.Time
+	err := row.Scan(&binding.ID, &binding.SubjectType, &binding.SubjectID, &binding.Role, &binding.ScopeType, &binding.ProductID, &binding.ChannelName, &binding.Effect, &binding.ValidFrom, &validUntil, &binding.CreatedBy, &binding.Version, &binding.CreatedAt, &binding.UpdatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return RoleBinding{}, ErrRoleBindingNotFound
+	}
+	if err != nil {
+		return RoleBinding{}, fmt.Errorf("scan role binding: %w", err)
+	}
+	if validUntil != nil {
+		binding.ValidUntil = validUntil.UTC()
+	}
+	return binding, nil
+}
+
+func scanIdentitySource(row pgx.Row) (IdentitySource, error) {
+	var source IdentitySource
+	var verifiedAt, previewedAt *time.Time
+	err := row.Scan(&source.ID, &source.Name, &source.Kind, &source.Status, &source.SecretReference, &source.RequiredMappingsComplete, &verifiedAt, &previewedAt, &source.FaultCode, &source.Version, &source.CreatedAt, &source.UpdatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return IdentitySource{}, ErrIdentitySourceNotFound
+	}
+	if err != nil {
+		return IdentitySource{}, fmt.Errorf("scan identity source: %w", err)
+	}
+	if verifiedAt != nil {
+		source.VerifiedAt = verifiedAt.UTC()
+	}
+	if previewedAt != nil {
+		source.PreviewedAt = previewedAt.UTC()
+	}
+	return source, nil
 }
 
 func scanLocalAuthentication(row pgx.Row) (UserPrincipal, LocalCredential, error) {
@@ -357,4 +620,26 @@ func nullableTime(value time.Time) any {
 		return nil
 	}
 	return value.UTC()
+}
+
+func nullableUUID(value uuid.UUID) any {
+	if value == uuid.Nil {
+		return nil
+	}
+	return value
+}
+func nullableString(value string) any {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	return strings.TrimSpace(value)
+}
+func pageLimit(page Page) (int, error) {
+	if !validIAMPage(page) {
+		return 0, ErrPageInvalid
+	}
+	if page.Limit == 0 {
+		return 50, nil
+	}
+	return page.Limit, nil
 }
