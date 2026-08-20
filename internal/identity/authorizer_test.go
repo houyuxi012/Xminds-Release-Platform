@@ -81,6 +81,20 @@ func TestAuditorCannotPerformReleaseWrite(t *testing.T) {
 	}
 }
 
+func TestViewerCanReadScopedProductButCannotWrite(t *testing.T) {
+	t.Parallel()
+
+	principal := Principal{
+		Subject: "viewer-1", Kind: PrincipalKindHuman, Roles: []Role{RoleViewer}, ProductIDs: []string{"product-a"},
+	}
+	if err := NewAuthorizer().Require(principal, ActionProductRead, "product-a"); err != nil {
+		t.Fatalf("viewer product read error = %v", err)
+	}
+	if err := NewAuthorizer().Require(principal, ActionReleaseCreate, "product-a"); !errors.Is(err, ErrActionDenied) {
+		t.Fatalf("viewer release create error = %v", err)
+	}
+}
+
 func TestLocalAdminIsDevelopmentOnly(t *testing.T) {
 	t.Parallel()
 

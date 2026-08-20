@@ -61,6 +61,9 @@ func NewAuthorizer() *Authorizer {
 			ActionProductRead,
 			ActionAuditRead,
 		),
+		RoleViewer: actionSet(
+			ActionProductRead,
+		),
 	}}
 }
 

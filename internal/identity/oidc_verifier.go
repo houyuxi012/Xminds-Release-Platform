@@ -226,7 +226,7 @@ func decodeRoles(claims map[string]json.RawMessage, name string) ([]Role, error)
 	for _, value := range values {
 		role := Role(value)
 		switch role {
-		case RoleAdmin, RolePublisher, RoleApprover, RoleAuditor:
+		case RoleAdmin, RolePublisher, RoleApprover, RoleAuditor, RoleViewer:
 			roles = append(roles, role)
 		default:
 			return nil, fmt.Errorf("%w: %s", ErrUnknownRole, value)

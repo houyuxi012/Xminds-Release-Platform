@@ -29,6 +29,7 @@ const (
 	RolePublisher Role = "publisher"
 	RoleApprover  Role = "approver"
 	RoleAuditor   Role = "auditor"
+	RoleViewer    Role = "viewer"
 )
 
 var (

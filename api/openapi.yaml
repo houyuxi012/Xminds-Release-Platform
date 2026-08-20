@@ -2096,7 +2096,7 @@ components:
           type: array
           items:
             type: string
-            enum: [admin, publisher, approver, auditor]
+            enum: [admin, publisher, approver, auditor, viewer]
         actor_product_ids:
           type: array
           items:
