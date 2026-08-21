@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"xminds-release-platform/internal/iam"
 	"xminds-release-platform/internal/identity"
@@ -43,12 +44,13 @@ func TestLoadAPIRuntimeConfigRejectsMissingPublicDistributionSettings(t *testing
 	t.Parallel()
 
 	base := map[string]string{
-		"XMINDS_RELEASE_OBJECT_STORE_ACCESS_KEY":           "access-key",
-		"XMINDS_RELEASE_OBJECT_STORE_SECRET_KEY":           "secret-key",
-		"XMINDS_RELEASE_DEFAULT_PRODUCT_ID":                "ngep",
-		"XMINDS_RELEASE_DEFAULT_CHANNEL":                   "stable",
-		"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY":          t.TempDir(),
-		"XMINDS_RELEASE_IAM_USE_DEVELOPMENT_BREACH_CORPUS": "true",
+		"XMINDS_RELEASE_OBJECT_STORE_ACCESS_KEY":             "access-key",
+		"XMINDS_RELEASE_OBJECT_STORE_SECRET_KEY":             "secret-key",
+		"XMINDS_RELEASE_DEFAULT_PRODUCT_ID":                  "ngep",
+		"XMINDS_RELEASE_DEFAULT_CHANNEL":                     "stable",
+		"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY":            t.TempDir(),
+		"XMINDS_RELEASE_IAM_MFA_ENROLLMENT_SECRET_DIRECTORY": t.TempDir(),
+		"XMINDS_RELEASE_IAM_USE_DEVELOPMENT_BREACH_CORPUS":   "true",
 	}
 	for _, key := range []string{
 		"XMINDS_RELEASE_OBJECT_STORE_ACCESS_KEY",
@@ -72,11 +74,12 @@ func TestLoadAPIRuntimeConfigRejectsMissingPublicDistributionSettings(t *testing
 func TestLoadAPIRuntimeConfigRejectsMissingProductionLocalAuthenticationSecurity(t *testing.T) {
 	t.Parallel()
 	_, err := loadAPIRuntimeConfig(map[string]string{
-		"XMINDS_RELEASE_OBJECT_STORE_ACCESS_KEY":  "access-key",
-		"XMINDS_RELEASE_OBJECT_STORE_SECRET_KEY":  "secret-key",
-		"XMINDS_RELEASE_DEFAULT_PRODUCT_ID":       "ngep",
-		"XMINDS_RELEASE_DEFAULT_CHANNEL":          "stable",
-		"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY": t.TempDir(),
+		"XMINDS_RELEASE_OBJECT_STORE_ACCESS_KEY":             "access-key",
+		"XMINDS_RELEASE_OBJECT_STORE_SECRET_KEY":             "secret-key",
+		"XMINDS_RELEASE_DEFAULT_PRODUCT_ID":                  "ngep",
+		"XMINDS_RELEASE_DEFAULT_CHANNEL":                     "stable",
+		"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY":            t.TempDir(),
+		"XMINDS_RELEASE_IAM_MFA_ENROLLMENT_SECRET_DIRECTORY": t.TempDir(),
 	}, "production")
 	if !errors.Is(err, errAPIRuntimeConfiguration) {
 		t.Fatalf("loadAPIRuntimeConfig() error = %v", err)
@@ -87,16 +90,17 @@ func TestLoadAPIRuntimeConfigParsesValidatedSettings(t *testing.T) {
 	t.Parallel()
 
 	configuration, err := loadAPIRuntimeConfig(map[string]string{
-		"XMINDS_RELEASE_OBJECT_STORE_ACCESS_KEY":           " access-key ",
-		"XMINDS_RELEASE_OBJECT_STORE_SECRET_KEY":           " secret-key ",
-		"XMINDS_RELEASE_OBJECT_STORE_REGION":               " cn-east-1 ",
-		"XMINDS_RELEASE_OBJECT_STORE_SESSION_TOKEN":        " session-token ",
-		"XMINDS_RELEASE_ENDPOINT_CA_DIRECTORY":             " /run/secrets/xminds-release/endpoint-cas ",
-		"XMINDS_RELEASE_ENDPOINT_ALLOWED_PRIVATE_CIDRS":    "10.42.7.0/24,fd12:3456:789a::/48",
-		"XMINDS_RELEASE_DEFAULT_PRODUCT_ID":                " ngep ",
-		"XMINDS_RELEASE_DEFAULT_CHANNEL":                   " stable ",
-		"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY":          " " + t.TempDir() + " ",
-		"XMINDS_RELEASE_IAM_USE_DEVELOPMENT_BREACH_CORPUS": "true",
+		"XMINDS_RELEASE_OBJECT_STORE_ACCESS_KEY":             " access-key ",
+		"XMINDS_RELEASE_OBJECT_STORE_SECRET_KEY":             " secret-key ",
+		"XMINDS_RELEASE_OBJECT_STORE_REGION":                 " cn-east-1 ",
+		"XMINDS_RELEASE_OBJECT_STORE_SESSION_TOKEN":          " session-token ",
+		"XMINDS_RELEASE_ENDPOINT_CA_DIRECTORY":               " /run/secrets/xminds-release/endpoint-cas ",
+		"XMINDS_RELEASE_ENDPOINT_ALLOWED_PRIVATE_CIDRS":      "10.42.7.0/24,fd12:3456:789a::/48",
+		"XMINDS_RELEASE_DEFAULT_PRODUCT_ID":                  " ngep ",
+		"XMINDS_RELEASE_DEFAULT_CHANNEL":                     " stable ",
+		"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY":            " " + t.TempDir() + " ",
+		"XMINDS_RELEASE_IAM_MFA_ENROLLMENT_SECRET_DIRECTORY": " " + t.TempDir() + " ",
+		"XMINDS_RELEASE_IAM_USE_DEVELOPMENT_BREACH_CORPUS":   "true",
 	}, "development")
 	if err != nil {
 		t.Fatalf("loadAPIRuntimeConfig() error = %v", err)
@@ -110,17 +114,89 @@ func TestLoadAPIRuntimeConfigParsesValidatedSettings(t *testing.T) {
 func TestLoadAPIRuntimeConfigRejectsUnsafeEndpointPrivateCIDR(t *testing.T) {
 	t.Parallel()
 	_, err := loadAPIRuntimeConfig(map[string]string{
-		"XMINDS_RELEASE_OBJECT_STORE_ACCESS_KEY":           "access-key",
-		"XMINDS_RELEASE_OBJECT_STORE_SECRET_KEY":           "secret-key",
-		"XMINDS_RELEASE_DEFAULT_PRODUCT_ID":                "ngep",
-		"XMINDS_RELEASE_DEFAULT_CHANNEL":                   "stable",
-		"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY":          t.TempDir(),
-		"XMINDS_RELEASE_IAM_USE_DEVELOPMENT_BREACH_CORPUS": "true",
-		"XMINDS_RELEASE_ENDPOINT_ALLOWED_PRIVATE_CIDRS":    "100.64.0.0/10",
+		"XMINDS_RELEASE_OBJECT_STORE_ACCESS_KEY":             "access-key",
+		"XMINDS_RELEASE_OBJECT_STORE_SECRET_KEY":             "secret-key",
+		"XMINDS_RELEASE_DEFAULT_PRODUCT_ID":                  "ngep",
+		"XMINDS_RELEASE_DEFAULT_CHANNEL":                     "stable",
+		"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY":            t.TempDir(),
+		"XMINDS_RELEASE_IAM_MFA_ENROLLMENT_SECRET_DIRECTORY": t.TempDir(),
+		"XMINDS_RELEASE_IAM_USE_DEVELOPMENT_BREACH_CORPUS":   "true",
+		"XMINDS_RELEASE_ENDPOINT_ALLOWED_PRIVATE_CIDRS":      "100.64.0.0/10",
 	}, "development")
 	if !errors.Is(err, errAPIRuntimeConfiguration) {
 		t.Fatalf("loadAPIRuntimeConfig() error=%v", err)
 	}
+}
+
+func TestRunMFASecretGCStopsBeforeSecretStoreShutdown(t *testing.T) {
+	t.Parallel()
+	repository := &blockingRuntimeMFASecretGCRepository{entered: make(chan struct{})}
+	worker, err := iam.NewMFASecretGCWorker(iam.MFASecretGCWorkerConfig{Repository: repository, Secrets: runtimeMFASecretStore{}, Clock: time.Now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runMFASecretGC(ctx, worker, time.Hour)
+	}()
+	select {
+	case <-repository.entered:
+	case <-time.After(time.Second):
+		t.Fatal("GC worker did not enter repository")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("GC worker did not stop after cancellation")
+	}
+}
+
+type blockingRuntimeMFASecretGCRepository struct{ entered chan struct{} }
+
+func (repository *blockingRuntimeMFASecretGCRepository) WithinTransaction(_ context.Context, function func(pgx.Tx) error) error {
+	return function(nil)
+}
+
+func (repository *blockingRuntimeMFASecretGCRepository) ListDueMFASecretGC(ctx context.Context, _ time.Time, _ int) ([]iam.MFASecretGCItem, error) {
+	close(repository.entered)
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (*blockingRuntimeMFASecretGCRepository) LeaseDueMFASecretGC(context.Context, pgx.Tx, string, time.Time, uuid.UUID, time.Time) (bool, error) {
+	return false, nil
+}
+func (*blockingRuntimeMFASecretGCRepository) CompleteMFASecretGC(context.Context, pgx.Tx, string, uuid.UUID) error {
+	return nil
+}
+func (*blockingRuntimeMFASecretGCRepository) FailMFASecretGC(context.Context, pgx.Tx, string, uuid.UUID, time.Time, string, time.Time) error {
+	return nil
+}
+func (*blockingRuntimeMFASecretGCRepository) LockMFASecretReference(context.Context, pgx.Tx, string) error {
+	return nil
+}
+func (*blockingRuntimeMFASecretGCRepository) MFASecretReferenceIsLive(context.Context, pgx.Tx, string, time.Time) (bool, error) {
+	return false, nil
+}
+func (*blockingRuntimeMFASecretGCRepository) MFASecretReferenceHasTombstone(context.Context, pgx.Tx, string) (bool, error) {
+	return false, nil
+}
+func (*blockingRuntimeMFASecretGCRepository) EnqueueMFASecretGC(context.Context, pgx.Tx, string, time.Time, time.Time) error {
+	return nil
+}
+
+type runtimeMFASecretStore struct{}
+
+func (runtimeMFASecretStore) Resolve(context.Context, string) ([]byte, error) { return nil, nil }
+func (runtimeMFASecretStore) Create(context.Context, uuid.UUID, string) (string, error) {
+	return "", nil
+}
+func (runtimeMFASecretStore) Delete(context.Context, string) error { return nil }
+func (runtimeMFASecretStore) ListOrphanCandidates(context.Context, time.Time, int) ([]string, error) {
+	return nil, nil
 }
 
 func TestManagementRoutesExposeProductAPIWithVerifiedPrincipal(t *testing.T) {

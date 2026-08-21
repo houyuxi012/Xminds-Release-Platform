@@ -129,14 +129,17 @@ go run ./apps/release-worker
 - `GET /health/ready`：PostgreSQL 就绪检查；
 - `GET /version`：构建版本信息；
 - `POST /api/v1/auth/local/activate`：一次性激活本地账户；
+- `POST /api/v1/auth/local/mfa-enrollments`：为待激活账户生成平台托管的 MFA seed 与 otpauth URI；
 - `POST /api/v1/auth/local/login`：本地账户登录；
 - `POST /api/v1/auth/emergency/login`：强制 MFA 的应急账户登录。
 
-上述 3 个认证入口不要求现有 Bearer，重认证挑战创建/完成和其他管理 API 仍在统一认证中间件之后。所有环境都必须配置绝对路径 `XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY`；生产、测试和预发环境还必须配置指向非可写 SHA-1/SHA-256 摘要文件的 `XMINDS_RELEASE_IAM_BREACH_CORPUS`，缺失时服务拒绝启动。仅显式 `development` 环境可通过 `XMINDS_RELEASE_IAM_USE_DEVELOPMENT_BREACH_CORPUS=true` 单独启用内置最小语料库；缺省环境、其他环境或与外部语料库同时配置时均拒绝启动。锁定阶段可通过 `XMINDS_RELEASE_IAM_LOCKOUT_STAGES=5:5m,8:30m,10:24h` 配置，次数和时长必须严格递增且满足运行时安全上下界。高风险挑战 TTL、evidence TTL、OIDC 新鲜度/时钟偏差、终态保留期和有界清理批次可通过 `.env.example` 中的 `XMINDS_RELEASE_IAM_REAUTH_*` 变量调整；越过安全边界的配置会导致服务拒绝启动。重认证 proof 绑定稳定的内部治理用户 ID；人员 proof 还精确绑定来源 ID，本地 proof 则使用独立的 local 绑定域，空来源从不作为通配。`000016` 会将无法可靠回填该绑定的既有活动 challenge 统一置为 `expired`。
+上述 4 个认证入口不要求现有 Bearer，重认证挑战创建/完成和其他管理 API 仍在统一认证中间件之后。所有环境必须分别配置绝对路径 `XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY` 和 `XMINDS_RELEASE_IAM_MFA_ENROLLMENT_SECRET_DIRECTORY`，两者不得指向同一目录；生产、测试和预发环境还必须配置指向非可写 SHA-1/SHA-256 摘要文件的 `XMINDS_RELEASE_IAM_BREACH_CORPUS`，缺失时服务拒绝启动。仅显式 `development` 环境可通过 `XMINDS_RELEASE_IAM_USE_DEVELOPMENT_BREACH_CORPUS=true` 单独启用内置最小语料库；缺省环境、其他环境或与外部语料库同时配置时均拒绝启动。锁定阶段可通过 `XMINDS_RELEASE_IAM_LOCKOUT_STAGES=5:5m,8:30m,10:24h` 配置，次数和时长必须严格递增且满足运行时安全上下界。高风险挑战 TTL、evidence TTL、OIDC 新鲜度/时钟偏差、终态保留期和有界清理批次可通过 `.env.example` 中的 `XMINDS_RELEASE_IAM_REAUTH_*` 变量调整；越过安全边界的配置会导致服务拒绝启动。重认证 proof 绑定稳定的内部治理用户 ID；人员 proof 还精确绑定来源 ID，本地 proof 则使用独立的 local 绑定域，空来源从不作为通配。`000016` 会将无法可靠回填该绑定的既有活动 challenge 统一置为 `expired`。
+
+MFA enrollment 根仅挂载给 API，由所有 API 副本以相同稳定 numeric UID 通过受信 RWX 卷共享，目录 owner-only 可写，生成文件为 `0400`；Worker 不挂载该根。若基础设施不能提供共享根，必须经同一 `MFASecretStore` 边界改用外部 Secret Manager，禁止每个副本使用独立本地盘。API 启动执行不记录 seed 的 create→resolve→delete 真实探针，任一步失败即拒绝启动。轮换与过期 Secret 经 PostgreSQL 持久 GC 队列、reference 锁、存活性复查和 token-bound lease 清理。旧 `secret://iam/` TOTP 在首次轮换后保留，不进入新根 GC，由独立旧根退役流程处理。
 
 ### 目录连接、活动 OIDC 与异步同步
 
-`XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY` 是 API 与 Worker 共享的受信任 IAM Secret 根（变量名为兼容已有部署保留）。目录必须是无符号链接的绝对路径，Secret 文件不得对 group/other 开放权限，单文件上限 4 KiB。数据库只保存 `secret://iam/<name>` 引用，不保存 Bearer、CA 或 Secret 内容。Secret 读取使用固定 4 个工作线程与 32 个等待槽位；调用方总超时可取消等待，即使底层 NFS/FUSE 打开操作卡住也不会按请求创建无界线程。关停时立即停止接单并以稳定错误释放队列请求，不等待无法取消的底层系统调用；受信任根目录描述符只会在固定工作线程真正退出后异步关闭。每次读取都从同一个已固定目录描述符打开、校验并完整读取单个文件快照；卡住的底层 I/O 最多占满固定工作线程，运维应同时监控上游文件系统健康。OIDC 来源 Secret 为严格 JSON：
+`XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY` 是 API 与 Worker 共享的受信任旧 IAM Secret 只读根（变量名为兼容已有部署保留）；不得向 API 或 Worker 授予该根写权限。目录必须是无符号链接的绝对路径，Secret 文件不得对 group/other 开放权限，单文件上限 4 KiB。数据库只保存 `secret://iam/<name>` 引用，不保存 Bearer、CA 或 Secret 内容。Secret 读取使用固定 4 个工作线程与 32 个等待槽位；调用方总超时可取消等待，即使底层 NFS/FUSE 打开操作卡住也不会按请求创建无界线程。关停时立即停止接单并以稳定错误释放队列请求，不等待无法取消的底层系统调用；受信任根目录描述符只会在固定工作线程真正退出后异步关闭。每次读取都从同一个已固定目录描述符打开、校验并完整读取单个文件快照；卡住的底层 I/O 最多占满固定工作线程，运维应同时监控上游文件系统健康。OIDC 来源 Secret 为严格 JSON：
 
 ```json
 {

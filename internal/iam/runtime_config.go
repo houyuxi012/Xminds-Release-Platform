@@ -28,13 +28,16 @@ type DirectoryRuntimeConfig struct {
 }
 
 type LocalAuthRuntimeConfig struct {
-	BreachCorpusPath           string
-	UseDevelopmentBreachCorpus bool
-	MFASecretDirectory         string
-	Password                   PasswordPolicyConfig
-	TOTP                       TOTPConfig
-	Policy                     LocalAuthPolicy
-	Reauthentication           ReauthenticationPolicy
+	BreachCorpusPath             string
+	UseDevelopmentBreachCorpus   bool
+	MFASecretDirectory           string
+	MFAEnrollmentSecretDirectory string
+	MFAEnrollmentTTL             time.Duration
+	MFAIssuer                    string
+	Password                     PasswordPolicyConfig
+	TOTP                         TOTPConfig
+	Policy                       LocalAuthPolicy
+	Reauthentication             ReauthenticationPolicy
 }
 
 func LoadDirectoryRuntimeConfig(environ map[string]string, environment string) (DirectoryRuntimeConfig, error) {
@@ -104,8 +107,11 @@ func LoadDirectoryRuntimeConfig(environ map[string]string, environment string) (
 
 func LoadLocalAuthRuntimeConfig(environ map[string]string, environment string) (LocalAuthRuntimeConfig, error) {
 	configuration := LocalAuthRuntimeConfig{
-		BreachCorpusPath:   strings.TrimSpace(environ["XMINDS_RELEASE_IAM_BREACH_CORPUS"]),
-		MFASecretDirectory: strings.TrimSpace(environ["XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY"]),
+		BreachCorpusPath:             strings.TrimSpace(environ["XMINDS_RELEASE_IAM_BREACH_CORPUS"]),
+		MFASecretDirectory:           strings.TrimSpace(environ["XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY"]),
+		MFAEnrollmentSecretDirectory: strings.TrimSpace(environ["XMINDS_RELEASE_IAM_MFA_ENROLLMENT_SECRET_DIRECTORY"]),
+		MFAEnrollmentTTL:             10 * time.Minute,
+		MFAIssuer:                    "Xminds Release Platform",
 		Password: PasswordPolicyConfig{
 			MinimumLength: 16, MemoryKiB: 64 * 1024, Iterations: 3, Parallelism: 2, SaltBytes: 16, DerivedKeyBytes: 32,
 		},
@@ -130,10 +136,15 @@ func LoadLocalAuthRuntimeConfig(environ map[string]string, environment string) (
 	} else {
 		configuration.BreachCorpusPath = filepath.Clean(configuration.BreachCorpusPath)
 	}
-	if configuration.MFASecretDirectory == "" || !filepath.IsAbs(configuration.MFASecretDirectory) {
+	if configuration.MFASecretDirectory == "" || !filepath.IsAbs(configuration.MFASecretDirectory) ||
+		configuration.MFAEnrollmentSecretDirectory == "" || !filepath.IsAbs(configuration.MFAEnrollmentSecretDirectory) {
 		return LocalAuthRuntimeConfig{}, ErrLocalAuthRuntimeConfiguration
 	}
 	configuration.MFASecretDirectory = filepath.Clean(configuration.MFASecretDirectory)
+	configuration.MFAEnrollmentSecretDirectory = filepath.Clean(configuration.MFAEnrollmentSecretDirectory)
+	if configuration.MFASecretDirectory == configuration.MFAEnrollmentSecretDirectory {
+		return LocalAuthRuntimeConfig{}, ErrLocalAuthRuntimeConfiguration
+	}
 
 	var err error
 	configuration.Password.MinimumLength, err = optionalInt(environ, "XMINDS_RELEASE_IAM_PASSWORD_MIN_LENGTH", configuration.Password.MinimumLength)
@@ -217,6 +228,13 @@ func LoadLocalAuthRuntimeConfig(environ map[string]string, environment string) (
 	if algorithm := strings.TrimSpace(environ["XMINDS_RELEASE_IAM_TOTP_ALGORITHM"]); algorithm != "" {
 		configuration.TOTP.Algorithm = strings.ToUpper(algorithm)
 	}
+	configuration.MFAEnrollmentTTL, err = optionalDuration(environ, "XMINDS_RELEASE_IAM_MFA_ENROLLMENT_TTL", configuration.MFAEnrollmentTTL)
+	if err != nil {
+		return LocalAuthRuntimeConfig{}, err
+	}
+	if issuer := strings.TrimSpace(environ["XMINDS_RELEASE_IAM_MFA_ISSUER"]); issuer != "" {
+		configuration.MFAIssuer = issuer
+	}
 	configuration.Reauthentication.ChallengeTTL, err = optionalDuration(environ, "XMINDS_RELEASE_IAM_REAUTH_CHALLENGE_TTL", configuration.Reauthentication.ChallengeTTL)
 	if err != nil {
 		return LocalAuthRuntimeConfig{}, err
@@ -243,6 +261,7 @@ func LoadLocalAuthRuntimeConfig(environ map[string]string, environment string) (
 	}
 	if !validPasswordPolicy(configuration.Password) || !validLocalAuthPolicy(configuration.Policy) ||
 		!validReauthenticationPolicy(configuration.Reauthentication) ||
+		configuration.MFAEnrollmentTTL < 5*time.Minute || configuration.MFAEnrollmentTTL > 15*time.Minute || !validMFATOTPIssuer(configuration.MFAIssuer) ||
 		(configuration.TOTP.Digits != 6 && configuration.TOTP.Digits != 8) || configuration.TOTP.Skew < 0 || configuration.TOTP.Skew > 2 ||
 		configuration.TOTP.Period < 30*time.Second || configuration.TOTP.Period > 2*time.Minute ||
 		(configuration.TOTP.Algorithm != "SHA1" && configuration.TOTP.Algorithm != "SHA256") {

@@ -134,6 +134,95 @@ func TestOpenAPIDefinesStrictLocalUserProvisioningAndReadContracts(t *testing.T)
 	}
 }
 
+func TestOpenAPIDefinesStrictMFAAndEmergencyLifecycleContracts(t *testing.T) {
+	t.Parallel()
+	loader := openapi3.NewLoader()
+	document, err := loader.LoadFromFile("openapi.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := document.Validate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for _, operation := range []struct {
+		path       string
+		operation  string
+		status     string
+		response   string
+		management bool
+	}{
+		{path: "/api/v1/auth/local/mfa-enrollments", operation: "beginLocalActivationMFAEnrollment", status: "201", response: "#/components/schemas/MFAEnrollmentStartResponse"},
+		{path: "/api/v1/auth/local/activate", operation: "activateLocalAccount", status: "200", response: "#/components/schemas/MFAActivationResponse"},
+		{path: "/api/v1/users/{user_id}/mfa/enrollments", operation: "beginUserMFARotation", status: "201", response: "#/components/schemas/MFAEnrollmentStartResponse", management: true},
+		{path: "/api/v1/users/{user_id}/mfa/enrollments/{enrollment_id}/confirm", operation: "confirmUserMFARotation", status: "200", response: "#/components/schemas/MFAActivationResponse", management: true},
+		{path: "/api/v1/users/{user_id}/mfa/recovery-codes/regenerate", operation: "regenerateUserMFARecoveryCodes", status: "200", response: "#/components/schemas/MFAActivationResponse", management: true},
+		{path: "/api/v1/emergency-users", operation: "provisionEmergencyUser", status: "201", response: "#/components/schemas/LocalUserProvisioning", management: true},
+		{path: "/api/v1/emergency-users/{user_id}/activation-token/reissue", operation: "reissueEmergencyUserActivation", status: "200", response: "#/components/schemas/LocalUserProvisioning", management: true},
+	} {
+		path := document.Paths.Find(operation.path)
+		if path == nil || path.Post == nil || path.Post.OperationID != operation.operation {
+			t.Fatalf("missing POST %s (%s)", operation.path, operation.operation)
+		}
+		response := path.Post.Responses.Value(operation.status)
+		assertResponseSchema(t, operation.operation, response, operation.response)
+		if header := response.Value.Headers["Cache-Control"]; header == nil || header.Value == nil || header.Value.Schema == nil || header.Value.Schema.Value == nil || header.Value.Schema.Value.Const != "no-store" {
+			t.Errorf("%s success must declare Cache-Control: no-store", operation.operation)
+		}
+		if operation.management {
+			if path.Post.Extensions["x-required-action"] != "identity.manage" {
+				t.Errorf("%s must require identity.manage", operation.operation)
+			}
+			for _, status := range []string{"400", "401", "403", "404", "409", "429", "500"} {
+				assertProblemResponse(t, operation.operation, status, path.Post.Responses.Value(status))
+			}
+		}
+	}
+
+	for name, required := range map[string][]string{
+		"BeginActivationMFAEnrollmentRequest": {"activation_token"},
+		"BeginMFARotationRequest":             {"version", "reason", "reauthentication"},
+		"ConfirmMFARotationRequest":           {"version", "mfa_proof", "reason"},
+		"RegenerateMFARecoveryCodesRequest":   {"version", "reason", "reauthentication"},
+		"CreateEmergencyUserRequest":          {"username", "display_name", "reason", "reauthentication"},
+		"ReissueEmergencyActivationRequest":   {"version", "reason", "reauthentication"},
+	} {
+		assertStrictRequiredSchema(t, name, document.Components.Schemas[name], required)
+	}
+	start := document.Components.Schemas["MFAEnrollmentStartResponse"]
+	assertStrictRequiredSchema(t, "MFAEnrollmentStartResponse", start, []string{"id", "secret", "otpauth_uri", "expires_at"})
+	for _, property := range []string{"secret", "otpauth_uri"} {
+		if value := start.Value.Properties[property]; value == nil || value.Value == nil || !value.Value.ReadOnly || value.Value.WriteOnly {
+			t.Errorf("MFAEnrollmentStartResponse.%s must be readOnly", property)
+		}
+	}
+	activation := document.Components.Schemas["MFAActivationResponse"]
+	assertStrictRequiredSchema(t, "MFAActivationResponse", activation, []string{"recovery_codes"})
+	if codes := activation.Value.Properties["recovery_codes"]; codes == nil || codes.Value == nil || !codes.Value.ReadOnly || codes.Value.MaxItems == nil || *codes.Value.MaxItems != 10 {
+		t.Errorf("MFAActivationResponse.recovery_codes must be readOnly and bounded to 10")
+	}
+	for schemaName, property := range map[string]string{
+		"BeginActivationMFAEnrollmentRequest": "activation_token",
+		"ActivateLocalAccountRequest":         "new_password",
+		"ConfirmMFARotationRequest":           "mfa_proof",
+		"LocalLoginRequest":                   "recovery_code",
+	} {
+		schema := document.Components.Schemas[schemaName]
+		value := schema.Value.Properties[property]
+		if value == nil || value.Value == nil || !value.Value.WriteOnly || value.Value.ReadOnly {
+			t.Errorf("%s.%s must be writeOnly", schemaName, property)
+		}
+	}
+	if _, exposed := document.Components.Schemas["CompleteReauthenticationChallengeRequest"].Value.Properties["recovery_code"]; exposed {
+		t.Error("reauthentication request must never accept recovery_code")
+	}
+	problem := document.Components.Schemas["ProblemDetails"]
+	for _, sensitive := range []string{"secret", "otpauth_uri", "recovery_codes", "activation_token", "password", "mfa_proof", "recovery_code"} {
+		if _, exposed := problem.Value.Properties[sensitive]; exposed {
+			t.Errorf("ProblemDetails exposes %s", sensitive)
+		}
+	}
+}
+
 func assertStrictRequiredSchema(t *testing.T, name string, schema *openapi3.SchemaRef, required []string) {
 	t.Helper()
 	if schema == nil || schema.Value == nil {

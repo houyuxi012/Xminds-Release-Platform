@@ -84,13 +84,15 @@ func TestLoadLocalAuthRuntimeConfigRequiresExplicitDevelopmentCorpusOptIn(t *tes
 		t.Fatalf("development without MFA directory error = %v", err)
 	}
 	secretDirectory := t.TempDir()
-	base := map[string]string{"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY": secretDirectory}
+	enrollmentDirectory := t.TempDir()
+	base := map[string]string{"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY": secretDirectory, "XMINDS_RELEASE_IAM_MFA_ENROLLMENT_SECRET_DIRECTORY": enrollmentDirectory}
 	if _, err := LoadLocalAuthRuntimeConfig(base, "development"); !errors.Is(err, ErrLocalAuthRuntimeConfiguration) {
 		t.Fatalf("implicit development corpus error = %v", err)
 	}
 	if _, err := LoadLocalAuthRuntimeConfig(map[string]string{
-		"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY":          secretDirectory,
-		"XMINDS_RELEASE_IAM_USE_DEVELOPMENT_BREACH_CORPUS": "true",
+		"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY":            secretDirectory,
+		"XMINDS_RELEASE_IAM_MFA_ENROLLMENT_SECRET_DIRECTORY": enrollmentDirectory,
+		"XMINDS_RELEASE_IAM_USE_DEVELOPMENT_BREACH_CORPUS":   "true",
 	}, ""); !errors.Is(err, ErrLocalAuthRuntimeConfiguration) {
 		t.Fatalf("missing environment with development opt-in error = %v", err)
 	}
@@ -99,17 +101,20 @@ func TestLoadLocalAuthRuntimeConfigRequiresExplicitDevelopmentCorpusOptIn(t *tes
 		environment string
 	}{
 		"production opt-in": {map[string]string{
-			"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY":          secretDirectory,
-			"XMINDS_RELEASE_IAM_USE_DEVELOPMENT_BREACH_CORPUS": "true",
+			"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY":            secretDirectory,
+			"XMINDS_RELEASE_IAM_MFA_ENROLLMENT_SECRET_DIRECTORY": enrollmentDirectory,
+			"XMINDS_RELEASE_IAM_USE_DEVELOPMENT_BREACH_CORPUS":   "true",
 		}, "production"},
 		"invalid boolean": {map[string]string{
-			"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY":          secretDirectory,
-			"XMINDS_RELEASE_IAM_USE_DEVELOPMENT_BREACH_CORPUS": "yes",
+			"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY":            secretDirectory,
+			"XMINDS_RELEASE_IAM_MFA_ENROLLMENT_SECRET_DIRECTORY": enrollmentDirectory,
+			"XMINDS_RELEASE_IAM_USE_DEVELOPMENT_BREACH_CORPUS":   "yes",
 		}, "development"},
 		"ambiguous sources": {map[string]string{
-			"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY":          secretDirectory,
-			"XMINDS_RELEASE_IAM_USE_DEVELOPMENT_BREACH_CORPUS": "true",
-			"XMINDS_RELEASE_IAM_BREACH_CORPUS":                 filepath.Join(t.TempDir(), "breaches.txt"),
+			"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY":            secretDirectory,
+			"XMINDS_RELEASE_IAM_MFA_ENROLLMENT_SECRET_DIRECTORY": enrollmentDirectory,
+			"XMINDS_RELEASE_IAM_USE_DEVELOPMENT_BREACH_CORPUS":   "true",
+			"XMINDS_RELEASE_IAM_BREACH_CORPUS":                   filepath.Join(t.TempDir(), "breaches.txt"),
 		}, "development"},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -119,13 +124,14 @@ func TestLoadLocalAuthRuntimeConfigRequiresExplicitDevelopmentCorpusOptIn(t *tes
 		})
 	}
 	configuration, err := LoadLocalAuthRuntimeConfig(map[string]string{
-		"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY":          secretDirectory,
-		"XMINDS_RELEASE_IAM_USE_DEVELOPMENT_BREACH_CORPUS": "true",
+		"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY":            secretDirectory,
+		"XMINDS_RELEASE_IAM_MFA_ENROLLMENT_SECRET_DIRECTORY": enrollmentDirectory,
+		"XMINDS_RELEASE_IAM_USE_DEVELOPMENT_BREACH_CORPUS":   "true",
 	}, "development")
 	if err != nil {
 		t.Fatalf("LoadLocalAuthRuntimeConfig() error = %v", err)
 	}
-	if !configuration.UseDevelopmentBreachCorpus || configuration.MFASecretDirectory != filepath.Clean(secretDirectory) {
+	if !configuration.UseDevelopmentBreachCorpus || configuration.MFASecretDirectory != filepath.Clean(secretDirectory) || configuration.MFAEnrollmentSecretDirectory != filepath.Clean(enrollmentDirectory) {
 		t.Fatalf("configuration = %+v", configuration)
 	}
 }
@@ -133,8 +139,9 @@ func TestLoadLocalAuthRuntimeConfigRequiresExplicitDevelopmentCorpusOptIn(t *tes
 func TestLoadLocalAuthRuntimeConfigRejectsUnsafePolicyOverrides(t *testing.T) {
 	t.Parallel()
 	base := map[string]string{
-		"XMINDS_RELEASE_IAM_BREACH_CORPUS":        filepath.Join(t.TempDir(), "breaches.txt"),
-		"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY": t.TempDir(),
+		"XMINDS_RELEASE_IAM_BREACH_CORPUS":                   filepath.Join(t.TempDir(), "breaches.txt"),
+		"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY":            t.TempDir(),
+		"XMINDS_RELEASE_IAM_MFA_ENROLLMENT_SECRET_DIRECTORY": t.TempDir(),
 	}
 	for key, value := range map[string]string{
 		"XMINDS_RELEASE_IAM_ACCOUNT_LIMIT":              "4",
@@ -173,14 +180,15 @@ func TestLoadLocalAuthRuntimeConfigRejectsUnsafePolicyOverrides(t *testing.T) {
 func TestLoadLocalAuthRuntimeConfigParsesBoundedPolicy(t *testing.T) {
 	t.Parallel()
 	configuration, err := LoadLocalAuthRuntimeConfig(map[string]string{
-		"XMINDS_RELEASE_IAM_BREACH_CORPUS":        filepath.Join(t.TempDir(), "breaches.txt"),
-		"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY": t.TempDir(),
-		"XMINDS_RELEASE_IAM_ACCOUNT_LIMIT":        "20",
-		"XMINDS_RELEASE_IAM_SESSION_IDLE":         "45m",
-		"XMINDS_RELEASE_IAM_TOTP_ALGORITHM":       "sha256",
-		"XMINDS_RELEASE_IAM_TOTP_PERIOD":          "60s",
-		"XMINDS_RELEASE_IAM_ARGON_ITERATIONS":     "4",
-		"XMINDS_RELEASE_IAM_LOCKOUT_STAGES":       "4:3m,7:20m,9:12h",
+		"XMINDS_RELEASE_IAM_BREACH_CORPUS":                   filepath.Join(t.TempDir(), "breaches.txt"),
+		"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY":            t.TempDir(),
+		"XMINDS_RELEASE_IAM_MFA_ENROLLMENT_SECRET_DIRECTORY": t.TempDir(),
+		"XMINDS_RELEASE_IAM_ACCOUNT_LIMIT":                   "20",
+		"XMINDS_RELEASE_IAM_SESSION_IDLE":                    "45m",
+		"XMINDS_RELEASE_IAM_TOTP_ALGORITHM":                  "sha256",
+		"XMINDS_RELEASE_IAM_TOTP_PERIOD":                     "60s",
+		"XMINDS_RELEASE_IAM_ARGON_ITERATIONS":                "4",
+		"XMINDS_RELEASE_IAM_LOCKOUT_STAGES":                  "4:3m,7:20m,9:12h",
 	}, "production")
 	if err != nil {
 		t.Fatalf("LoadLocalAuthRuntimeConfig() error = %v", err)
@@ -191,17 +199,58 @@ func TestLoadLocalAuthRuntimeConfigParsesBoundedPolicy(t *testing.T) {
 	}
 }
 
+func TestLoadLocalAuthRuntimeConfigRequiresIndependentBoundedEnrollmentSecretRoot(t *testing.T) {
+	t.Parallel()
+	legacyRoot := t.TempDir()
+	enrollmentRoot := t.TempDir()
+	base := map[string]string{
+		"XMINDS_RELEASE_IAM_BREACH_CORPUS":                   filepath.Join(t.TempDir(), "breaches.txt"),
+		"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY":            legacyRoot,
+		"XMINDS_RELEASE_IAM_MFA_ENROLLMENT_SECRET_DIRECTORY": enrollmentRoot,
+	}
+	for name, mutate := range map[string]func(map[string]string){
+		"missing enrollment root": func(values map[string]string) { delete(values, "XMINDS_RELEASE_IAM_MFA_ENROLLMENT_SECRET_DIRECTORY") },
+		"shared legacy root": func(values map[string]string) {
+			values["XMINDS_RELEASE_IAM_MFA_ENROLLMENT_SECRET_DIRECTORY"] = legacyRoot
+		},
+		"short ttl":      func(values map[string]string) { values["XMINDS_RELEASE_IAM_MFA_ENROLLMENT_TTL"] = "4m59s" },
+		"long ttl":       func(values map[string]string) { values["XMINDS_RELEASE_IAM_MFA_ENROLLMENT_TTL"] = "15m1s" },
+		"control issuer": func(values map[string]string) { values["XMINDS_RELEASE_IAM_MFA_ISSUER"] = "Xminds\nRelease" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			values := make(map[string]string, len(base)+1)
+			for key, value := range base {
+				values[key] = value
+			}
+			mutate(values)
+			if _, err := LoadLocalAuthRuntimeConfig(values, "production"); !errors.Is(err, ErrLocalAuthRuntimeConfiguration) {
+				t.Fatalf("LoadLocalAuthRuntimeConfig() error=%v", err)
+			}
+		})
+	}
+	base["XMINDS_RELEASE_IAM_MFA_ENROLLMENT_TTL"] = "12m"
+	base["XMINDS_RELEASE_IAM_MFA_ISSUER"] = "Xminds Enterprise Release"
+	configuration, err := LoadLocalAuthRuntimeConfig(base, "production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if configuration.MFAEnrollmentSecretDirectory != filepath.Clean(enrollmentRoot) || configuration.MFAEnrollmentTTL != 12*time.Minute || configuration.MFAIssuer != "Xminds Enterprise Release" {
+		t.Fatalf("configuration=%+v", configuration)
+	}
+}
+
 func TestLoadLocalAuthRuntimeConfigParsesBoundedReauthenticationPolicy(t *testing.T) {
 	t.Parallel()
 	configuration, err := LoadLocalAuthRuntimeConfig(map[string]string{
-		"XMINDS_RELEASE_IAM_BREACH_CORPUS":             filepath.Join(t.TempDir(), "breaches.txt"),
-		"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY":      t.TempDir(),
-		"XMINDS_RELEASE_IAM_REAUTH_CHALLENGE_TTL":      "6m",
-		"XMINDS_RELEASE_IAM_REAUTH_EVIDENCE_TTL":       "90s",
-		"XMINDS_RELEASE_IAM_REAUTH_OIDC_MAXIMUM_AGE":   "4m",
-		"XMINDS_RELEASE_IAM_REAUTH_ALLOWED_CLOCK_SKEW": "45s",
-		"XMINDS_RELEASE_IAM_REAUTH_TERMINAL_RETENTION": "48h",
-		"XMINDS_RELEASE_IAM_REAUTH_CLEANUP_BATCH_SIZE": "256",
+		"XMINDS_RELEASE_IAM_BREACH_CORPUS":                   filepath.Join(t.TempDir(), "breaches.txt"),
+		"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY":            t.TempDir(),
+		"XMINDS_RELEASE_IAM_MFA_ENROLLMENT_SECRET_DIRECTORY": t.TempDir(),
+		"XMINDS_RELEASE_IAM_REAUTH_CHALLENGE_TTL":            "6m",
+		"XMINDS_RELEASE_IAM_REAUTH_EVIDENCE_TTL":             "90s",
+		"XMINDS_RELEASE_IAM_REAUTH_OIDC_MAXIMUM_AGE":         "4m",
+		"XMINDS_RELEASE_IAM_REAUTH_ALLOWED_CLOCK_SKEW":       "45s",
+		"XMINDS_RELEASE_IAM_REAUTH_TERMINAL_RETENTION":       "48h",
+		"XMINDS_RELEASE_IAM_REAUTH_CLEANUP_BATCH_SIZE":       "256",
 	}, "production")
 	if err != nil {
 		t.Fatalf("LoadLocalAuthRuntimeConfig() error = %v", err)
@@ -218,8 +267,9 @@ func TestLoadLocalAuthRuntimeConfigParsesBoundedReauthenticationPolicy(t *testin
 func TestLoadLocalAuthRuntimeConfigRejectsUnsafeReauthenticationPolicy(t *testing.T) {
 	t.Parallel()
 	base := map[string]string{
-		"XMINDS_RELEASE_IAM_BREACH_CORPUS":        filepath.Join(t.TempDir(), "breaches.txt"),
-		"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY": t.TempDir(),
+		"XMINDS_RELEASE_IAM_BREACH_CORPUS":                   filepath.Join(t.TempDir(), "breaches.txt"),
+		"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY":            t.TempDir(),
+		"XMINDS_RELEASE_IAM_MFA_ENROLLMENT_SECRET_DIRECTORY": t.TempDir(),
 	}
 	for key, value := range map[string]string{
 		"XMINDS_RELEASE_IAM_REAUTH_CHALLENGE_TTL":      "30s",

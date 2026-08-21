@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/base32"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
@@ -84,7 +86,17 @@ type ActivationRepository interface {
 	SaveActivation(ctx context.Context, tx pgx.Tx, user UserPrincipal, credential LocalCredential, history PasswordDigest, expectedVersion int64) error
 }
 
+type MFAActivationRepository interface {
+	GetMFAActivationPreflight(ctx context.Context, activationDigest string, enrollmentID uuid.UUID) (MFAEnrollment, error)
+	GetMFAEnrollmentForUpdate(ctx context.Context, tx pgx.Tx, enrollmentID uuid.UUID) (MFAEnrollment, error)
+	LockMFASecretReference(ctx context.Context, tx pgx.Tx, reference string) error
+	MFASecretReferenceHasTombstone(ctx context.Context, tx pgx.Tx, reference string) (bool, error)
+	ConfirmMFAEnrollment(ctx context.Context, tx pgx.Tx, enrollmentID uuid.UUID, expectedVersion int64, confirmedAt time.Time) error
+	ReplaceMFARecoveryCodes(ctx context.Context, tx pgx.Tx, userID, generationID uuid.UUID, digests []string, createdAt time.Time) error
+}
+
 type LoginRepository interface {
+	FindLoginPreflight(ctx context.Context, canonicalUsername string) (LoginState, UserPrincipal, LocalCredential, bool, error)
 	FindLogin(ctx context.Context, tx pgx.Tx, canonicalUsername string) (LoginState, UserPrincipal, LocalCredential, bool, error)
 	ConsumeRateLimit(ctx context.Context, tx pgx.Tx, scope RateLimitScope, keyDigest string, windowStart time.Time, limit int, expiresAt time.Time) (bool, error)
 	CleanupExpiredRateLimits(ctx context.Context, tx pgx.Tx, before time.Time, limit int) (int64, error)
@@ -92,7 +104,12 @@ type LoginRepository interface {
 	SaveAuthenticationSuccess(ctx context.Context, tx pgx.Tx, userID uuid.UUID, mfaCounter int64, session Session) error
 }
 
+type MFARecoveryRepository interface {
+	ConsumeMFARecoveryCode(ctx context.Context, tx pgx.Tx, userID uuid.UUID, digest string, usedAt time.Time) (bool, error)
+}
+
 type LocalReauthenticationRepository interface {
+	FindLocalReauthenticationPreflight(ctx context.Context, canonicalUsername string, sessionID uuid.UUID) (LoginState, UserPrincipal, LocalCredential, Session, bool, error)
 	FindLocalReauthentication(ctx context.Context, tx pgx.Tx, canonicalUsername string, sessionID uuid.UUID) (LoginState, UserPrincipal, LocalCredential, Session, bool, error)
 	SaveReauthenticationSuccess(ctx context.Context, tx pgx.Tx, userID uuid.UUID, mfaCounter int64) error
 }
@@ -111,6 +128,8 @@ type LocalAuthService struct {
 	repository       ActivationRepository
 	login            LoginRepository
 	reauthentication LocalReauthenticationRepository
+	mfaActivation    MFAActivationRepository
+	mfaRecovery      MFARecoveryRepository
 	auditor          AuditAppender
 	passwords        PasswordService
 	dummyPassword    PasswordDigest
@@ -122,7 +141,9 @@ type LocalAuthService struct {
 func NewLocalAuthService(config LocalAuthConfig) (*LocalAuthService, error) {
 	login, ok := config.Repository.(LoginRepository)
 	reauthentication, reauthenticationOK := config.Repository.(LocalReauthenticationRepository)
-	if config.Repository == nil || !ok || !reauthenticationOK || config.Auditor == nil || config.Passwords == nil || config.MFA == nil || config.Clock == nil || !validLocalAuthPolicy(config.Policy) {
+	mfaActivation, mfaActivationOK := config.Repository.(MFAActivationRepository)
+	mfaRecovery, mfaRecoveryOK := config.Repository.(MFARecoveryRepository)
+	if config.Repository == nil || !ok || !reauthenticationOK || !mfaActivationOK || !mfaRecoveryOK || config.Auditor == nil || config.Passwords == nil || config.MFA == nil || config.Clock == nil || !validLocalAuthPolicy(config.Policy) {
 		return nil, ErrIAMConfiguration
 	}
 	if _, _, _, _, err := parsePasswordDigest(config.DummyPassword); err != nil {
@@ -130,7 +151,7 @@ func NewLocalAuthService(config LocalAuthConfig) (*LocalAuthService, error) {
 	}
 	return &LocalAuthService{
 		repository: config.Repository, login: login, reauthentication: reauthentication, auditor: config.Auditor, passwords: config.Passwords,
-		dummyPassword: config.DummyPassword, mfa: config.MFA, policy: cloneLocalAuthPolicy(config.Policy), clock: config.Clock,
+		dummyPassword: config.DummyPassword, mfa: config.MFA, mfaActivation: mfaActivation, mfaRecovery: mfaRecovery, policy: cloneLocalAuthPolicy(config.Policy), clock: config.Clock,
 	}, nil
 }
 
@@ -139,31 +160,240 @@ type localFactorResult struct {
 	authenticationFailed bool
 	reasonCode           string
 	mfaCounter           int64
+	factorType           string
 }
 
-func (service *LocalAuthService) verifyLocalFactors(ctx context.Context, user UserPrincipal, credential LocalCredential, administrator, eligible bool, password, mfaProof string) localFactorResult {
+type localLoginPreflight struct {
+	state         LoginState
+	user          UserPrincipal
+	credential    LocalCredential
+	administrator bool
+	eligible      bool
+	passwordValid bool
+	mfaAssertion  MFAAssertion
+	mfaError      error
+}
+
+type localReauthenticationPreflight struct {
+	state         LoginState
+	user          UserPrincipal
+	credential    LocalCredential
+	session       Session
+	administrator bool
+	eligible      bool
+	passwordValid bool
+	mfaAssertion  MFAAssertion
+	mfaError      error
+}
+
+func (service *LocalAuthService) verifyLocalFactors(preflight localReauthenticationPreflight, user UserPrincipal, credential LocalCredential, session Session, administrator, eligible bool, mfaProof string) localFactorResult {
 	result := localFactorResult{authenticated: eligible, reasonCode: "CREDENTIAL_INVALID"}
-	passwordDigest := service.dummyPassword
-	if eligible {
-		passwordDigest = credential.Password
-	}
-	if passwordErr := service.passwords.Verify(password, passwordDigest); eligible && passwordErr != nil {
+	if eligible && (!preflight.passwordValid || !sameLocalReauthenticationPreflight(preflight, user, credential, session, administrator)) {
 		result.authenticated, result.authenticationFailed, result.reasonCode = false, true, "CREDENTIAL_INVALID"
 	}
-	requiresMFA := user.Kind == UserKindEmergency || administrator
+	requiresMFA := user.MFAEnrolled || user.Kind == UserKindEmergency || administrator
 	if result.authenticated && requiresMFA {
 		if !user.MFAEnrolled || credential.MFASecretReference == "" || strings.TrimSpace(mfaProof) == "" {
 			result.authenticated, result.authenticationFailed, result.reasonCode = false, true, "MFA_REQUIRED"
 		} else {
-			assertion, verifyErr := service.mfa.Verify(ctx, credential.MFASecretReference, mfaProof)
-			if verifyErr != nil || assertion.Counter <= credential.MFALastCounter {
+			assertion := preflight.mfaAssertion
+			if preflight.mfaError != nil || assertion.Counter <= credential.MFALastCounter {
 				result.authenticated, result.authenticationFailed, result.reasonCode = false, true, "MFA_PROOF_INVALID"
 			} else {
 				result.mfaCounter = assertion.Counter
+				result.factorType = "totp"
 			}
 		}
+	} else if result.authenticated && strings.TrimSpace(mfaProof) != "" {
+		result.authenticated, result.authenticationFailed, result.reasonCode = false, true, "MFA_PROOF_INVALID"
 	}
 	return result
+}
+
+func (service *LocalAuthService) prepareLocalReauthenticationPreflight(ctx context.Context, username string, sessionID uuid.UUID, command CompleteReauthenticationCommand, now time.Time) (localReauthenticationPreflight, error) {
+	state, user, credential, session, administrator, findErr := service.reauthentication.FindLocalReauthenticationPreflight(ctx, username, sessionID)
+	if findErr != nil && !errors.Is(findErr, ErrLocalAuthenticationFailed) {
+		return localReauthenticationPreflight{}, findErr
+	}
+	eligible := localReauthenticationEligibility(state, user, credential, session, administrator, findErr == nil, username, sessionID, now)
+	passwordDigest := service.dummyPassword
+	if eligible {
+		passwordDigest = credential.Password
+	}
+	preflight := localReauthenticationPreflight{
+		state: state, user: user, credential: credential, session: session, administrator: administrator, eligible: eligible,
+		passwordValid: eligible && service.passwords.Verify(command.Password, passwordDigest) == nil,
+	}
+	if !eligible {
+		_ = service.passwords.Verify(command.Password, passwordDigest)
+		return preflight, nil
+	}
+	requiresMFA := user.MFAEnrolled || user.Kind == UserKindEmergency || administrator
+	if preflight.passwordValid && requiresMFA && user.MFAEnrolled && credential.MFASecretReference != "" && strings.TrimSpace(command.MFAProof) != "" {
+		preflight.mfaAssertion, preflight.mfaError = service.mfa.Verify(ctx, credential.MFASecretReference, command.MFAProof)
+	}
+	return preflight, nil
+}
+
+func localReauthenticationEligibility(state LoginState, user UserPrincipal, credential LocalCredential, session Session, _ bool, found bool, username string, sessionID uuid.UUID, now time.Time) bool {
+	eligible := found && user.Username == username && user.Status == UserStatusActive && !credential.LockedUntil.After(now) &&
+		session.ID == sessionID && session.SubjectID == user.ID && session.RevokedAt.IsZero() && session.AbsoluteExpiresAt.After(now) && session.IdleExpiresAt.After(now)
+	if !eligible {
+		return false
+	}
+	switch session.AuthenticationMethod {
+	case AuthenticationMethodLocal:
+		return user.Kind == UserKindLocal && (state.Mode == LoginModeLocal || state.Mode == LoginModeConfiguring)
+	case AuthenticationMethodEmergency:
+		return user.Kind == UserKindEmergency && session.MFALevel >= 1
+	default:
+		return false
+	}
+}
+
+func sameLocalReauthenticationPreflight(preflight localReauthenticationPreflight, user UserPrincipal, credential LocalCredential, session Session, administrator bool) bool {
+	return sameLocalLoginPreflight(localLoginPreflight{
+		state: preflight.state, user: preflight.user, credential: preflight.credential,
+		administrator: preflight.administrator, eligible: preflight.eligible,
+	}, user, credential, administrator) &&
+		preflight.session.ID == session.ID && preflight.session.Version == session.Version &&
+		preflight.session.SubjectID == session.SubjectID && preflight.session.AuthenticationMethod == session.AuthenticationMethod &&
+		preflight.session.MFALevel == session.MFALevel && preflight.session.RevokedAt.Equal(session.RevokedAt) &&
+		preflight.session.AbsoluteExpiresAt.Equal(session.AbsoluteExpiresAt) && preflight.session.IdleExpiresAt.Equal(session.IdleExpiresAt)
+}
+
+func (service *LocalAuthService) verifyLoginFactors(ctx context.Context, tx pgx.Tx, preflight localLoginPreflight, user UserPrincipal, credential LocalCredential, administrator, eligible bool, mfaProof, recoveryCode string, now time.Time) (localFactorResult, error) {
+	result := localFactorResult{authenticated: eligible, reasonCode: "CREDENTIAL_INVALID"}
+	if eligible && (!preflight.passwordValid || !sameLocalLoginPreflight(preflight, user, credential, administrator)) {
+		result.authenticated, result.authenticationFailed, result.reasonCode = false, true, "CREDENTIAL_INVALID"
+	}
+	if !result.authenticated {
+		return result, nil
+	}
+
+	totpPresent := strings.TrimSpace(mfaProof) != ""
+	recoveryPresent := strings.TrimSpace(recoveryCode) != ""
+	requiresMFA := user.MFAEnrolled || user.Kind == UserKindEmergency || administrator
+	if !requiresMFA {
+		if totpPresent || recoveryPresent {
+			result.authenticated, result.authenticationFailed, result.reasonCode = false, true, "MFA_PROOF_INVALID"
+		}
+		return result, nil
+	}
+	if !user.MFAEnrolled || totpPresent == recoveryPresent {
+		result.authenticated, result.authenticationFailed, result.reasonCode = false, true, "MFA_REQUIRED"
+		return result, nil
+	}
+	if totpPresent {
+		if credential.MFASecretReference == "" {
+			result.authenticated, result.authenticationFailed, result.reasonCode = false, true, "MFA_REQUIRED"
+			return result, nil
+		}
+		assertion := preflight.mfaAssertion
+		if preflight.mfaError != nil || assertion.Counter <= credential.MFALastCounter {
+			result.authenticated, result.authenticationFailed, result.reasonCode = false, true, "MFA_PROOF_INVALID"
+			return result, nil
+		}
+		result.mfaCounter = assertion.Counter
+		result.factorType = "totp"
+		return result, nil
+	}
+
+	canonical, valid := canonicalMFARecoveryCode(recoveryCode)
+	if !valid {
+		result.authenticated, result.authenticationFailed, result.reasonCode = false, true, "MFA_PROOF_INVALID"
+		return result, nil
+	}
+	digest := sha256.Sum256([]byte(canonical))
+	consumed, consumeErr := service.mfaRecovery.ConsumeMFARecoveryCode(ctx, tx, user.ID, hex.EncodeToString(digest[:]), now)
+	if consumeErr != nil {
+		return localFactorResult{}, consumeErr
+	}
+	if !consumed {
+		result.authenticated, result.authenticationFailed, result.reasonCode = false, true, "MFA_PROOF_INVALID"
+		return result, nil
+	}
+	result.factorType = "recovery_code"
+	return result, nil
+}
+
+func (service *LocalAuthService) prepareLocalLoginPreflight(ctx context.Context, username string, command LocalLoginCommand, method AuthenticationMethod, now time.Time) (localLoginPreflight, error) {
+	state, user, credential, administrator, findErr := service.login.FindLoginPreflight(ctx, username)
+	if findErr != nil && !errors.Is(findErr, ErrLocalAuthenticationFailed) {
+		return localLoginPreflight{}, findErr
+	}
+	eligible, _ := localLoginEligibility(state, user, credential, findErr == nil, method, now)
+	passwordDigest := service.dummyPassword
+	if eligible {
+		passwordDigest = credential.Password
+	}
+	preflight := localLoginPreflight{
+		state: state, user: user, credential: credential, administrator: administrator, eligible: eligible,
+		passwordValid: eligible && service.passwords.Verify(command.Password, passwordDigest) == nil,
+	}
+	if !eligible {
+		_ = service.passwords.Verify(command.Password, passwordDigest)
+		return preflight, nil
+	}
+	requiresMFA := user.MFAEnrolled || user.Kind == UserKindEmergency || administrator
+	totpPresent := strings.TrimSpace(command.MFAProof) != ""
+	recoveryPresent := strings.TrimSpace(command.RecoveryCode) != ""
+	if preflight.passwordValid && requiresMFA && user.MFAEnrolled && totpPresent && !recoveryPresent && credential.MFASecretReference != "" {
+		preflight.mfaAssertion, preflight.mfaError = service.mfa.Verify(ctx, credential.MFASecretReference, command.MFAProof)
+	}
+	return preflight, nil
+}
+
+func localLoginEligibility(state LoginState, user UserPrincipal, credential LocalCredential, found bool, method AuthenticationMethod, now time.Time) (bool, string) {
+	reasonCode := "CREDENTIAL_INVALID"
+	eligible := found
+	if eligible && method == AuthenticationMethodLocal && user.Kind != UserKindLocal {
+		eligible, reasonCode = false, "ENTRY_NOT_ALLOWED"
+	}
+	if eligible && method == AuthenticationMethodEmergency && user.Kind != UserKindEmergency {
+		eligible, reasonCode = false, "ENTRY_NOT_ALLOWED"
+	}
+	if eligible && method == AuthenticationMethodLocal && state.Mode != LoginModeLocal && state.Mode != LoginModeConfiguring {
+		eligible, reasonCode = false, "LOGIN_MODE_REJECTED"
+	}
+	if eligible && user.Status != UserStatusActive {
+		eligible, reasonCode = false, "SUBJECT_INACTIVE"
+	}
+	if eligible && credential.LockedUntil.After(now) {
+		eligible, reasonCode = false, "CREDENTIAL_LOCKED"
+	}
+	return eligible, reasonCode
+}
+
+func sameLocalLoginPreflight(preflight localLoginPreflight, user UserPrincipal, credential LocalCredential, administrator bool) bool {
+	return preflight.eligible && preflight.state.Version >= 1 &&
+		preflight.user.ID == user.ID && preflight.user.Version == user.Version && preflight.user.Kind == user.Kind &&
+		preflight.user.Status == user.Status && preflight.user.MFAEnrolled == user.MFAEnrolled &&
+		preflight.administrator == administrator && preflight.credential.UserID == credential.UserID &&
+		preflight.credential.MFASecretReference == credential.MFASecretReference &&
+		preflight.credential.MFALastCounter == credential.MFALastCounter &&
+		preflight.credential.FailedAttempts == credential.FailedAttempts &&
+		preflight.credential.LockedUntil.Equal(credential.LockedUntil) &&
+		passwordDigestEqual(preflight.credential.Password, credential.Password)
+}
+
+func passwordDigestEqual(left, right PasswordDigest) bool {
+	return left.Algorithm == right.Algorithm && left.Parameters == right.Parameters &&
+		subtle.ConstantTimeCompare(left.Salt, right.Salt) == 1 && subtle.ConstantTimeCompare(left.DerivedKey, right.DerivedKey) == 1
+}
+
+func canonicalMFARecoveryCode(value string) (string, bool) {
+	trimmed := strings.TrimSpace(value)
+	canonical := strings.ToUpper(strings.ReplaceAll(trimmed, "-", ""))
+	if len(canonical) != 24 {
+		return "", false
+	}
+	for _, character := range canonical {
+		if (character < 'A' || character > 'Z') && (character < '2' || character > '7') {
+			return "", false
+		}
+	}
+	return canonical, true
 }
 
 func cloneLocalAuthPolicy(policy LocalAuthPolicy) LocalAuthPolicy {
@@ -189,6 +419,10 @@ func (service *LocalAuthService) loginWithMethod(ctx context.Context, command Lo
 	if !allowed {
 		return LoginResult{}, ErrLocalAuthenticationLimited
 	}
+	preflight, err := service.prepareLocalLoginPreflight(ctx, username, command, method, now)
+	if err != nil {
+		return LoginResult{}, err
+	}
 	var result LoginResult
 	var outcome error
 	err = service.repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
@@ -196,24 +430,14 @@ func (service *LocalAuthService) loginWithMethod(ctx context.Context, command Lo
 		if findErr != nil && !errors.Is(findErr, ErrLocalAuthenticationFailed) {
 			return findErr
 		}
-		reasonCode := "CREDENTIAL_INVALID"
-		eligible := findErr == nil
-		if eligible && method == AuthenticationMethodLocal && user.Kind != UserKindLocal {
-			eligible, reasonCode = false, "ENTRY_NOT_ALLOWED"
+		eligible, reasonCode := localLoginEligibility(state, user, credential, findErr == nil, method, now)
+		if eligible && (preflight.state.Mode != state.Mode || preflight.state.Version != state.Version) {
+			eligible = false
 		}
-		if eligible && method == AuthenticationMethodEmergency && user.Kind != UserKindEmergency {
-			eligible, reasonCode = false, "ENTRY_NOT_ALLOWED"
+		factors, factorErr := service.verifyLoginFactors(ctx, tx, preflight, user, credential, administrator, eligible, command.MFAProof, command.RecoveryCode, now)
+		if factorErr != nil {
+			return factorErr
 		}
-		if eligible && method == AuthenticationMethodLocal && state.Mode != LoginModeLocal && state.Mode != LoginModeConfiguring {
-			eligible, reasonCode = false, "LOGIN_MODE_REJECTED"
-		}
-		if eligible && user.Status != UserStatusActive {
-			eligible, reasonCode = false, "SUBJECT_INACTIVE"
-		}
-		if eligible && credential.LockedUntil.After(now) {
-			eligible, reasonCode = false, "CREDENTIAL_LOCKED"
-		}
-		factors := service.verifyLocalFactors(ctx, user, credential, administrator, eligible, command.Password, command.MFAProof)
 		if !factors.authenticated {
 			if factors.authenticationFailed {
 				attempts := credential.FailedAttempts + 1
@@ -225,7 +449,7 @@ func (service *LocalAuthService) loginWithMethod(ctx context.Context, command Lo
 			if reasonCode == "CREDENTIAL_INVALID" {
 				reasonCode = factors.reasonCode
 			}
-			return service.appendLoginAudit(ctx, tx, user, method, audit.OutcomeDenied, reasonCode, request)
+			return service.appendLoginAudit(ctx, tx, user, method, audit.OutcomeDenied, reasonCode, "", request)
 		}
 		token, digest, generationErr := generateSessionToken()
 		if generationErr != nil {
@@ -241,13 +465,13 @@ func (service *LocalAuthService) loginWithMethod(ctx context.Context, command Lo
 		}
 		session := Session{
 			ID: sessionID, TokenDigest: digest, SubjectID: user.ID, AuthenticationMethod: method,
-			MFALevel: boolToMFA(user.Kind == UserKindEmergency || administrator), AuthenticatedAt: now, LastUsedAt: now,
+			MFALevel: boolToMFA(factors.factorType != ""), AuthenticatedAt: now, LastUsedAt: now,
 			AbsoluteExpiresAt: now.Add(absolute), IdleExpiresAt: now.Add(idle), Version: 1,
 		}
 		if err := service.login.SaveAuthenticationSuccess(ctx, tx, user.ID, factors.mfaCounter, session); err != nil {
 			return err
 		}
-		if err := service.appendLoginAudit(ctx, tx, user, method, audit.OutcomeSuccess, "AUTHENTICATED", request); err != nil {
+		if err := service.appendLoginAudit(ctx, tx, user, method, audit.OutcomeSuccess, "AUTHENTICATED", factors.factorType, request); err != nil {
 			return err
 		}
 		result = LoginResult{
@@ -282,25 +506,21 @@ func (service *LocalAuthService) Reauthenticate(ctx context.Context, actor ident
 	if !allowed {
 		return ErrLocalAuthenticationLimited
 	}
+	preflight, err := service.prepareLocalReauthenticationPreflight(ctx, username, sessionID, command, now)
+	if err != nil {
+		return err
+	}
 	var outcome error
 	err = service.repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
 		state, user, credential, session, administrator, findErr := service.reauthentication.FindLocalReauthentication(ctx, tx, username, sessionID)
 		if findErr != nil && !errors.Is(findErr, ErrLocalAuthenticationFailed) {
 			return findErr
 		}
-		eligible := findErr == nil && user.Username == username && user.Status == UserStatusActive && !credential.LockedUntil.After(now) &&
-			session.ID == sessionID && session.SubjectID == user.ID && session.RevokedAt.IsZero() && session.AbsoluteExpiresAt.After(now) && session.IdleExpiresAt.After(now)
-		if eligible {
-			switch session.AuthenticationMethod {
-			case AuthenticationMethodLocal:
-				eligible = user.Kind == UserKindLocal && (state.Mode == LoginModeLocal || state.Mode == LoginModeConfiguring)
-			case AuthenticationMethodEmergency:
-				eligible = user.Kind == UserKindEmergency && session.MFALevel >= 1
-			default:
-				eligible = false
-			}
+		eligible := localReauthenticationEligibility(state, user, credential, session, administrator, findErr == nil, username, sessionID, now)
+		if eligible && (preflight.state.Mode != state.Mode || preflight.state.Version != state.Version) {
+			eligible = false
 		}
-		factors := service.verifyLocalFactors(ctx, user, credential, administrator, eligible, command.Password, command.MFAProof)
+		factors := service.verifyLocalFactors(preflight, user, credential, session, administrator, eligible, command.MFAProof)
 		if !factors.authenticated {
 			if factors.authenticationFailed {
 				attempts := credential.FailedAttempts + 1
@@ -361,12 +581,16 @@ func (service *LocalAuthService) consumeAuthenticationAttempt(ctx context.Contex
 	return allowed, nil
 }
 
-func (service *LocalAuthService) appendLoginAudit(ctx context.Context, tx pgx.Tx, user UserPrincipal, method AuthenticationMethod, outcome audit.Outcome, reasonCode string, request RequestContext) error {
+func (service *LocalAuthService) appendLoginAudit(ctx context.Context, tx pgx.Tx, user UserPrincipal, method AuthenticationMethod, outcome audit.Outcome, reasonCode, factorType string, request RequestContext) error {
 	action, entrypoint := "identity.local_user.login", "local"
 	if method == AuthenticationMethodEmergency {
 		action, entrypoint = "identity.emergency.login", "emergency"
 	}
-	return service.appendAuthenticationAuditWithMetadata(ctx, tx, user, action, outcome, reasonCode, request, map[string]any{"entrypoint": entrypoint})
+	metadata := map[string]any{"entrypoint": entrypoint}
+	if factorType != "" {
+		metadata["factor_type"] = factorType
+	}
+	return service.appendAuthenticationAuditWithMetadata(ctx, tx, user, action, outcome, reasonCode, request, metadata)
 }
 
 func (service *LocalAuthService) appendAuthenticationAttemptAudit(ctx context.Context, tx pgx.Tx, method AuthenticationMethod, outcome audit.Outcome, reasonCode string, request RequestContext) error {
@@ -414,13 +638,40 @@ func boolToMFA(required bool) int {
 }
 
 func (service *LocalAuthService) Activate(ctx context.Context, command ActivateLocalAccountCommand, request RequestContext) error {
+	_, err := service.ActivateWithResult(ctx, command, request)
+	return err
+}
+
+func (service *LocalAuthService) ActivateWithResult(ctx context.Context, command ActivateLocalAccountCommand, request RequestContext) (LocalActivationResult, error) {
 	token := strings.TrimSpace(command.ActivationToken)
-	if token == "" || len(token) > 1024 {
-		return ErrLocalAuthenticationFailed
+	if token == "" || token != command.ActivationToken || len(token) > 1024 || strings.TrimSpace(command.MFASecretReference) != "" {
+		return LocalActivationResult{}, ErrLocalAuthenticationFailed
 	}
 	digest := sha256.Sum256([]byte(token))
 	activationDigest := hex.EncodeToString(digest[:])
 	now := service.clock().UTC().Truncate(time.Microsecond)
+	hasMFAInput := command.MFAEnrollmentID != uuid.Nil || strings.TrimSpace(command.MFAProof) != ""
+	var preflightEnrollment MFAEnrollment
+	var preflightAssertion MFAAssertion
+	var preflightProofError error
+	if command.MFAEnrollmentID != uuid.Nil && strings.TrimSpace(command.MFAProof) != "" {
+		preflightEnrollment, preflightProofError = service.mfaActivation.GetMFAActivationPreflight(ctx, activationDigest, command.MFAEnrollmentID)
+		if preflightProofError == nil {
+			preflightAssertion, preflightProofError = service.mfa.Verify(ctx, preflightEnrollment.SecretReference, command.MFAProof)
+		} else if !errors.Is(preflightProofError, ErrMFAEnrollmentNotFound) && !errors.Is(preflightProofError, ErrLocalAuthenticationFailed) {
+			return LocalActivationResult{}, preflightProofError
+		}
+	}
+	recoveryCodes := make([]string, 0)
+	var recoveryDigests []string
+	var recoveryGeneration uuid.UUID
+	if command.MFAEnrollmentID != uuid.Nil {
+		var err error
+		recoveryCodes, recoveryDigests, recoveryGeneration, err = generateMFARecoveryCodeSet(10)
+		if err != nil {
+			return LocalActivationResult{}, err
+		}
+	}
 	var outcome error
 	err := service.repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
 		user, credential, history, administrator, err := service.repository.FindActivation(ctx, tx, activationDigest)
@@ -446,17 +697,35 @@ func (service *LocalAuthService) Activate(ctx context.Context, command ActivateL
 			return service.appendAuthenticationAudit(ctx, tx, user, "identity.local_user.activate", audit.OutcomeDenied, "PASSWORD_POLICY_REJECTED", request)
 		}
 		requiresMFA := user.Kind == UserKindEmergency || administrator
-		hasMFAInput := strings.TrimSpace(command.MFASecretReference) != "" || strings.TrimSpace(command.MFAProof) != ""
 		var assertion MFAAssertion
+		var enrollment MFAEnrollment
 		if requiresMFA || hasMFAInput {
-			if strings.TrimSpace(command.MFASecretReference) == "" || strings.TrimSpace(command.MFAProof) == "" {
+			if command.MFAEnrollmentID == uuid.Nil || strings.TrimSpace(command.MFAProof) == "" {
 				outcome = ErrLocalAuthenticationFailed
 				return service.appendAuthenticationAudit(ctx, tx, user, "identity.local_user.activate", audit.OutcomeDenied, "MFA_REQUIRED", request)
 			}
-			assertion, err = service.mfa.Verify(ctx, command.MFASecretReference, command.MFAProof)
-			if err != nil || assertion.Counter <= credential.MFALastCounter {
+			enrollment, err = service.mfaActivation.GetMFAEnrollmentForUpdate(ctx, tx, command.MFAEnrollmentID)
+			if err != nil || enrollment.UserID != user.ID || enrollment.Purpose != MFAEnrollmentPurposeActivation || enrollment.Status != MFAEnrollmentStatusPending ||
+				enrollment.ExpectedUserVersion != user.Version || !enrollment.ExpiresAt.After(now) {
+				outcome = ErrLocalAuthenticationFailed
+				return service.appendAuthenticationAudit(ctx, tx, user, "identity.local_user.activate", audit.OutcomeDenied, "MFA_ENROLLMENT_INVALID", request)
+			}
+			if preflightProofError != nil || preflightEnrollment.ID != enrollment.ID || preflightEnrollment.Version != enrollment.Version ||
+				preflightEnrollment.SecretReference != enrollment.SecretReference || preflightAssertion.Counter <= credential.MFALastCounter {
 				outcome = ErrLocalAuthenticationFailed
 				return service.appendAuthenticationAudit(ctx, tx, user, "identity.local_user.activate", audit.OutcomeDenied, "MFA_PROOF_INVALID", request)
+			}
+			assertion = preflightAssertion
+			if err := service.mfaActivation.LockMFASecretReference(ctx, tx, enrollment.SecretReference); err != nil {
+				return err
+			}
+			tombstone, err := service.mfaActivation.MFASecretReferenceHasTombstone(ctx, tx, enrollment.SecretReference)
+			if err != nil {
+				return err
+			}
+			if tombstone {
+				outcome = ErrLocalAuthenticationFailed
+				return ErrIAMConflict
 			}
 		}
 		expectedVersion := user.Version
@@ -472,7 +741,7 @@ func (service *LocalAuthService) Activate(ctx context.Context, command ActivateL
 		credential.FailedAttempts = 0
 		credential.LockedUntil = time.Time{}
 		if user.MFAEnrolled {
-			credential.MFASecretReference = strings.TrimSpace(command.MFASecretReference)
+			credential.MFASecretReference = enrollment.SecretReference
 			credential.MFALastCounter = assertion.Counter
 		}
 		if err := service.repository.SaveActivation(ctx, tx, user, credential, password, expectedVersion); err != nil {
@@ -482,6 +751,15 @@ func (service *LocalAuthService) Activate(ctx context.Context, command ActivateL
 			}
 			return err
 		}
+		if user.MFAEnrolled {
+			if err := service.mfaActivation.ConfirmMFAEnrollment(ctx, tx, enrollment.ID, enrollment.Version, now); err != nil {
+				outcome = ErrLocalAuthenticationFailed
+				return err
+			}
+			if err := service.mfaActivation.ReplaceMFARecoveryCodes(ctx, tx, user.ID, recoveryGeneration, recoveryDigests, now); err != nil {
+				return err
+			}
+		}
 		if err := service.appendAuthenticationAudit(ctx, tx, user, "identity.local_user.activate", audit.OutcomeSuccess, "ACTIVATED", request); err != nil {
 			return err
 		}
@@ -489,11 +767,39 @@ func (service *LocalAuthService) Activate(ctx context.Context, command ActivateL
 	})
 	if err != nil {
 		if outcome != nil {
-			return outcome
+			return LocalActivationResult{}, outcome
 		}
-		return err
+		return LocalActivationResult{}, err
 	}
-	return outcome
+	return LocalActivationResult{RecoveryCodes: recoveryCodes}, outcome
+}
+
+func generateMFARecoveryCodeSet(count int) ([]string, []string, uuid.UUID, error) {
+	if count < 1 || count > 32 {
+		return nil, nil, uuid.Nil, ErrIAMConfiguration
+	}
+	generationID, err := uuid.NewV7()
+	if err != nil {
+		return nil, nil, uuid.Nil, ErrIAMConfiguration
+	}
+	codes := make([]string, 0, count)
+	digests := make([]string, 0, count)
+	seen := make(map[string]struct{}, count)
+	for len(codes) < count {
+		entropy := make([]byte, 15)
+		if _, err := rand.Read(entropy); err != nil {
+			return nil, nil, uuid.Nil, ErrIAMConfiguration
+		}
+		canonical := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(entropy)
+		if _, duplicate := seen[canonical]; duplicate {
+			continue
+		}
+		seen[canonical] = struct{}{}
+		digest := sha256.Sum256([]byte(canonical))
+		digests = append(digests, hex.EncodeToString(digest[:]))
+		codes = append(codes, strings.Join([]string{canonical[0:4], canonical[4:8], canonical[8:12], canonical[12:16], canonical[16:20], canonical[20:24]}, "-"))
+	}
+	return codes, digests, generationID, nil
 }
 
 func (service *LocalAuthService) appendAuthenticationAudit(ctx context.Context, tx pgx.Tx, user UserPrincipal, action string, outcome audit.Outcome, reasonCode string, request RequestContext) error {

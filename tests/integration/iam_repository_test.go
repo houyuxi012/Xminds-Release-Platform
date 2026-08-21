@@ -271,10 +271,21 @@ VALUES ($1, 0, $2, $3)`, userID, hex.EncodeToString(digest[:]), now.Add(time.Hou
 
 	mfaToken := "concurrent-mfa-activation-token-with-sufficient-entropy"
 	mfaUserID := seedPending("concurrent.mfa", mfaToken)
+	mfaEnrollmentID, err := uuid.NewV7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+INSERT INTO iam_mfa_enrollments (
+    id,user_id,purpose,status,secret_reference,expected_user_version,expires_at,version,created_at,updated_at
+) VALUES ($1,$2,'activation','pending',$3,1,$4,1,$5,$5)`, mfaEnrollmentID, mfaUserID,
+		"secret://iam-mfa/mfa-"+mfaEnrollmentID.String()+".totp", now.Add(10*time.Minute), now); err != nil {
+		t.Fatalf("seed MFA activation enrollment: %v", err)
+	}
 	mfa.counter.Store(100)
 	if err := authenticator.Activate(ctx, iam.ActivateLocalAccountCommand{
 		ActivationToken: mfaToken, NewPassword: "Concurrent-MFA-Password!",
-		MFASecretReference: "secret://iam/concurrent-mfa", MFAProof: "123456",
+		MFAEnrollmentID: mfaEnrollmentID, MFAProof: "123456",
 	}, iam.RequestContext{RequestID: uuid.NewString(), SourceIP: "192.0.2.42"}); err != nil {
 		t.Fatalf("activate MFA fixture: %v", err)
 	}
@@ -1812,9 +1823,20 @@ INSERT INTO role_bindings (
 	}, request); !errors.Is(err, iam.ErrLocalAuthenticationFailed) {
 		t.Fatalf("Activate(inherited administrator without MFA) error = %v", err)
 	}
+	inheritedEnrollmentID, err := uuid.NewV7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+INSERT INTO iam_mfa_enrollments (
+    id,user_id,purpose,status,secret_reference,expected_user_version,expires_at,version,created_at,updated_at
+) VALUES ($1,$2,'activation','pending',$3,1,$4,1,$5,$5)`, inheritedEnrollmentID, userID,
+		"secret://iam-mfa/mfa-"+inheritedEnrollmentID.String()+".totp", now.Add(10*time.Minute), now); err != nil {
+		t.Fatalf("seed inherited administrator MFA enrollment: %v", err)
+	}
 	if err := authenticator.Activate(ctx, iam.ActivateLocalAccountCommand{
 		ActivationToken: activationToken, NewPassword: "Postgres-Strong-Password!",
-		MFASecretReference: "secret://iam/postgres-operator", MFAProof: "123456",
+		MFAEnrollmentID: inheritedEnrollmentID, MFAProof: "123456",
 	}, request); err != nil {
 		t.Fatalf("Activate() error = %v", err)
 	}

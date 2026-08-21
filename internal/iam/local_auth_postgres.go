@@ -147,6 +147,34 @@ FOR UPDATE OF user_record, credential`, canonicalUsername)
 	return state, user, credential, administrator, nil
 }
 
+func (repository *PostgresRepository) FindLoginPreflight(ctx context.Context, canonicalUsername string) (LoginState, UserPrincipal, LocalCredential, bool, error) {
+	if repository == nil || repository.pool == nil {
+		return LoginState{}, UserPrincipal{}, LocalCredential{}, false, ErrIAMConfiguration
+	}
+	state, err := repository.GetLoginState(ctx, nil)
+	if err != nil {
+		return LoginState{}, UserPrincipal{}, LocalCredential{}, false, err
+	}
+	row := repository.pool.QueryRow(ctx, `SELECT `+userColumns+`,
+       COALESCE(credential.algorithm, ''), COALESCE(credential.parameters, ''),
+       COALESCE(credential.salt, '\x'::bytea), COALESCE(credential.derived_key, '\x'::bytea),
+       credential.failed_attempts, credential.locked_until, credential.password_changed_at,
+       credential.activation_digest, credential.activation_expires_at,
+       credential.mfa_secret_reference, credential.mfa_last_counter,
+	   `+platformAdministratorExistsSQL+`
+FROM user_principals user_record
+JOIN local_credentials credential ON credential.user_id=user_record.id
+WHERE lower(user_record.username)=$1`, canonicalUsername)
+	user, credential, administrator, err := scanAuthRecord(row, true)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return state, UserPrincipal{}, LocalCredential{}, false, ErrLocalAuthenticationFailed
+	}
+	if err != nil {
+		return state, UserPrincipal{}, LocalCredential{}, false, fmt.Errorf("preflight local login: %w", err)
+	}
+	return state, user, credential, administrator, nil
+}
+
 func (repository *PostgresRepository) FindLocalReauthentication(ctx context.Context, tx pgx.Tx, canonicalUsername string, sessionID uuid.UUID) (LoginState, UserPrincipal, LocalCredential, Session, bool, error) {
 	state, user, credential, administrator, err := repository.FindLogin(ctx, tx, canonicalUsername)
 	if err != nil {
@@ -173,6 +201,38 @@ FOR UPDATE`, sessionID).Scan(
 		session.RevokedAt = revokedAt.UTC()
 	}
 	return state, user, credential, session, administrator, nil
+}
+
+func (repository *PostgresRepository) FindLocalReauthenticationPreflight(ctx context.Context, canonicalUsername string, sessionID uuid.UUID) (LoginState, UserPrincipal, LocalCredential, Session, bool, error) {
+	state, user, credential, administrator, err := repository.FindLoginPreflight(ctx, canonicalUsername)
+	if err != nil {
+		return state, UserPrincipal{}, LocalCredential{}, Session{}, false, err
+	}
+	session, err := scanLocalSession(repository.pool.QueryRow(ctx, `
+SELECT id, token_digest, subject_id, authentication_method, mfa_level, authenticated_at,
+       last_used_at, absolute_expires_at, idle_expires_at, revoked_at, revocation_reason, version
+FROM local_sessions WHERE id=$1`, sessionID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return state, UserPrincipal{}, LocalCredential{}, Session{}, false, ErrLocalAuthenticationFailed
+	}
+	if err != nil {
+		return state, UserPrincipal{}, LocalCredential{}, Session{}, false, fmt.Errorf("preflight local reauthentication session: %w", err)
+	}
+	return state, user, credential, session, administrator, nil
+}
+
+func scanLocalSession(row pgx.Row) (Session, error) {
+	var session Session
+	var revokedAt *time.Time
+	err := row.Scan(
+		&session.ID, &session.TokenDigest, &session.SubjectID, &session.AuthenticationMethod, &session.MFALevel,
+		&session.AuthenticatedAt, &session.LastUsedAt, &session.AbsoluteExpiresAt, &session.IdleExpiresAt,
+		&revokedAt, &session.RevocationReason, &session.Version,
+	)
+	if revokedAt != nil {
+		session.RevokedAt = revokedAt.UTC()
+	}
+	return session, err
 }
 
 func (repository *PostgresRepository) SaveReauthenticationSuccess(ctx context.Context, tx pgx.Tx, userID uuid.UUID, mfaCounter int64) error {

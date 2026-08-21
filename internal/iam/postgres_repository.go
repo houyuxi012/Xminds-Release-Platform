@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"xminds-release-platform/internal/identity"
 	"xminds-release-platform/internal/platform/database"
 )
 
@@ -379,6 +380,15 @@ func (repository *PostgresRepository) InsertLocalUser(ctx context.Context, tx pg
 	if tx == nil || user.ID == uuid.Nil || credential.UserID != user.ID || user.Kind != UserKindLocal {
 		return ErrIAMConfiguration
 	}
+	return insertPendingPasswordUser(ctx, tx, user, credential)
+}
+
+func insertPendingPasswordUser(ctx context.Context, tx pgx.Tx, user UserPrincipal, credential LocalCredential) error {
+	if tx == nil || user.ID == uuid.Nil || credential.UserID != user.ID ||
+		(user.Kind != UserKindLocal && user.Kind != UserKindEmergency) || user.Status != UserStatusPending || user.MFAEnrolled || user.Version != 1 ||
+		credential.ActivationDigest == "" || credential.ActivationExpiresAt.IsZero() {
+		return ErrIAMConfiguration
+	}
 	if err := lockPrincipalMappingKeys(ctx, tx, user.Username, user.Email); err != nil {
 		return err
 	}
@@ -405,6 +415,50 @@ INSERT INTO local_credentials (
 		nullableTime(credential.PasswordChangedAt), credential.ActivationDigest, credential.ActivationExpiresAt.UTC())
 	if err != nil {
 		return fmt.Errorf("insert local credential: %w", err)
+	}
+	return nil
+}
+
+func (repository *PostgresRepository) CanonicalPrincipalAvailable(ctx context.Context, username, email string) (bool, error) {
+	if repository == nil || repository.pool == nil || username == "" {
+		return false, ErrIAMConfiguration
+	}
+	var available bool
+	err := repository.pool.QueryRow(ctx, `SELECT NOT EXISTS (
+    SELECT 1 FROM user_principals
+    WHERE lower(username)=lower($1) OR ($2<>'' AND lower(email)=lower($2))
+)`, username, email).Scan(&available)
+	if err != nil {
+		return false, fmt.Errorf("check canonical principal availability: %w", err)
+	}
+	return available, nil
+}
+
+func (repository *PostgresRepository) ProvisionPendingEmergency(ctx context.Context, tx pgx.Tx, user UserPrincipal, credential LocalCredential, binding RoleBinding) error {
+	if tx == nil || user.Kind != UserKindEmergency || user.Status != UserStatusPending || user.MFAEnrolled ||
+		binding.ID == uuid.Nil || binding.SubjectType != SubjectTypeUser || binding.SubjectID != user.ID ||
+		binding.Role != identity.RoleAdmin || binding.ScopeType != ScopeTypePlatform || binding.Effect != BindingEffectAllow ||
+		binding.ProductID != "" || binding.ChannelName != "" || !binding.ValidUntil.IsZero() || binding.Version != 1 {
+		return ErrIAMConfiguration
+	}
+	if err := insertPendingPasswordUser(ctx, tx, user, credential); err != nil {
+		return err
+	}
+	return repository.InsertRoleBinding(ctx, tx, binding)
+}
+
+func (repository *PostgresRepository) SaveEmergencyActivation(ctx context.Context, tx pgx.Tx, userID uuid.UUID, activationDigest string, activationExpiresAt time.Time) error {
+	if tx == nil || userID == uuid.Nil || !validLowerSHA256Digest(activationDigest) || activationExpiresAt.IsZero() {
+		return ErrIAMConfiguration
+	}
+	result, err := tx.Exec(ctx, `
+UPDATE local_credentials SET activation_digest=$2,activation_expires_at=$3
+WHERE user_id=$1`, userID, activationDigest, activationExpiresAt.UTC())
+	if err != nil {
+		return fmt.Errorf("save emergency activation: %w", err)
+	}
+	if result.RowsAffected() != 1 {
+		return ErrIAMConflict
 	}
 	return nil
 }

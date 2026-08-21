@@ -39,6 +39,10 @@ const (
 	ReauthenticationOperationDirectoryConflictResolve     ReauthenticationOperation = "identity.directory_conflict.resolve"
 	ReauthenticationOperationOrganizationMembershipCreate ReauthenticationOperation = "identity.organization_membership.create"
 	ReauthenticationOperationOrganizationMembershipDelete ReauthenticationOperation = "identity.organization_membership.delete"
+	ReauthenticationOperationMFAEnrollmentBegin           ReauthenticationOperation = "mfa.enrollment.begin"
+	ReauthenticationOperationMFARecoveryCodesRegenerate   ReauthenticationOperation = "mfa.recovery_codes.regenerate"
+	ReauthenticationOperationEmergencyUserCreate          ReauthenticationOperation = "emergency.user.create"
+	ReauthenticationOperationEmergencyActivationReissue   ReauthenticationOperation = "emergency.user.activation.reissue"
 )
 
 type ReauthenticationStatus string
@@ -296,9 +300,20 @@ func (service *ReauthenticationService) actorBinding(actor identity.Principal) (
 	if service == nil || service.repository == nil || service.authorizer == nil || !actor.Governed || strings.TrimSpace(actor.Subject) == "" || strings.TrimSpace(actor.TokenID) == "" {
 		return 0, "", false
 	}
+	version, digest, ok := canonicalReauthenticationActorBinding(actor)
+	if !ok {
+		return 0, "", false
+	}
+	return version, hex.EncodeToString(digest[:]), true
+}
+
+func canonicalReauthenticationActorBinding(actor identity.Principal) (int16, [32]byte, bool) {
+	if !actor.Governed || strings.TrimSpace(actor.Subject) == "" || strings.TrimSpace(actor.TokenID) == "" {
+		return 0, [32]byte{}, false
+	}
 	userID, err := uuid.Parse(strings.TrimSpace(actor.GovernedUserID))
 	if err != nil || userID == uuid.Nil {
-		return 0, "", false
+		return 0, [32]byte{}, false
 	}
 	hash := sha256.New()
 	_, _ = hash.Write([]byte(reauthenticationActorBindingDomain))
@@ -307,19 +322,21 @@ func (service *ReauthenticationService) actorBinding(actor identity.Principal) (
 	case identity.PrincipalKindHuman:
 		sourceID, sourceErr := uuid.Parse(strings.TrimSpace(actor.IdentitySourceID))
 		if sourceErr != nil || sourceID == uuid.Nil {
-			return 0, "", false
+			return 0, [32]byte{}, false
 		}
 		_, _ = hash.Write([]byte{0x01})
 		_, _ = hash.Write(sourceID[:])
 	case identity.PrincipalKindLocal:
 		if strings.TrimSpace(actor.IdentitySourceID) != "" {
-			return 0, "", false
+			return 0, [32]byte{}, false
 		}
 		_, _ = hash.Write([]byte{0x02})
 	default:
-		return 0, "", false
+		return 0, [32]byte{}, false
 	}
-	return reauthenticationActorBindingVersion, hex.EncodeToString(hash.Sum(nil)), true
+	var digest [32]byte
+	copy(digest[:], hash.Sum(nil))
+	return reauthenticationActorBindingVersion, digest, true
 }
 
 func (service *ReauthenticationService) canComplete(challenge ReauthenticationChallenge, actor identity.Principal, bindingVersion int16, bindingDigest string, now time.Time) bool {
@@ -352,7 +369,9 @@ func validReauthenticationOperation(operation ReauthenticationOperation) bool {
 	case ReauthenticationOperationRoleBindingCreate, ReauthenticationOperationRoleBindingDelete,
 		ReauthenticationOperationUserDisable, ReauthenticationOperationUserEnable, ReauthenticationOperationUserRevokeSessions,
 		ReauthenticationOperationSSOEnable, ReauthenticationOperationSSODisable, ReauthenticationOperationDirectoryConflictResolve,
-		ReauthenticationOperationOrganizationMembershipCreate, ReauthenticationOperationOrganizationMembershipDelete:
+		ReauthenticationOperationOrganizationMembershipCreate, ReauthenticationOperationOrganizationMembershipDelete,
+		ReauthenticationOperationMFAEnrollmentBegin, ReauthenticationOperationMFARecoveryCodesRegenerate,
+		ReauthenticationOperationEmergencyUserCreate, ReauthenticationOperationEmergencyActivationReissue:
 		return true
 	default:
 		return false

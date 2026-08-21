@@ -197,6 +197,15 @@ func run(ctx context.Context, arguments []string, environ map[string]string) err
 	if err != nil {
 		return fmt.Errorf("configure IAM directory conflict cursor codec: %w", err)
 	}
+	mfaSecretStore, err := iam.NewFileMFASecretStore(runtimeConfig.LocalAuth.MFAEnrollmentSecretDirectory)
+	if err != nil {
+		return fmt.Errorf("configure IAM MFA enrollment secret store: %w", err)
+	}
+	defer mfaSecretStore.Close()
+	if err := iam.ProbeMFASecretStore(ctx, mfaSecretStore); err != nil {
+		return fmt.Errorf("probe IAM MFA enrollment secret store: %w", err)
+	}
+	routingSecretResolver := iam.RoutingSecretResolver{IAM: secretResolver, MFA: mfaSecretStore}
 	oidcTrusts, err := iam.NewOIDCTrustFactory(iam.OIDCTrustFactoryConfig{
 		Secrets: secretResolver, RequestTimeout: runtimeConfig.Directory.RequestTimeout,
 		AllowLoopbackHTTP: runtimeConfig.Directory.AllowLoopbackHTTP, AllowedPrivatePrefixes: runtimeConfig.Directory.AllowedPrivatePrefixes,
@@ -212,7 +221,7 @@ func run(ctx context.Context, arguments []string, environ map[string]string) err
 	if err != nil {
 		return fmt.Errorf("configure IAM directory adapter: %w", err)
 	}
-	mfaVerifier, err := iam.NewTOTPVerifier(runtimeConfig.LocalAuth.TOTP, secretResolver, time.Now)
+	mfaVerifier, err := iam.NewTOTPVerifier(runtimeConfig.LocalAuth.TOTP, routingSecretResolver, time.Now)
 	if err != nil {
 		return fmt.Errorf("configure IAM TOTP verifier: %w", err)
 	}
@@ -237,6 +246,13 @@ func run(ctx context.Context, arguments []string, environ map[string]string) err
 	})
 	if err != nil {
 		return fmt.Errorf("configure high-risk reauthentication service: %w", err)
+	}
+	mfaEnrollmentService, err := iam.NewMFAService(iam.MFAServiceConfig{
+		Repository: iamRepository, Auditor: auditor, Secrets: mfaSecretStore, Policy: runtimeConfig.LocalAuth.Policy,
+		EnrollmentTTL: runtimeConfig.LocalAuth.MFAEnrollmentTTL, Issuer: runtimeConfig.LocalAuth.MFAIssuer, Clock: time.Now,
+	})
+	if err != nil {
+		return fmt.Errorf("configure MFA activation enrollment service: %w", err)
 	}
 	sessionVerifier, err := iam.NewSessionVerifier(iamRepository, runtimeConfig.LocalAuth.Policy, time.Now)
 	if err != nil {
@@ -263,11 +279,27 @@ func run(ctx context.Context, arguments []string, environ map[string]string) err
 	}
 	iamService, err := iam.NewService(iam.ServiceConfig{
 		Repository: iamRepository, ScopeCatalog: iamRepository, BreakGlass: iam.NewBreakGlassInvariantAuthority(iamRepository), Auditor: auditor, Sessions: iamRepository, Passwords: iamPasswords,
-		Directory: directoryAdapter, DirectorySync: directorySyncService, HighRisk: reauthenticationService, Clock: time.Now,
+		Directory: directoryAdapter, DirectorySync: directorySyncService, HighRisk: reauthenticationService,
+		MFASecrets: mfaSecretStore, MFAVerifier: mfaVerifier, MFAEnrollmentTTL: runtimeConfig.LocalAuth.MFAEnrollmentTTL, MFAIssuer: runtimeConfig.LocalAuth.MFAIssuer, Clock: time.Now,
 	})
 	if err != nil {
 		return fmt.Errorf("configure IAM service: %w", err)
 	}
+
+	mfaGCWorker, err := iam.NewMFASecretGCWorker(iam.MFASecretGCWorkerConfig{Repository: iamRepository, Secrets: mfaSecretStore, Clock: time.Now})
+	if err != nil {
+		return fmt.Errorf("configure MFA secret garbage collection: %w", err)
+	}
+	gcContext, stopMFASecretGC := context.WithCancel(ctx)
+	gcDone := make(chan struct{})
+	go func() {
+		defer close(gcDone)
+		runMFASecretGC(gcContext, mfaGCWorker, time.Minute)
+	}()
+	defer func() {
+		stopMFASecretGC()
+		<-gcDone
+	}()
 
 	managementServer := &http.Server{
 		Addr: configuration.APIListen,
@@ -287,7 +319,10 @@ func run(ctx context.Context, arguments []string, environ map[string]string) err
 				IAM:              iamService,
 				Reauthentication: reauthenticationService,
 			}),
-			func(router chi.Router) { iam.RegisterPublicAuthRoutes(router, localAuthenticator) },
+			func(router chi.Router) {
+				iam.RegisterPublicAuthRoutes(router, localAuthenticator)
+				iam.RegisterPublicMFAEnrollmentRoutes(router, mfaEnrollmentService)
+			},
 		),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
@@ -305,6 +340,31 @@ func run(ctx context.Context, arguments []string, environ map[string]string) err
 		MaxHeaderBytes:    1 << 20,
 	}
 	return serveAPIServers(ctx, managementServer, publicServer)
+}
+
+func runMFASecretGC(ctx context.Context, worker *iam.MFASecretGCWorker, interval time.Duration) {
+	if worker == nil || interval <= 0 {
+		return
+	}
+	run := func() {
+		processed, err := worker.RunOnce(ctx)
+		if err != nil && !errors.Is(err, context.Canceled) {
+			slog.WarnContext(ctx, "IAM MFA secret garbage collection failed", "error", err)
+		} else if processed > 0 {
+			slog.InfoContext(ctx, "IAM MFA secret garbage collection completed", "processed", processed)
+		}
+	}
+	run()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			run()
+		}
+	}
 }
 
 type managementApplications struct {

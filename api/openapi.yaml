@@ -107,14 +107,46 @@ paths:
             schema:
               $ref: '#/components/schemas/ActivateLocalAccountRequest'
       responses:
-        '204':
-          description: 账户已激活，无响应体
+
+        '200':
+          description: 账户已激活；若完成 MFA 则仅在本次返回恢复码。
+          headers:
+            Cache-Control:
+              schema: {type: string, const: no-store}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MFAActivationResponse'}
         '400':
           $ref: '#/components/responses/UnprocessableEntity'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '500':
           $ref: '#/components/responses/InternalError'
+  /api/v1/auth/local/mfa-enrollments:
+    post:
+      operationId: beginLocalActivationMFAEnrollment
+      summary: 为待激活本地账户生成 MFA 注册秘密
+      description: 使用激活令牌发起，seed 与 otpauth URI 仅在本次 no-store 响应中返回。
+      tags: [Local Authentication]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/BeginActivationMFAEnrollmentRequest'}
+      responses:
+        '201':
+          description: MFA 注册已创建。
+          headers:
+            Cache-Control:
+              schema: {type: string, const: no-store}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MFAEnrollmentStartResponse'}
+        '400': {$ref: '#/components/responses/UnprocessableEntity'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
   /api/v1/auth/local/login:
     post:
       operationId: loginLocalAccount
@@ -130,6 +162,9 @@ paths:
       responses:
         '200':
           description: 一次性返回不透明持久会话令牌
+          headers:
+            Cache-Control:
+              schema: {type: string, const: no-store}
           content:
             application/json:
               schema:
@@ -161,6 +196,9 @@ paths:
       responses:
         '200':
           description: 一次性返回短时应急会话令牌
+          headers:
+            Cache-Control:
+              schema: {type: string, const: no-store}
           content:
             application/json:
               schema:
@@ -1548,6 +1586,150 @@ paths:
         '403': {$ref: '#/components/responses/Forbidden'}
         '409': {$ref: '#/components/responses/Conflict'}
         '500': {$ref: '#/components/responses/InternalError'}
+  /api/v1/users/{user_id}/mfa/enrollments:
+    post:
+      operationId: beginUserMFARotation
+      summary: 为已激活本地或应急账户发起 MFA 轮换
+      description: 消费新鲜重认证证明，seed 与 otpauth URI 仅在本次响应返回。
+      tags: [Identity Governance]
+      x-required-action: identity.manage
+      parameters: [{$ref: '#/components/parameters/UserIDPath'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/BeginMFARotationRequest'}
+      responses:
+        '201':
+          description: MFA 轮换注册已创建。
+          headers:
+            Cache-Control:
+              schema: {type: string, const: no-store}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MFAEnrollmentStartResponse'}
+        '400': {$ref: '#/components/responses/UnprocessableEntity'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /api/v1/users/{user_id}/mfa/enrollments/{enrollment_id}/confirm:
+    post:
+      operationId: confirmUserMFARotation
+      summary: 确认 MFA 轮换并一次性返回恢复码
+      tags: [Identity Governance]
+      x-required-action: identity.manage
+      parameters:
+        - {$ref: '#/components/parameters/UserIDPath'}
+        - {$ref: '#/components/parameters/MFAEnrollmentIDPath'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ConfirmMFARotationRequest'}
+      responses:
+        '200':
+          description: MFA 轮换已确认，旧会话已撤销。
+          headers:
+            Cache-Control:
+              schema: {type: string, const: no-store}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MFAActivationResponse'}
+        '400': {$ref: '#/components/responses/UnprocessableEntity'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /api/v1/users/{user_id}/mfa/recovery-codes/regenerate:
+    post:
+      operationId: regenerateUserMFARecoveryCodes
+      summary: 重新生成 MFA 恢复码并撤销用户会话
+      tags: [Identity Governance]
+      x-required-action: identity.manage
+      parameters: [{$ref: '#/components/parameters/UserIDPath'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/RegenerateMFARecoveryCodesRequest'}
+      responses:
+        '200':
+          description: 仅在本次响应返回新恢复码。
+          headers:
+            Cache-Control:
+              schema: {type: string, const: no-store}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MFAActivationResponse'}
+        '400': {$ref: '#/components/responses/UnprocessableEntity'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /api/v1/emergency-users:
+    post:
+      operationId: provisionEmergencyUser
+      summary: 受控创建待激活应急管理员
+      tags: [Identity Governance]
+      x-required-action: identity.manage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreateEmergencyUserRequest'}
+      responses:
+        '201':
+          description: 待激活应急管理员已原子创建，激活令牌仅返回一次。
+          headers:
+            Location:
+              schema: {type: string, format: uri-reference}
+            Cache-Control:
+              schema: {type: string, const: no-store}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/LocalUserProvisioning'}
+        '400': {$ref: '#/components/responses/UnprocessableEntity'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /api/v1/emergency-users/{user_id}/activation-token/reissue:
+    post:
+      operationId: reissueEmergencyUserActivation
+      summary: 为过期待激活应急管理员重发激活令牌
+      tags: [Identity Governance]
+      x-required-action: identity.manage
+      parameters: [{$ref: '#/components/parameters/UserIDPath'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ReissueEmergencyActivationRequest'}
+      responses:
+        '200':
+          description: 新激活令牌仅在本次响应返回。
+          headers:
+            Cache-Control:
+              schema: {type: string, const: no-store}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/LocalUserProvisioning'}
+        '400': {$ref: '#/components/responses/UnprocessableEntity'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
   /api/v1/users:
     get:
       operationId: listUsers
@@ -2051,6 +2233,11 @@ components:
       in: path
       required: true
       schema: {type: string, format: uuid}
+    MFAEnrollmentIDPath:
+      name: enrollment_id
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
     Limit:
       name: limit
       in: query
@@ -2143,6 +2330,15 @@ components:
             $ref: '#/components/schemas/ProblemDetails'
     UnprocessableEntity:
       description: 请求字段或业务规则校验失败
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    TooManyRequests:
+      description: 账户或来源 IP 超过固定窗口限制
+      headers:
+        Retry-After:
+          schema: {type: integer, minimum: 1}
       content:
         application/problem+json:
           schema:
@@ -3161,6 +3357,10 @@ components:
         - identity.directory_conflict.resolve
         - identity.organization_membership.create
         - identity.organization_membership.delete
+        - mfa.enrollment.begin
+        - mfa.recovery_codes.regenerate
+        - emergency.user.create
+        - emergency.user.activation.reissue
     HighRiskProof:
       type: object
       additionalProperties: false
@@ -3491,6 +3691,107 @@ components:
           readOnly: true
           description: 仅在创建成功响应中返回一次的激活秘密；后续无法查询。
         activation_expires_at: {type: string, format: date-time}
+    BeginActivationMFAEnrollmentRequest:
+      type: object
+      additionalProperties: false
+      required: [activation_token]
+      properties:
+        activation_token:
+          type: string
+          minLength: 32
+          maxLength: 1024
+          writeOnly: true
+    MFAEnrollmentStartResponse:
+      type: object
+      additionalProperties: false
+      required: [id, secret, otpauth_uri, expires_at]
+      properties:
+        id: {type: string, format: uuid}
+        secret:
+          type: string
+          pattern: '^[A-Z2-7]{32}$'
+          readOnly: true
+        otpauth_uri:
+          type: string
+          pattern: '^otpauth://totp/'
+          readOnly: true
+          description: 包含 seed 的一次性敏感响应字段，禁止写入 URL、Location、日志或 ProblemDetails。
+        expires_at: {type: string, format: date-time}
+    MFAActivationResponse:
+      type: object
+      additionalProperties: false
+      required: [recovery_codes]
+      properties:
+        recovery_codes:
+          type: array
+          minItems: 0
+          maxItems: 10
+          readOnly: true
+          items:
+            type: string
+            pattern: '^[A-Z2-7]{4}(?:-[A-Z2-7]{4}){5}$'
+            readOnly: true
+    BeginMFARotationRequest:
+      type: object
+      additionalProperties: false
+      required: [version, reason, reauthentication]
+      properties:
+        version: {type: integer, minimum: 1}
+        reason: {$ref: '#/components/schemas/MFACanonicalReason'}
+        reauthentication: {$ref: '#/components/schemas/HighRiskProof'}
+    ConfirmMFARotationRequest:
+      type: object
+      additionalProperties: false
+      required: [version, mfa_proof, reason]
+      properties:
+        version: {type: integer, minimum: 1}
+        mfa_proof:
+          type: string
+          pattern: '^[0-9]{6,8}$'
+          writeOnly: true
+        reason: {$ref: '#/components/schemas/MFACanonicalReason'}
+    RegenerateMFARecoveryCodesRequest:
+      type: object
+      additionalProperties: false
+      required: [version, reason, reauthentication]
+      properties:
+        version: {type: integer, minimum: 1}
+        reason: {$ref: '#/components/schemas/MFACanonicalReason'}
+        reauthentication: {$ref: '#/components/schemas/HighRiskProof'}
+    CreateEmergencyUserRequest:
+      type: object
+      additionalProperties: false
+      required: [username, display_name, reason, reauthentication]
+      properties:
+        username:
+          type: string
+          minLength: 3
+          maxLength: 128
+          pattern: '^[a-z0-9][a-z0-9._-]{2,127}$'
+        display_name:
+          type: string
+          minLength: 1
+          maxLength: 256
+        email:
+          type: string
+          format: email
+          maxLength: 320
+        reason: {$ref: '#/components/schemas/MFACanonicalReason'}
+        reauthentication: {$ref: '#/components/schemas/HighRiskProof'}
+    ReissueEmergencyActivationRequest:
+      type: object
+      additionalProperties: false
+      required: [version, reason, reauthentication]
+      properties:
+        version: {type: integer, minimum: 1}
+        reason: {$ref: '#/components/schemas/MFACanonicalReason'}
+        reauthentication: {$ref: '#/components/schemas/HighRiskProof'}
+    MFACanonicalReason:
+      type: string
+      minLength: 8
+      maxLength: 512
+      pattern: '^\S(?:[\s\S]{6,510}\S)?$'
+      description: 理由必须是精确的 8–512 个 Unicode 字符，不允许首尾空白。
     ActivateLocalAccountRequest:
       type: object
       additionalProperties: false
@@ -3506,10 +3807,9 @@ components:
           minLength: 12
           maxLength: 1024
           writeOnly: true
-        mfa_secret_reference:
+        mfa_enrollment_id:
           type: string
-          minLength: 1
-          maxLength: 256
+          format: uuid
           writeOnly: true
         mfa_proof:
           type: string
@@ -3533,6 +3833,10 @@ components:
           type: string
           pattern: '^[0-9]{6,8}$'
           writeOnly: true
+        recovery_code:
+          type: string
+          pattern: '^[A-Za-z2-7]{4}(?:-[A-Za-z2-7]{4}){5}$'
+          writeOnly: true
     LocalAuthenticatedSubject:
       type: object
       additionalProperties: false
@@ -3550,6 +3854,7 @@ components:
         access_token:
           type: string
           pattern: '^xms_[A-Za-z0-9_-]{43}$'
+          readOnly: true
         token_type:
           type: string
           const: Bearer

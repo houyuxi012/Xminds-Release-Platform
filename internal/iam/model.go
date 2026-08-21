@@ -89,6 +89,28 @@ const (
 	OrganizationMembershipStatusRemoved OrganizationMembershipStatus = "removed"
 )
 
+type MFAEnrollmentPurpose string
+
+const (
+	MFAEnrollmentPurposeActivation MFAEnrollmentPurpose = "activation"
+	MFAEnrollmentPurposeRotation   MFAEnrollmentPurpose = "rotation"
+)
+
+type MFAEnrollmentStatus string
+
+const (
+	MFAEnrollmentStatusPending   MFAEnrollmentStatus = "pending"
+	MFAEnrollmentStatusConfirmed MFAEnrollmentStatus = "confirmed"
+	MFAEnrollmentStatusExpired   MFAEnrollmentStatus = "expired"
+)
+
+type MFASecretGCState string
+
+const (
+	MFASecretGCStatePending MFASecretGCState = "pending"
+	MFASecretGCStateLeased  MFASecretGCState = "leased"
+)
+
 var (
 	ErrIAMConfiguration               = errors.New("IAM service configuration is invalid")
 	ErrIAMConflict                    = errors.New("IAM record changed concurrently")
@@ -121,6 +143,9 @@ var (
 	ErrLocalAuthenticationFailed      = errors.New("local authentication failed")
 	ErrLocalAuthenticationLimited     = errors.New("local authentication rate limit exceeded")
 	ErrPasswordRecentlyUsed           = errors.New("password was recently used")
+	ErrMFAEnrollmentNotFound          = errors.New("MFA enrollment was not found")
+	ErrMFAEnrollmentInvalid           = errors.New("MFA enrollment is invalid")
+	ErrMFARecoveryCodeInvalid         = errors.New("MFA recovery code is invalid")
 )
 
 type LoginState struct {
@@ -241,17 +266,68 @@ type LocalCredential struct {
 	MFALastCounter      int64
 }
 
+type MFAEnrollment struct {
+	ID                    uuid.UUID
+	UserID                uuid.UUID
+	Purpose               MFAEnrollmentPurpose
+	Status                MFAEnrollmentStatus
+	SecretReference       string
+	CreatedByUserID       uuid.UUID
+	CreatorBindingVersion int
+	CreatorBindingDigest  [32]byte
+	ExpectedUserVersion   int64
+	ExpiresAt             time.Time
+	ConfirmedAt           time.Time
+	Version               int64
+	CreatedAt             time.Time
+	UpdatedAt             time.Time
+}
+
+type MFASecretGCItem struct {
+	SecretReference string
+	State           MFASecretGCState
+	NotBefore       time.Time
+	Attempts        int
+	LastErrorCode   string
+	LeaseToken      uuid.UUID
+	LeasedUntil     time.Time
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+}
+
 type ActivateLocalAccountCommand struct {
 	ActivationToken    string
 	NewPassword        string
+	MFAEnrollmentID    uuid.UUID
 	MFASecretReference string
 	MFAProof           string
 }
 
+type LocalActivationResult struct {
+	RecoveryCodes []string `json:"recovery_codes"`
+}
+
+type BeginMFARotationCommand struct {
+	UserVersion int64
+	Reason      string
+}
+
+type ConfirmMFARotationCommand struct {
+	UserVersion int64
+	MFAProof    string
+	Reason      string
+}
+
+type RegenerateMFARecoveryCodesCommand struct {
+	UserVersion int64
+	Reason      string
+}
+
 type LocalLoginCommand struct {
-	Username string
-	Password string
-	MFAProof string
+	Username     string
+	Password     string
+	MFAProof     string
+	RecoveryCode string
 }
 
 type AuthenticationMethod string
@@ -328,6 +404,18 @@ type CreateLocalUserCommand struct {
 	Username    string
 	DisplayName string
 	Email       string
+}
+
+type CreateEmergencyUserCommand struct {
+	Username    string
+	DisplayName string
+	Email       string
+	Reason      string
+}
+
+type ReissueEmergencyActivationCommand struct {
+	UserVersion int64
+	Reason      string
 }
 
 type LocalUserProvisioning struct {

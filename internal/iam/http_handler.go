@@ -56,6 +56,14 @@ type DirectorySyncApplication interface {
 	ResolveDirectorySyncConflict(ctx context.Context, actor identity.Principal, sourceID, conflictID uuid.UUID, command ResolveDirectorySyncConflictCommand, proof HighRiskProof, request RequestContext) (DirectorySyncConflict, error)
 }
 
+type MFAManagementApplication interface {
+	BeginMFARotation(ctx context.Context, actor identity.Principal, userID uuid.UUID, command BeginMFARotationCommand, proof HighRiskProof, request RequestContext) (MFAEnrollmentStart, error)
+	ConfirmMFARotation(ctx context.Context, actor identity.Principal, userID, enrollmentID uuid.UUID, command ConfirmMFARotationCommand, request RequestContext) (LocalActivationResult, error)
+	RegenerateMFARecoveryCodes(ctx context.Context, actor identity.Principal, userID uuid.UUID, command RegenerateMFARecoveryCodesCommand, proof HighRiskProof, request RequestContext) (LocalActivationResult, error)
+	ProvisionEmergencyUser(ctx context.Context, actor identity.Principal, command CreateEmergencyUserCommand, proof HighRiskProof, request RequestContext) (LocalUserProvisioning, error)
+	ReissueEmergencyActivation(ctx context.Context, actor identity.Principal, userID uuid.UUID, command ReissueEmergencyActivationCommand, proof HighRiskProof, request RequestContext) (LocalUserProvisioning, error)
+}
+
 func NewHTTPHandler(application IAMApplication) http.Handler {
 	if application == nil {
 		return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -100,6 +108,190 @@ func RegisterRoutes(router chi.Router, application IAMApplication) {
 	})
 	if directory, ok := application.(DirectorySyncApplication); ok {
 		registerDirectorySyncRoutes(router, directory)
+	}
+	if mfa, ok := application.(MFAManagementApplication); ok {
+		registerMFAManagementRoutes(router, mfa)
+	}
+}
+
+func registerMFAManagementRoutes(router chi.Router, application MFAManagementApplication) {
+	router.Post("/api/v1/users/{user_id}/mfa/enrollments", beginMFARotationHandler(application))
+	router.Post("/api/v1/users/{user_id}/mfa/enrollments/{enrollment_id}/confirm", confirmMFARotationHandler(application))
+	router.Post("/api/v1/users/{user_id}/mfa/recovery-codes/regenerate", regenerateMFARecoveryCodesHandler(application))
+	router.Post("/api/v1/emergency-users", provisionEmergencyUserHandler(application))
+	router.Post("/api/v1/emergency-users/{user_id}/activation-token/reissue", reissueEmergencyActivationHandler(application))
+}
+
+func beginMFARotationHandler(application MFAManagementApplication) http.HandlerFunc {
+	type input struct {
+		Version          int64                      `json:"version"`
+		Reason           string                     `json:"reason"`
+		Reauthentication reauthenticationProofInput `json:"reauthentication"`
+	}
+	return func(writer http.ResponseWriter, request *http.Request) {
+		principal, ok := requireIAMPrincipal(writer, request)
+		if !ok {
+			return
+		}
+		userID, ok := parseIAMPathUUID(writer, request, "user_id", "USER_ID_INVALID", ErrUserInputInvalid)
+		if !ok {
+			return
+		}
+		var body input
+		if err := decodeIAMJSON(request, &body); err != nil {
+			writeIAMApplicationError(writer, request, ErrUserInputInvalid)
+			return
+		}
+		proof, err := validateReauthenticationProofInput(body.Reauthentication)
+		if err != nil {
+			writeIAMApplicationError(writer, request, err)
+			return
+		}
+		result, err := application.BeginMFARotation(request.Context(), principal, userID, BeginMFARotationCommand{UserVersion: body.Version, Reason: body.Reason}, proof, iamRequestContext(request))
+		if err != nil {
+			writeIAMApplicationError(writer, request, err)
+			return
+		}
+		writer.Header().Set("Cache-Control", "no-store")
+		writeIAMJSON(writer, http.StatusCreated, result)
+	}
+}
+
+func confirmMFARotationHandler(application MFAManagementApplication) http.HandlerFunc {
+	type input struct {
+		Version  int64  `json:"version"`
+		MFAProof string `json:"mfa_proof"`
+		Reason   string `json:"reason"`
+	}
+	return func(writer http.ResponseWriter, request *http.Request) {
+		principal, ok := requireIAMPrincipal(writer, request)
+		if !ok {
+			return
+		}
+		userID, ok := parseIAMPathUUID(writer, request, "user_id", "USER_ID_INVALID", ErrUserInputInvalid)
+		if !ok {
+			return
+		}
+		enrollmentID, ok := parseIAMPathUUID(writer, request, "enrollment_id", "MFA_ENROLLMENT_ID_INVALID", ErrMFAEnrollmentInvalid)
+		if !ok {
+			return
+		}
+		var body input
+		if err := decodeIAMJSON(request, &body); err != nil {
+			writeIAMApplicationError(writer, request, ErrUserInputInvalid)
+			return
+		}
+		result, err := application.ConfirmMFARotation(request.Context(), principal, userID, enrollmentID, ConfirmMFARotationCommand{UserVersion: body.Version, MFAProof: body.MFAProof, Reason: body.Reason}, iamRequestContext(request))
+		if err != nil {
+			writeIAMApplicationError(writer, request, err)
+			return
+		}
+		writer.Header().Set("Cache-Control", "no-store")
+		writeIAMJSON(writer, http.StatusOK, result)
+	}
+}
+
+func regenerateMFARecoveryCodesHandler(application MFAManagementApplication) http.HandlerFunc {
+	type input struct {
+		Version          int64                      `json:"version"`
+		Reason           string                     `json:"reason"`
+		Reauthentication reauthenticationProofInput `json:"reauthentication"`
+	}
+	return func(writer http.ResponseWriter, request *http.Request) {
+		principal, ok := requireIAMPrincipal(writer, request)
+		if !ok {
+			return
+		}
+		userID, ok := parseIAMPathUUID(writer, request, "user_id", "USER_ID_INVALID", ErrUserInputInvalid)
+		if !ok {
+			return
+		}
+		var body input
+		if err := decodeIAMJSON(request, &body); err != nil {
+			writeIAMApplicationError(writer, request, ErrUserInputInvalid)
+			return
+		}
+		proof, err := validateReauthenticationProofInput(body.Reauthentication)
+		if err != nil {
+			writeIAMApplicationError(writer, request, err)
+			return
+		}
+		result, err := application.RegenerateMFARecoveryCodes(request.Context(), principal, userID, RegenerateMFARecoveryCodesCommand{UserVersion: body.Version, Reason: body.Reason}, proof, iamRequestContext(request))
+		if err != nil {
+			writeIAMApplicationError(writer, request, err)
+			return
+		}
+		writer.Header().Set("Cache-Control", "no-store")
+		writeIAMJSON(writer, http.StatusOK, result)
+	}
+}
+
+func provisionEmergencyUserHandler(application MFAManagementApplication) http.HandlerFunc {
+	type input struct {
+		Username         string                     `json:"username"`
+		DisplayName      string                     `json:"display_name"`
+		Email            string                     `json:"email"`
+		Reason           string                     `json:"reason"`
+		Reauthentication reauthenticationProofInput `json:"reauthentication"`
+	}
+	return func(writer http.ResponseWriter, request *http.Request) {
+		principal, ok := requireIAMPrincipal(writer, request)
+		if !ok {
+			return
+		}
+		var body input
+		if err := decodeIAMJSON(request, &body); err != nil {
+			writeIAMApplicationError(writer, request, ErrUserInputInvalid)
+			return
+		}
+		proof, err := validateReauthenticationProofInput(body.Reauthentication)
+		if err != nil {
+			writeIAMApplicationError(writer, request, err)
+			return
+		}
+		result, err := application.ProvisionEmergencyUser(request.Context(), principal, CreateEmergencyUserCommand{Username: body.Username, DisplayName: body.DisplayName, Email: body.Email, Reason: body.Reason}, proof, iamRequestContext(request))
+		if err != nil {
+			writeIAMApplicationError(writer, request, err)
+			return
+		}
+		writer.Header().Set("Cache-Control", "no-store")
+		writer.Header().Set("Location", "/api/v1/users/"+result.User.ID.String())
+		writeIAMJSON(writer, http.StatusCreated, result)
+	}
+}
+
+func reissueEmergencyActivationHandler(application MFAManagementApplication) http.HandlerFunc {
+	type input struct {
+		Version          int64                      `json:"version"`
+		Reason           string                     `json:"reason"`
+		Reauthentication reauthenticationProofInput `json:"reauthentication"`
+	}
+	return func(writer http.ResponseWriter, request *http.Request) {
+		principal, ok := requireIAMPrincipal(writer, request)
+		if !ok {
+			return
+		}
+		userID, ok := parseIAMPathUUID(writer, request, "user_id", "USER_ID_INVALID", ErrUserInputInvalid)
+		if !ok {
+			return
+		}
+		var body input
+		if err := decodeIAMJSON(request, &body); err != nil {
+			writeIAMApplicationError(writer, request, ErrUserInputInvalid)
+			return
+		}
+		proof, err := validateReauthenticationProofInput(body.Reauthentication)
+		if err != nil {
+			writeIAMApplicationError(writer, request, err)
+			return
+		}
+		result, err := application.ReissueEmergencyActivation(request.Context(), principal, userID, ReissueEmergencyActivationCommand{UserVersion: body.Version, Reason: body.Reason}, proof, iamRequestContext(request))
+		if err != nil {
+			writeIAMApplicationError(writer, request, err)
+			return
+		}
+		writer.Header().Set("Cache-Control", "no-store")
+		writeIAMJSON(writer, http.StatusOK, result)
 	}
 }
 
@@ -1008,12 +1200,15 @@ func iamRequestContext(request *http.Request) RequestContext {
 func writeIAMApplicationError(writer http.ResponseWriter, request *http.Request, err error) {
 	switch {
 	case errors.Is(err, ErrUserInputInvalid), errors.Is(err, ErrPageInvalid), errors.Is(err, ErrRoleBindingInvalid), errors.Is(err, ErrIdentitySourceInputInvalid), errors.Is(err, ErrHighRiskProofInputInvalid),
-		errors.Is(err, ErrOrganizationMembershipInvalid), errors.Is(err, ErrDisableReasonRequired), errors.Is(err, ErrEnableReasonRequired), errors.Is(err, ErrRevokeReasonRequired):
+		errors.Is(err, ErrOrganizationMembershipInvalid), errors.Is(err, ErrMFAEnrollmentInvalid), errors.Is(err, ErrMFARecoveryCodeInvalid), errors.Is(err, ErrMFAProofInvalid),
+		errors.Is(err, ErrDisableReasonRequired), errors.Is(err, ErrEnableReasonRequired), errors.Is(err, ErrRevokeReasonRequired):
 		writeIAMProblem(writer, request, http.StatusBadRequest, "IAM_INPUT_INVALID", "Identity request is invalid", err)
 	case errors.Is(err, identity.ErrActionDenied):
 		writeIAMProblem(writer, request, http.StatusForbidden, "IAM_ACCESS_DENIED", "Identity access is denied", err)
 	case errors.Is(err, ErrUserNotFound):
 		writeIAMProblem(writer, request, http.StatusNotFound, "USER_NOT_FOUND", "User was not found", err)
+	case errors.Is(err, ErrMFAEnrollmentNotFound):
+		writeIAMProblem(writer, request, http.StatusNotFound, "MFA_ENROLLMENT_NOT_FOUND", "MFA enrollment was not found", err)
 	case errors.Is(err, ErrOrganizationNotFound):
 		writeIAMProblem(writer, request, http.StatusNotFound, "ORGANIZATION_NOT_FOUND", "Organization was not found", err)
 	case errors.Is(err, ErrOrganizationMembershipNotFound):

@@ -189,6 +189,82 @@ func TestHTTPHandlerNeverReturnsProvisioningSecretFromUserReads(t *testing.T) {
 	}
 }
 
+func TestMFAManagementHTTPUsesStrictProofAndOneTimeNoStoreResponses(t *testing.T) {
+	t.Parallel()
+	userID := uuid.MustParse("018f835d-7e4b-7abc-9f42-67a2f5f48e81")
+	enrollmentID := uuid.MustParse("018f835d-7e4b-7abc-9f42-67a2f5f48e82")
+	proof := `"reauthentication":{"challenge_id":"018f835d-7e4b-7abc-9f42-67a2f5f48e74","evidence":"xmr_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ","confirmed":true}`
+	application := &stubIAMApplication{
+		mfaEnrollmentStart: MFAEnrollmentStart{ID: enrollmentID, Secret: "ONCEONLYSEED", OTPAuthURI: "otpauth://totp/Xminds:test?secret=ONCEONLYSEED", ExpiresAt: time.Date(2026, 8, 21, 18, 0, 0, 0, time.UTC)},
+		mfaActivation:      LocalActivationResult{RecoveryCodes: []string{"AAAA-BBBB-CCCC-DDDD-EEEE-FFFF"}},
+		provisioning: LocalUserProvisioning{User: UserPrincipal{ID: userID}, ActivationToken: "once-only-activation",
+			ActivationExpires: time.Date(2026, 8, 22, 18, 0, 0, 0, time.UTC)},
+	}
+	handler := authenticatedIAMHandler(application)
+
+	for _, testCase := range []struct {
+		name       string
+		method     string
+		path       string
+		body       string
+		wantStatus int
+		wantSecret string
+	}{
+		{name: "begin rotation", method: http.MethodPost, path: "/api/v1/users/" + userID.String() + "/mfa/enrollments", body: `{"version":1,"reason":"Rotate compromised factor.",` + proof + `}`, wantStatus: http.StatusCreated, wantSecret: "ONCEONLYSEED"},
+		{name: "confirm rotation", method: http.MethodPost, path: "/api/v1/users/" + userID.String() + "/mfa/enrollments/" + enrollmentID.String() + "/confirm", body: `{"version":1,"mfa_proof":"123456","reason":"Confirm replacement factor."}`, wantStatus: http.StatusOK, wantSecret: "AAAA-BBBB-CCCC-DDDD-EEEE-FFFF"},
+		{name: "regenerate recovery", method: http.MethodPost, path: "/api/v1/users/" + userID.String() + "/mfa/recovery-codes/regenerate", body: `{"version":1,"reason":"Replace exposed recovery codes.",` + proof + `}`, wantStatus: http.StatusOK, wantSecret: "AAAA-BBBB-CCCC-DDDD-EEEE-FFFF"},
+		{name: "provision emergency", method: http.MethodPost, path: "/api/v1/emergency-users", body: `{"username":"emergency.secondary","display_name":"Secondary Emergency","email":"emergency.secondary@example.com","reason":"Provision secondary break glass administrator.",` + proof + `}`, wantStatus: http.StatusCreated, wantSecret: "once-only-activation"},
+		{name: "reissue emergency", method: http.MethodPost, path: "/api/v1/emergency-users/" + userID.String() + "/activation-token/reissue", body: `{"version":1,"reason":"Reissue expired emergency activation.",` + proof + `}`, wantStatus: http.StatusOK, wantSecret: "once-only-activation"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			request := httptest.NewRequest(testCase.method, testCase.path, strings.NewReader(testCase.body))
+			request.Header.Set("Authorization", "Bearer token")
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != testCase.wantStatus || response.Header().Get("Cache-Control") != "no-store" || !strings.Contains(response.Body.String(), testCase.wantSecret) {
+				t.Fatalf("status=%d headers=%v body=%s", response.Code, response.Header(), response.Body)
+			}
+		})
+	}
+	if application.mfaBeginCalls != 1 || application.mfaConfirmCalls != 1 || application.mfaRegenerateCalls != 1 || application.emergencyProvisionCalls != 1 || application.emergencyReissueCalls != 1 {
+		t.Fatalf("management calls begin=%d confirm=%d regenerate=%d provision=%d reissue=%d", application.mfaBeginCalls, application.mfaConfirmCalls, application.mfaRegenerateCalls, application.emergencyProvisionCalls, application.emergencyReissueCalls)
+	}
+}
+
+func TestMFAManagementHTTPRejectsMalformedInputBeforeApplication(t *testing.T) {
+	t.Parallel()
+	userID := uuid.MustParse("018f835d-7e4b-7abc-9f42-67a2f5f48e81")
+	enrollmentID := uuid.MustParse("018f835d-7e4b-7abc-9f42-67a2f5f48e82")
+	application := &stubIAMApplication{}
+	handler := authenticatedIAMHandler(application)
+	for _, testCase := range []struct {
+		name string
+		path string
+		body string
+	}{
+		{name: "invalid begin proof", path: "/api/v1/users/" + userID.String() + "/mfa/enrollments", body: `{"version":1,"reason":"Rotate compromised factor.","reauthentication":{"challenge_id":"invalid","evidence":"invalid","confirmed":true}}`},
+		{name: "confirm unknown field", path: "/api/v1/users/" + userID.String() + "/mfa/enrollments/" + enrollmentID.String() + "/confirm", body: `{"version":1,"mfa_proof":"123456","reason":"Confirm replacement factor.","recovery_code":"must-not-be-accepted"}`},
+		{name: "regenerate missing confirmed", path: "/api/v1/users/" + userID.String() + "/mfa/recovery-codes/regenerate", body: `{"version":1,"reason":"Replace exposed recovery codes.","reauthentication":{"challenge_id":"018f835d-7e4b-7abc-9f42-67a2f5f48e74","evidence":"xmr_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ"}}`},
+		{name: "provision unknown field", path: "/api/v1/emergency-users", body: `{"username":"emergency.secondary","display_name":"Secondary Emergency","reason":"Provision secondary break glass administrator.","reauthentication":{"challenge_id":"018f835d-7e4b-7abc-9f42-67a2f5f48e74","evidence":"xmr_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ","confirmed":true},"kind":"local"}`},
+		{name: "reissue false confirmed", path: "/api/v1/emergency-users/" + userID.String() + "/activation-token/reissue", body: `{"version":1,"reason":"Reissue expired emergency activation.","reauthentication":{"challenge_id":"018f835d-7e4b-7abc-9f42-67a2f5f48e74","evidence":"xmr_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ","confirmed":false}}`},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, testCase.path, strings.NewReader(testCase.body))
+			request.Header.Set("Authorization", "Bearer token")
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body)
+			}
+		})
+	}
+	if application.mfaBeginCalls+application.mfaConfirmCalls+application.mfaRegenerateCalls+application.emergencyProvisionCalls+application.emergencyReissueCalls != 0 {
+		t.Fatalf("malformed input reached application: %+v", application)
+	}
+}
+
 // Mutation caught: omitting any organization governance route leaves the
 // backend contract incomplete even if list/create still work.
 func TestHTTPHandlerExposesOrganizationDetailChildrenAndMembershipLifecycle(t *testing.T) {
@@ -720,6 +796,13 @@ type stubIAMApplication struct {
 	highRiskProof              HighRiskProof
 	highRiskAction             string
 	highRiskVersion            int64
+	mfaEnrollmentStart         MFAEnrollmentStart
+	mfaActivation              LocalActivationResult
+	mfaBeginCalls              int
+	mfaConfirmCalls            int
+	mfaRegenerateCalls         int
+	emergencyProvisionCalls    int
+	emergencyReissueCalls      int
 }
 
 func (application *stubIAMApplication) GetOrganization(context.Context, identity.Principal, uuid.UUID) (OrganizationUnit, error) {
@@ -755,6 +838,35 @@ func (application *stubIAMApplication) CreateLocalUser(_ context.Context, _ iden
 	application.createCommand = command
 	application.createRequest = request
 	return application.provisioning, application.createError
+}
+
+func (application *stubIAMApplication) BeginMFARotation(_ context.Context, _ identity.Principal, _ uuid.UUID, _ BeginMFARotationCommand, proof HighRiskProof, _ RequestContext) (MFAEnrollmentStart, error) {
+	application.mfaBeginCalls++
+	application.highRiskProof = proof
+	return application.mfaEnrollmentStart, nil
+}
+
+func (application *stubIAMApplication) ConfirmMFARotation(_ context.Context, _ identity.Principal, _, _ uuid.UUID, _ ConfirmMFARotationCommand, _ RequestContext) (LocalActivationResult, error) {
+	application.mfaConfirmCalls++
+	return application.mfaActivation, nil
+}
+
+func (application *stubIAMApplication) RegenerateMFARecoveryCodes(_ context.Context, _ identity.Principal, _ uuid.UUID, _ RegenerateMFARecoveryCodesCommand, proof HighRiskProof, _ RequestContext) (LocalActivationResult, error) {
+	application.mfaRegenerateCalls++
+	application.highRiskProof = proof
+	return application.mfaActivation, nil
+}
+
+func (application *stubIAMApplication) ProvisionEmergencyUser(_ context.Context, _ identity.Principal, _ CreateEmergencyUserCommand, proof HighRiskProof, _ RequestContext) (LocalUserProvisioning, error) {
+	application.emergencyProvisionCalls++
+	application.highRiskProof = proof
+	return application.provisioning, nil
+}
+
+func (application *stubIAMApplication) ReissueEmergencyActivation(_ context.Context, _ identity.Principal, _ uuid.UUID, _ ReissueEmergencyActivationCommand, proof HighRiskProof, _ RequestContext) (LocalUserProvisioning, error) {
+	application.emergencyReissueCalls++
+	application.highRiskProof = proof
+	return application.provisioning, nil
 }
 
 func (application *stubIAMApplication) GetUser(context.Context, identity.Principal, uuid.UUID) (UserPrincipal, error) {

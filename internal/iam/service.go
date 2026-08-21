@@ -27,30 +27,39 @@ var identityFaultCodePattern = regexp.MustCompile(`^[A-Z][A-Z0-9_]{2,63}$`)
 var localUsernamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{2,127}$`)
 
 type ServiceConfig struct {
-	Repository    Repository
-	ScopeCatalog  ScopeCatalogValidator
-	BreakGlass    BreakGlassInvariant
-	Auditor       AuditAppender
-	Sessions      SessionRevoker
-	Passwords     PasswordService
-	Directory     DirectoryAdapter
-	DirectorySync *DirectorySyncService
-	HighRisk      HighRiskAuthorizer
-	Clock         func() time.Time
+	Repository       Repository
+	ScopeCatalog     ScopeCatalogValidator
+	BreakGlass       BreakGlassInvariant
+	Auditor          AuditAppender
+	Sessions         SessionRevoker
+	Passwords        PasswordService
+	Directory        DirectoryAdapter
+	DirectorySync    *DirectorySyncService
+	HighRisk         HighRiskAuthorizer
+	MFASecrets       MFASecretStore
+	MFAVerifier      MFAVerifier
+	MFAEnrollmentTTL time.Duration
+	MFAIssuer        string
+	Clock            func() time.Time
 }
 
 type Service struct {
-	repository    Repository
-	scopeCatalog  ScopeCatalogValidator
-	breakGlass    BreakGlassInvariant
-	auditor       AuditAppender
-	sessions      SessionRevoker
-	passwords     PasswordService
-	directory     DirectoryAdapter
-	directorySync *DirectorySyncService
-	highRisk      HighRiskAuthorizer
-	authorizer    *identity.Authorizer
-	clock         func() time.Time
+	repository       Repository
+	scopeCatalog     ScopeCatalogValidator
+	breakGlass       BreakGlassInvariant
+	auditor          AuditAppender
+	sessions         SessionRevoker
+	passwords        PasswordService
+	directory        DirectoryAdapter
+	directorySync    *DirectorySyncService
+	highRisk         HighRiskAuthorizer
+	mfaRepository    mfaManagementRepository
+	mfaSecrets       MFASecretStore
+	mfaVerifier      MFAVerifier
+	mfaEnrollmentTTL time.Duration
+	mfaIssuer        string
+	authorizer       *identity.Authorizer
+	clock            func() time.Time
 }
 
 func (service *Service) CreateOrganization(ctx context.Context, actor identity.Principal, command CreateOrganizationCommand, request RequestContext) (OrganizationUnit, error) {
@@ -854,9 +863,17 @@ func NewService(config ServiceConfig) (*Service, error) {
 	if config.Repository == nil || config.ScopeCatalog == nil || config.BreakGlass == nil || config.Auditor == nil || config.Passwords == nil || config.Clock == nil {
 		return nil, ErrIAMConfiguration
 	}
+	mfaRepository, _ := config.Repository.(mfaManagementRepository)
+	if config.MFASecrets != nil || config.MFAVerifier != nil || config.MFAEnrollmentTTL != 0 || config.MFAIssuer != "" {
+		if mfaRepository == nil || config.MFASecrets == nil || config.MFAVerifier == nil || config.MFAEnrollmentTTL < 5*time.Minute || config.MFAEnrollmentTTL > 15*time.Minute || !validMFATOTPIssuer(config.MFAIssuer) {
+			return nil, ErrIAMConfiguration
+		}
+	}
 	return &Service{
 		repository: config.Repository, scopeCatalog: config.ScopeCatalog, breakGlass: config.BreakGlass, auditor: config.Auditor, sessions: config.Sessions, directory: config.Directory, directorySync: config.DirectorySync, highRisk: config.HighRisk,
 		passwords: config.Passwords, authorizer: identity.NewAuthorizer(), clock: config.Clock,
+		mfaRepository: mfaRepository, mfaSecrets: config.MFASecrets, mfaVerifier: config.MFAVerifier,
+		mfaEnrollmentTTL: config.MFAEnrollmentTTL, mfaIssuer: config.MFAIssuer,
 	}, nil
 }
 

@@ -41,6 +41,24 @@ type Repository interface {
 	UpdateIdentitySourceDraft(ctx context.Context, tx pgx.Tx, source IdentitySource, expectedVersion int64) error
 }
 
+type MFARepository interface {
+	GetMFAEnrollmentForUpdate(ctx context.Context, tx pgx.Tx, enrollmentID uuid.UUID) (MFAEnrollment, error)
+	GetPendingMFAEnrollmentForUpdate(ctx context.Context, tx pgx.Tx, userID uuid.UUID) (MFAEnrollment, error)
+	InsertMFAEnrollment(ctx context.Context, tx pgx.Tx, enrollment MFAEnrollment) error
+	ConfirmMFAEnrollment(ctx context.Context, tx pgx.Tx, enrollmentID uuid.UUID, expectedVersion int64, confirmedAt time.Time) error
+	ExpireMFAEnrollment(ctx context.Context, tx pgx.Tx, enrollmentID uuid.UUID, expectedVersion int64, expiredAt time.Time) error
+	ReplaceMFARecoveryCodes(ctx context.Context, tx pgx.Tx, userID, generationID uuid.UUID, digests []string, createdAt time.Time) error
+	ConsumeMFARecoveryCode(ctx context.Context, tx pgx.Tx, userID uuid.UUID, digest string, usedAt time.Time) (bool, error)
+	EnqueueMFASecretGC(ctx context.Context, tx pgx.Tx, reference string, notBefore, createdAt time.Time) error
+	ListDueMFASecretGC(ctx context.Context, at time.Time, limit int) ([]MFASecretGCItem, error)
+	LockMFASecretReference(ctx context.Context, tx pgx.Tx, reference string) error
+	MFASecretReferenceIsLive(ctx context.Context, tx pgx.Tx, reference string, at time.Time) (bool, error)
+	MFASecretReferenceHasTombstone(ctx context.Context, tx pgx.Tx, reference string) (bool, error)
+	LeaseDueMFASecretGC(ctx context.Context, tx pgx.Tx, reference string, at time.Time, leaseToken uuid.UUID, leasedUntil time.Time) (bool, error)
+	CompleteMFASecretGC(ctx context.Context, tx pgx.Tx, reference string, leaseToken uuid.UUID) error
+	FailMFASecretGC(ctx context.Context, tx pgx.Tx, reference string, leaseToken uuid.UUID, retryAt time.Time, errorCode string, failedAt time.Time) error
+}
+
 // ScopeCatalogValidator is the authoritative catalog boundary for IAM role
 // scopes. Transactional callers pass their transaction so the validated
 // product/channel remains protected until the role binding is persisted.

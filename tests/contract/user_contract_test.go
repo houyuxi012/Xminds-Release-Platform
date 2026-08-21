@@ -24,6 +24,11 @@ func TestMountedUserRoutesHaveOpenAPIOperations(t *testing.T) {
 		{method: http.MethodPost, path: "/api/v1/local-users"},
 		{method: http.MethodGet, path: "/api/v1/users"},
 		{method: http.MethodGet, path: "/api/v1/users/018f835d-7e4b-7abc-9f42-67a2f5f48e58"},
+		{method: http.MethodPost, path: "/api/v1/users/018f835d-7e4b-7abc-9f42-67a2f5f48e58/mfa/enrollments"},
+		{method: http.MethodPost, path: "/api/v1/users/018f835d-7e4b-7abc-9f42-67a2f5f48e58/mfa/enrollments/018f835d-7e4b-7abc-9f42-67a2f5f48e59/confirm"},
+		{method: http.MethodPost, path: "/api/v1/users/018f835d-7e4b-7abc-9f42-67a2f5f48e58/mfa/recovery-codes/regenerate"},
+		{method: http.MethodPost, path: "/api/v1/emergency-users"},
+		{method: http.MethodPost, path: "/api/v1/emergency-users/018f835d-7e4b-7abc-9f42-67a2f5f48e58/activation-token/reissue"},
 	} {
 		response := httptest.NewRecorder()
 		handler.ServeHTTP(response, httptest.NewRequest(route.method, route.path, nil))
@@ -47,6 +52,11 @@ func TestMountedUserRoutesHaveOpenAPIOperations(t *testing.T) {
 		{method: http.MethodPost, path: "/api/v1/local-users"},
 		{method: http.MethodGet, path: "/api/v1/users"},
 		{method: http.MethodGet, path: "/api/v1/users/{user_id}"},
+		{method: http.MethodPost, path: "/api/v1/users/{user_id}/mfa/enrollments"},
+		{method: http.MethodPost, path: "/api/v1/users/{user_id}/mfa/enrollments/{enrollment_id}/confirm"},
+		{method: http.MethodPost, path: "/api/v1/users/{user_id}/mfa/recovery-codes/regenerate"},
+		{method: http.MethodPost, path: "/api/v1/emergency-users"},
+		{method: http.MethodPost, path: "/api/v1/emergency-users/{user_id}/activation-token/reissue"},
 	} {
 		pathItem := document.Paths.Find(operation.path)
 		if pathItem == nil || pathItem.GetOperation(operation.method) == nil {
@@ -145,4 +155,24 @@ func (userRouteContractApplication) EnableSSO(context.Context, identity.Principa
 
 func (userRouteContractApplication) DisableSSO(context.Context, identity.Principal, uuid.UUID, int64, iam.HighRiskProof, iam.RequestContext) error {
 	return nil
+}
+
+func (userRouteContractApplication) BeginMFARotation(context.Context, identity.Principal, uuid.UUID, iam.BeginMFARotationCommand, iam.HighRiskProof, iam.RequestContext) (iam.MFAEnrollmentStart, error) {
+	return iam.MFAEnrollmentStart{}, nil
+}
+
+func (userRouteContractApplication) ConfirmMFARotation(context.Context, identity.Principal, uuid.UUID, uuid.UUID, iam.ConfirmMFARotationCommand, iam.RequestContext) (iam.LocalActivationResult, error) {
+	return iam.LocalActivationResult{}, nil
+}
+
+func (userRouteContractApplication) RegenerateMFARecoveryCodes(context.Context, identity.Principal, uuid.UUID, iam.RegenerateMFARecoveryCodesCommand, iam.HighRiskProof, iam.RequestContext) (iam.LocalActivationResult, error) {
+	return iam.LocalActivationResult{}, nil
+}
+
+func (userRouteContractApplication) ProvisionEmergencyUser(context.Context, identity.Principal, iam.CreateEmergencyUserCommand, iam.HighRiskProof, iam.RequestContext) (iam.LocalUserProvisioning, error) {
+	return iam.LocalUserProvisioning{}, nil
+}
+
+func (userRouteContractApplication) ReissueEmergencyActivation(context.Context, identity.Principal, uuid.UUID, iam.ReissueEmergencyActivationCommand, iam.HighRiskProof, iam.RequestContext) (iam.LocalUserProvisioning, error) {
+	return iam.LocalUserProvisioning{}, nil
 }

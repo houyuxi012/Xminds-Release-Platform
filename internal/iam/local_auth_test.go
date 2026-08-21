@@ -59,6 +59,33 @@ func TestLocalReauthenticationReusesPasswordMFAAndDoesNotCreateSession(t *testin
 	}
 }
 
+func TestLocalReauthenticationDoesNotHoldDatabaseTransactionDuringSecretResolution(t *testing.T) {
+	harness := newActiveLocalAuthHarness(t, UserKindLocal, true, LoginModeLocal)
+	sessionID := uuid.MustParse("018f835d-7e4b-7abc-9f42-67a2f5f49003")
+	harness.repository.sessions[sessionID] = validMemorySession(harness, sessionID)
+	actor := identity.Principal{Subject: "release.operator", Kind: identity.PrincipalKindLocal, TokenID: sessionID.String(), AuthenticationAssurance: 1}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	harness.service.mfa = blockingMFAVerifier{entered: entered, release: release}
+	done := make(chan error, 1)
+	go func() {
+		done <- harness.service.Reauthenticate(context.Background(), actor, CompleteReauthenticationCommand{
+			Password: "Current-Strong-Password!", MFAProof: "123456",
+		}, harness.request)
+	}()
+	<-entered
+	if !harness.repository.mu.TryLock() {
+		close(release)
+		<-done
+		t.Fatal("database transaction lock was held while reauthentication MFA secret was resolved")
+	}
+	harness.repository.mu.Unlock()
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("Reauthenticate() error = %v", err)
+	}
+}
+
 func TestLocalReauthenticationCredentialAndMFAFailuresUseProgressiveLockout(t *testing.T) {
 	for _, testCase := range []struct {
 		name     string
@@ -186,6 +213,163 @@ func TestLocalLoginReturnsOpaquePersistedSessionWithBoundedLifetime(t *testing.T
 		if !session.AbsoluteExpiresAt.Equal(harness.now.Add(12*time.Hour)) || !session.IdleExpiresAt.Equal(harness.now.Add(30*time.Minute)) {
 			t.Fatalf("session expiry = %+v", session)
 		}
+	}
+}
+
+func TestLocalLoginRequiresMFAForEveryEnrolledUserAndDerivesSessionLevelFromUsedFactor(t *testing.T) {
+	t.Run("enrolled ordinary user requires a factor", func(t *testing.T) {
+		harness := newActiveLocalAuthHarness(t, UserKindLocal, false, LoginModeLocal)
+		user := harness.repository.users[harness.userID]
+		user.MFAEnrolled = true
+		harness.repository.users[harness.userID] = user
+
+		if _, err := harness.service.LoginLocal(context.Background(), LocalLoginCommand{
+			Username: "release.operator", Password: "Current-Strong-Password!",
+		}, harness.request); !errors.Is(err, ErrLocalAuthenticationFailed) {
+			t.Fatalf("LoginLocal() error = %v, want authentication failure", err)
+		}
+		if len(harness.repository.sessions) != 0 {
+			t.Fatalf("sessions = %+v, want none", harness.repository.sessions)
+		}
+	})
+
+	t.Run("enrolled ordinary user TOTP creates level one session", func(t *testing.T) {
+		harness := newActiveLocalAuthHarness(t, UserKindLocal, false, LoginModeLocal)
+		user := harness.repository.users[harness.userID]
+		user.MFAEnrolled = true
+		harness.repository.users[harness.userID] = user
+
+		if _, err := harness.service.LoginLocal(context.Background(), LocalLoginCommand{
+			Username: "release.operator", Password: "Current-Strong-Password!", MFAProof: "123456",
+		}, harness.request); err != nil {
+			t.Fatalf("LoginLocal() error = %v", err)
+		}
+		for _, session := range harness.repository.sessions {
+			if session.MFALevel != 1 {
+				t.Fatalf("MFA level = %d, want 1", session.MFALevel)
+			}
+		}
+	})
+
+	t.Run("unenrolled ordinary user accepts no factor and rejects supplied factor", func(t *testing.T) {
+		harness := newActiveLocalAuthHarness(t, UserKindLocal, false, LoginModeLocal)
+		if _, err := harness.service.LoginLocal(context.Background(), LocalLoginCommand{
+			Username: "release.operator", Password: "Current-Strong-Password!",
+		}, harness.request); err != nil {
+			t.Fatalf("LoginLocal() error = %v", err)
+		}
+		for _, session := range harness.repository.sessions {
+			if session.MFALevel != 0 {
+				t.Fatalf("MFA level = %d, want 0", session.MFALevel)
+			}
+		}
+
+		withUnexpectedFactor := newActiveLocalAuthHarness(t, UserKindLocal, false, LoginModeLocal)
+		if _, err := withUnexpectedFactor.service.LoginLocal(context.Background(), LocalLoginCommand{
+			Username: "release.operator", Password: "Current-Strong-Password!", MFAProof: "123456",
+		}, withUnexpectedFactor.request); !errors.Is(err, ErrLocalAuthenticationFailed) {
+			t.Fatalf("LoginLocal() error = %v, want authentication failure", err)
+		}
+	})
+}
+
+func TestLocalLoginRecoveryCodeIsAtomicSingleUseAndMutuallyExclusiveWithTOTP(t *testing.T) {
+	const recoveryCode = "ABCD-EFGH-JKLM-NPQR-STUV-WXYZ"
+	harness := newActiveLocalAuthHarness(t, UserKindLocal, false, LoginModeLocal)
+	user := harness.repository.users[harness.userID]
+	user.MFAEnrolled = true
+	harness.repository.users[harness.userID] = user
+	canonical := strings.ReplaceAll(recoveryCode, "-", "")
+	digest := sha256.Sum256([]byte(canonical))
+	harness.repository.recoveryDigests[harness.userID] = []string{hex.EncodeToString(digest[:])}
+
+	if _, err := harness.service.LoginLocal(context.Background(), LocalLoginCommand{
+		Username: "release.operator", Password: "Current-Strong-Password!", RecoveryCode: recoveryCode,
+	}, harness.request); err != nil {
+		t.Fatalf("first LoginLocal() error = %v", err)
+	}
+	for _, session := range harness.repository.sessions {
+		if session.MFALevel != 1 {
+			t.Fatalf("MFA level = %d, want 1", session.MFALevel)
+		}
+	}
+	if !harness.repository.usedRecoveryDigests[harness.userID][hex.EncodeToString(digest[:])] {
+		t.Fatal("recovery code was not consumed")
+	}
+	if _, err := harness.service.LoginLocal(context.Background(), LocalLoginCommand{
+		Username: "release.operator", Password: "Current-Strong-Password!", RecoveryCode: recoveryCode,
+	}, harness.request); !errors.Is(err, ErrLocalAuthenticationFailed) {
+		t.Fatalf("replayed LoginLocal() error = %v", err)
+	}
+
+	both := newActiveLocalAuthHarness(t, UserKindLocal, false, LoginModeLocal)
+	bothUser := both.repository.users[both.userID]
+	bothUser.MFAEnrolled = true
+	both.repository.users[both.userID] = bothUser
+	both.repository.recoveryDigests[both.userID] = []string{hex.EncodeToString(digest[:])}
+	if _, err := both.service.LoginLocal(context.Background(), LocalLoginCommand{
+		Username: "release.operator", Password: "Current-Strong-Password!", MFAProof: "123456", RecoveryCode: recoveryCode,
+	}, both.request); !errors.Is(err, ErrLocalAuthenticationFailed) {
+		t.Fatalf("dual-factor LoginLocal() error = %v", err)
+	}
+	if both.repository.usedRecoveryDigests[both.userID][hex.EncodeToString(digest[:])] {
+		t.Fatal("mutually exclusive factors consumed recovery code")
+	}
+}
+
+func TestLocalLoginAuditFailureRollsBackRecoveryConsumptionAndSession(t *testing.T) {
+	const recoveryCode = "ABCD-EFGH-JKLM-NPQR-STUV-WXYZ"
+	harness := newActiveLocalAuthHarness(t, UserKindLocal, false, LoginModeLocal)
+	user := harness.repository.users[harness.userID]
+	user.MFAEnrolled = true
+	harness.repository.users[harness.userID] = user
+	canonical := strings.ReplaceAll(recoveryCode, "-", "")
+	digest := sha256.Sum256([]byte(canonical))
+	digestString := hex.EncodeToString(digest[:])
+	harness.repository.recoveryDigests[harness.userID] = []string{digestString}
+	harness.auditor.failAction = "identity.local_user.login"
+
+	if _, err := harness.service.LoginLocal(context.Background(), LocalLoginCommand{
+		Username: "release.operator", Password: "Current-Strong-Password!", RecoveryCode: recoveryCode,
+	}, harness.request); err == nil {
+		t.Fatal("LoginLocal() error = nil, want audit failure")
+	}
+	if harness.repository.usedRecoveryDigests[harness.userID][digestString] || len(harness.repository.sessions) != 0 {
+		t.Fatalf("failed transaction state: used=%v sessions=%+v", harness.repository.usedRecoveryDigests, harness.repository.sessions)
+	}
+	harness.auditor.failAction = ""
+	if _, err := harness.service.LoginLocal(context.Background(), LocalLoginCommand{
+		Username: "release.operator", Password: "Current-Strong-Password!", RecoveryCode: recoveryCode,
+	}, harness.request); err != nil {
+		t.Fatalf("retry LoginLocal() error = %v", err)
+	}
+}
+
+func TestLocalLoginDoesNotHoldDatabaseTransactionDuringSecretResolution(t *testing.T) {
+	harness := newActiveLocalAuthHarness(t, UserKindLocal, false, LoginModeLocal)
+	user := harness.repository.users[harness.userID]
+	user.MFAEnrolled = true
+	harness.repository.users[harness.userID] = user
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	harness.service.mfa = blockingMFAVerifier{entered: entered, release: release}
+	done := make(chan error, 1)
+	go func() {
+		_, err := harness.service.LoginLocal(context.Background(), LocalLoginCommand{
+			Username: "release.operator", Password: "Current-Strong-Password!", MFAProof: "123456",
+		}, harness.request)
+		done <- err
+	}()
+	<-entered
+	if !harness.repository.mu.TryLock() {
+		close(release)
+		<-done
+		t.Fatal("database transaction lock was held while MFA secret was resolved")
+	}
+	harness.repository.mu.Unlock()
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("LoginLocal() error = %v", err)
 	}
 }
 
@@ -610,19 +794,27 @@ func TestActivateAdministratorRequiresNonReplayableMFAEnrollment(t *testing.T) {
 	t.Parallel()
 
 	harness := newLocalAuthHarness(t, UserKindLocal, true)
+	enrollmentID := seedActivationMFAEnrollment(t, harness)
 	command := ActivateLocalAccountCommand{
-		ActivationToken:    harness.activationToken,
-		NewPassword:        "A-Strong-Admin-Password!",
-		MFASecretReference: "secret://iam/admin-totp",
-		MFAProof:           "123456",
+		ActivationToken: harness.activationToken,
+		NewPassword:     "A-Strong-Admin-Password!",
+		MFAEnrollmentID: enrollmentID,
+		MFAProof:        "123456",
 	}
-	if err := harness.service.Activate(context.Background(), command, harness.request); err != nil {
+	result, err := harness.service.ActivateWithResult(context.Background(), command, harness.request)
+	if err != nil {
 		t.Fatalf("Activate(admin) error = %v", err)
 	}
 	user := harness.repository.users[harness.userID]
 	credential := harness.repository.credentials[harness.userID]
-	if !user.MFAEnrolled || credential.MFASecretReference != "secret://iam/admin-totp" || credential.MFALastCounter != 42 {
+	wantReference := "secret://iam-mfa/mfa-" + enrollmentID.String() + ".totp"
+	if !user.MFAEnrolled || credential.MFASecretReference != wantReference || credential.MFALastCounter != 42 || len(result.RecoveryCodes) != 10 || len(harness.repository.recoveryDigests[harness.userID]) != 10 {
 		t.Fatalf("MFA activation state = user=%+v credential=%+v", user, credential)
+	}
+	for _, code := range result.RecoveryCodes {
+		if len(strings.ReplaceAll(code, "-", "")) != 24 || code != strings.ToUpper(code) {
+			t.Fatalf("invalid recovery code format=%q", code)
+		}
 	}
 
 	missing := newLocalAuthHarness(t, UserKindEmergency, false)
@@ -631,6 +823,47 @@ func TestActivateAdministratorRequiresNonReplayableMFAEnrollment(t *testing.T) {
 	}, missing.request); !errors.Is(err, ErrLocalAuthenticationFailed) {
 		t.Fatalf("Activate(emergency without MFA) error = %v", err)
 	}
+}
+
+func TestLocalActivationDoesNotHoldDatabaseTransactionDuringSecretResolution(t *testing.T) {
+	harness := newLocalAuthHarness(t, UserKindEmergency, true)
+	enrollmentID := seedActivationMFAEnrollment(t, harness)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	harness.service.mfa = blockingMFAVerifier{entered: entered, release: release}
+	done := make(chan error, 1)
+	go func() {
+		_, err := harness.service.ActivateWithResult(context.Background(), ActivateLocalAccountCommand{
+			ActivationToken: harness.activationToken, NewPassword: "A-Different-Strong-Password!",
+			MFAEnrollmentID: enrollmentID, MFAProof: "123456",
+		}, harness.request)
+		done <- err
+	}()
+	<-entered
+	if !harness.repository.mu.TryLock() {
+		close(release)
+		<-done
+		t.Fatal("database transaction lock was held while MFA secret was resolved")
+	}
+	harness.repository.mu.Unlock()
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("ActivateWithResult() error = %v", err)
+	}
+}
+
+func seedActivationMFAEnrollment(t *testing.T, harness *localAuthHarness) uuid.UUID {
+	t.Helper()
+	id, err := uuid.NewV7()
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness.repository.enrollments[id] = MFAEnrollment{
+		ID: id, UserID: harness.userID, Purpose: MFAEnrollmentPurposeActivation, Status: MFAEnrollmentStatusPending,
+		SecretReference: "secret://iam-mfa/mfa-" + id.String() + ".totp", ExpectedUserVersion: 1,
+		ExpiresAt: harness.now.Add(10 * time.Minute), Version: 1, CreatedAt: harness.now, UpdatedAt: harness.now,
+	}
+	return id
 }
 
 func TestActivateLocalAccountAllowsOnlyOneConcurrentConsumer(t *testing.T) {
@@ -764,10 +997,14 @@ func newLocalAuthHarness(t *testing.T, kind UserKind, admin bool) *localAuthHarn
 		credentials: map[uuid.UUID]LocalCredential{userID: {
 			UserID: userID, ActivationDigest: hex.EncodeToString(digest[:]), ActivationExpiresAt: now.Add(time.Hour),
 		}},
-		history:    map[uuid.UUID][]PasswordDigest{},
-		admins:     map[uuid.UUID]bool{userID: admin},
-		rateLimits: map[string]memoryRateWindow{},
-		sessions:   map[uuid.UUID]Session{},
+		history:             map[uuid.UUID][]PasswordDigest{},
+		admins:              map[uuid.UUID]bool{userID: admin},
+		rateLimits:          map[string]memoryRateWindow{},
+		sessions:            map[uuid.UUID]Session{},
+		enrollments:         map[uuid.UUID]MFAEnrollment{},
+		recoveryDigests:     map[uuid.UUID][]string{},
+		usedRecoveryDigests: map[uuid.UUID]map[string]bool{},
+		mfaTombstones:       map[string]bool{},
 	}
 	passwords := &testPasswordManager{}
 	dummyPassword, err := passwords.Hash(context.Background(), "Dummy-Authentication-Password!")
@@ -832,6 +1069,10 @@ type memoryLocalAuthRepository struct {
 	admins                        map[uuid.UUID]bool
 	rateLimits                    map[string]memoryRateWindow
 	sessions                      map[uuid.UUID]Session
+	enrollments                   map[uuid.UUID]MFAEnrollment
+	recoveryDigests               map[uuid.UUID][]string
+	usedRecoveryDigests           map[uuid.UUID]map[string]bool
+	mfaTombstones                 map[string]bool
 	failActivationAfterUserUpdate bool
 	findActivationError           error
 	findLoginError                error
@@ -851,6 +1092,9 @@ func (repository *memoryLocalAuthRepository) WithinTransaction(_ context.Context
 	history := cloneHistory(repository.history)
 	rateLimits := cloneRateLimits(repository.rateLimits)
 	sessions := cloneSessions(repository.sessions)
+	enrollments := cloneMFAEnrollments(repository.enrollments)
+	recoveryDigests := cloneStringSlices(repository.recoveryDigests)
+	usedRecoveryDigests := cloneRecoveryUsage(repository.usedRecoveryDigests)
 	err := function(nil)
 	if err != nil {
 		repository.users = users
@@ -858,8 +1102,38 @@ func (repository *memoryLocalAuthRepository) WithinTransaction(_ context.Context
 		repository.history = history
 		repository.rateLimits = rateLimits
 		repository.sessions = sessions
+		repository.enrollments = enrollments
+		repository.recoveryDigests = recoveryDigests
+		repository.usedRecoveryDigests = usedRecoveryDigests
 	}
 	return err
+}
+
+func cloneRecoveryUsage(source map[uuid.UUID]map[string]bool) map[uuid.UUID]map[string]bool {
+	result := make(map[uuid.UUID]map[string]bool, len(source))
+	for userID, digests := range source {
+		result[userID] = make(map[string]bool, len(digests))
+		for digest, used := range digests {
+			result[userID][digest] = used
+		}
+	}
+	return result
+}
+
+func cloneMFAEnrollments(source map[uuid.UUID]MFAEnrollment) map[uuid.UUID]MFAEnrollment {
+	result := make(map[uuid.UUID]MFAEnrollment, len(source))
+	for key, value := range source {
+		result[key] = value
+	}
+	return result
+}
+
+func cloneStringSlices(source map[uuid.UUID][]string) map[uuid.UUID][]string {
+	result := make(map[uuid.UUID][]string, len(source))
+	for key, value := range source {
+		result[key] = append([]string(nil), value...)
+	}
+	return result
 }
 
 func cloneSessions(source map[uuid.UUID]Session) map[uuid.UUID]Session {
@@ -905,6 +1179,69 @@ func (repository *memoryLocalAuthRepository) SaveActivation(_ context.Context, _
 	return nil
 }
 
+func (repository *memoryLocalAuthRepository) GetMFAEnrollmentForUpdate(_ context.Context, _ pgx.Tx, enrollmentID uuid.UUID) (MFAEnrollment, error) {
+	enrollment, exists := repository.enrollments[enrollmentID]
+	if !exists {
+		return MFAEnrollment{}, ErrMFAEnrollmentNotFound
+	}
+	return enrollment, nil
+}
+
+func (repository *memoryLocalAuthRepository) GetMFAActivationPreflight(_ context.Context, activationDigest string, enrollmentID uuid.UUID) (MFAEnrollment, error) {
+	repository.mu.Lock()
+	defer repository.mu.Unlock()
+	enrollment, exists := repository.enrollments[enrollmentID]
+	if !exists || repository.credentials[enrollment.UserID].ActivationDigest != activationDigest {
+		return MFAEnrollment{}, ErrMFAEnrollmentNotFound
+	}
+	return enrollment, nil
+}
+
+func (*memoryLocalAuthRepository) LockMFASecretReference(context.Context, pgx.Tx, string) error {
+	return nil
+}
+
+func (repository *memoryLocalAuthRepository) MFASecretReferenceHasTombstone(_ context.Context, _ pgx.Tx, reference string) (bool, error) {
+	return repository.mfaTombstones[reference], nil
+}
+
+func (repository *memoryLocalAuthRepository) ConfirmMFAEnrollment(_ context.Context, _ pgx.Tx, enrollmentID uuid.UUID, expectedVersion int64, confirmedAt time.Time) error {
+	enrollment, exists := repository.enrollments[enrollmentID]
+	if !exists || enrollment.Status != MFAEnrollmentStatusPending || enrollment.Version != expectedVersion || !enrollment.ExpiresAt.After(confirmedAt) {
+		return ErrIAMConflict
+	}
+	enrollment.Status = MFAEnrollmentStatusConfirmed
+	enrollment.ConfirmedAt = confirmedAt
+	enrollment.UpdatedAt = confirmedAt
+	enrollment.Version++
+	repository.enrollments[enrollmentID] = enrollment
+	return nil
+}
+
+func (repository *memoryLocalAuthRepository) ReplaceMFARecoveryCodes(_ context.Context, _ pgx.Tx, userID, _ uuid.UUID, digests []string, _ time.Time) error {
+	repository.recoveryDigests[userID] = append([]string(nil), digests...)
+	repository.usedRecoveryDigests[userID] = map[string]bool{}
+	return nil
+}
+
+func (repository *memoryLocalAuthRepository) ConsumeMFARecoveryCode(_ context.Context, _ pgx.Tx, userID uuid.UUID, digest string, _ time.Time) (bool, error) {
+	found := false
+	for _, candidate := range repository.recoveryDigests[userID] {
+		if candidate == digest {
+			found = true
+			break
+		}
+	}
+	if !found || repository.usedRecoveryDigests[userID][digest] {
+		return false, nil
+	}
+	if repository.usedRecoveryDigests[userID] == nil {
+		repository.usedRecoveryDigests[userID] = map[string]bool{}
+	}
+	repository.usedRecoveryDigests[userID][digest] = true
+	return true, nil
+}
+
 func cloneUsers(source map[uuid.UUID]UserPrincipal) map[uuid.UUID]UserPrincipal {
 	result := make(map[uuid.UUID]UserPrincipal, len(source))
 	for key, value := range source {
@@ -941,6 +1278,12 @@ func (repository *memoryLocalAuthRepository) FindLogin(_ context.Context, _ pgx.
 	return repository.login, UserPrincipal{}, LocalCredential{}, false, ErrLocalAuthenticationFailed
 }
 
+func (repository *memoryLocalAuthRepository) FindLoginPreflight(_ context.Context, username string) (LoginState, UserPrincipal, LocalCredential, bool, error) {
+	repository.mu.Lock()
+	defer repository.mu.Unlock()
+	return repository.FindLogin(context.Background(), nil, username)
+}
+
 func (repository *memoryLocalAuthRepository) FindLocalReauthentication(_ context.Context, _ pgx.Tx, username string, sessionID uuid.UUID) (LoginState, UserPrincipal, LocalCredential, Session, bool, error) {
 	if repository.findLoginError != nil {
 		return repository.login, UserPrincipal{}, LocalCredential{}, Session{}, false, repository.findLoginError
@@ -955,6 +1298,12 @@ func (repository *memoryLocalAuthRepository) FindLocalReauthentication(_ context
 		}
 	}
 	return repository.login, UserPrincipal{}, LocalCredential{}, Session{}, false, ErrLocalAuthenticationFailed
+}
+
+func (repository *memoryLocalAuthRepository) FindLocalReauthenticationPreflight(_ context.Context, username string, sessionID uuid.UUID) (LoginState, UserPrincipal, LocalCredential, Session, bool, error) {
+	repository.mu.Lock()
+	defer repository.mu.Unlock()
+	return repository.FindLocalReauthentication(context.Background(), nil, username, sessionID)
 }
 
 func (repository *memoryLocalAuthRepository) ConsumeRateLimit(_ context.Context, _ pgx.Tx, scope RateLimitScope, keyDigest string, windowStart time.Time, limit int, expiresAt time.Time) (bool, error) {
@@ -1033,6 +1382,17 @@ type fixedMFAVerifier struct {
 	counter int64
 }
 
+type blockingMFAVerifier struct {
+	entered chan<- struct{}
+	release <-chan struct{}
+}
+
+func (verifier blockingMFAVerifier) Verify(_ context.Context, _ string, _ string) (MFAAssertion, error) {
+	close(verifier.entered)
+	<-verifier.release
+	return MFAAssertion{Counter: 42}, nil
+}
+
 func (verifier fixedMFAVerifier) Verify(_ context.Context, _ string, proof string) (MFAAssertion, error) {
 	if proof != verifier.proof {
 		return MFAAssertion{}, ErrMFAProofInvalid
@@ -1041,9 +1401,10 @@ func (verifier fixedMFAVerifier) Verify(_ context.Context, _ string, proof strin
 }
 
 type lockedAuditRecorder struct {
-	mu       sync.Mutex
-	commands []audit.AppendCommand
-	err      error
+	mu         sync.Mutex
+	commands   []audit.AppendCommand
+	err        error
+	failAction string
 }
 
 func (recorder *lockedAuditRecorder) Append(_ context.Context, _ pgx.Tx, command audit.AppendCommand) (audit.Event, error) {
@@ -1051,6 +1412,9 @@ func (recorder *lockedAuditRecorder) Append(_ context.Context, _ pgx.Tx, command
 	defer recorder.mu.Unlock()
 	if recorder.err != nil {
 		return audit.Event{}, recorder.err
+	}
+	if recorder.failAction != "" && command.Action == recorder.failAction {
+		return audit.Event{}, ErrIAMConflict
 	}
 	recorder.commands = append(recorder.commands, command)
 	return audit.Event{}, nil

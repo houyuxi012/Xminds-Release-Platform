@@ -193,6 +193,230 @@ func TestCreateLocalUserRejectsInvalidIdentityFields(t *testing.T) {
 	}
 }
 
+func TestBeginMFARotationChecksAuthorityGovernanceAndCanonicalInputBeforeProof(t *testing.T) {
+	for _, testCase := range []struct {
+		name   string
+		mutate func(*iamHarness)
+		userID uuid.UUID
+		cmd    BeginMFARotationCommand
+	}{
+		{name: "unauthorized", mutate: func(h *iamHarness) {
+			h.admin.Roles = []identity.Role{identity.RoleViewer}
+			h.admin.RoleScopes = []identity.RoleScope{{Role: identity.RoleViewer, ScopeType: "platform", Effect: "allow"}}
+		}, cmd: BeginMFARotationCommand{UserVersion: 1, Reason: "Rotate compromised factor."}},
+		{name: "not governed", mutate: func(h *iamHarness) { h.admin.Governed = false }, cmd: BeginMFARotationCommand{UserVersion: 1, Reason: "Rotate compromised factor."}},
+		{name: "non canonical reason", cmd: BeginMFARotationCommand{UserVersion: 1, Reason: " Rotate compromised factor. "}},
+		{name: "invalid version", cmd: BeginMFARotationCommand{UserVersion: 0, Reason: "Rotate compromised factor."}},
+		{name: "missing target", userID: uuid.MustParse("018f835d-7e4b-7abc-9f42-67a2f5f48e99"), cmd: BeginMFARotationCommand{UserVersion: 1, Reason: "Rotate compromised factor."}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			harness := newIAMHarness(t)
+			governIAMAdminForMFA(harness)
+			if testCase.mutate != nil {
+				testCase.mutate(harness)
+			}
+			target := testCase.userID
+			if target == uuid.Nil {
+				target = harness.emergencyAdminID
+			}
+			if _, err := harness.service.BeginMFARotation(context.Background(), harness.admin, target, testCase.cmd, harness.proof(), harness.request); err == nil {
+				t.Fatal("BeginMFARotation() error=nil")
+			}
+			if len(harness.highRisk.operations) != 0 {
+				t.Fatalf("proof consumed before static precondition: %+v", harness.highRisk.operations)
+			}
+		})
+	}
+}
+
+func TestBeginMFARotationCreatesServerOwnedActorBoundEnrollment(t *testing.T) {
+	harness := newIAMHarness(t)
+	governIAMAdminForMFA(harness)
+
+	result, err := harness.service.BeginMFARotation(context.Background(), harness.admin, harness.emergencyAdminID, BeginMFARotationCommand{
+		UserVersion: 1, Reason: "Rotate compromised factor.",
+	}, harness.proof(), harness.request)
+	if err != nil {
+		t.Fatalf("BeginMFARotation() error=%v", err)
+	}
+	enrollment := harness.repository.enrollments[result.ID]
+	if result.Secret == "" || result.OTPAuthURI == "" || !result.ExpiresAt.Equal(harness.now.Add(10*time.Minute)) {
+		t.Fatalf("result=%+v", result)
+	}
+	if enrollment.Purpose != MFAEnrollmentPurposeRotation || enrollment.UserID != harness.emergencyAdminID ||
+		enrollment.CreatedByUserID.String() != harness.admin.GovernedUserID || enrollment.CreatorBindingVersion != 1 || enrollment.CreatorBindingDigest == [32]byte{} {
+		t.Fatalf("enrollment=%+v", enrollment)
+	}
+	if len(harness.highRisk.operations) != 1 || harness.highRisk.operations[0] != "mfa.enrollment.begin" {
+		t.Fatalf("high-risk operations=%+v", harness.highRisk.operations)
+	}
+}
+
+func TestConfirmMFARotationSwitchesCredentialAndRecoveryStateAtomically(t *testing.T) {
+	harness := newIAMHarness(t)
+	governIAMAdminForMFA(harness)
+	oldEnrollmentID := uuid.MustParse("018f835d-7e4b-7abc-9f42-67a2f5f48e15")
+	credential := harness.repository.credentials[harness.emergencyAdminID]
+	credential.MFASecretReference = "secret://iam-mfa/mfa-" + oldEnrollmentID.String() + ".totp"
+	harness.repository.credentials[harness.emergencyAdminID] = credential
+	started, err := harness.service.BeginMFARotation(context.Background(), harness.admin, harness.emergencyAdminID, BeginMFARotationCommand{
+		UserVersion: 1, Reason: "Rotate compromised factor.",
+	}, harness.proof(), harness.request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldReference := harness.repository.credentials[harness.emergencyAdminID].MFASecretReference
+	result, err := harness.service.ConfirmMFARotation(context.Background(), harness.admin, harness.emergencyAdminID, started.ID, ConfirmMFARotationCommand{
+		UserVersion: 1, MFAProof: "123456", Reason: "Confirm replacement factor.",
+	}, harness.request)
+	if err != nil {
+		t.Fatalf("ConfirmMFARotation() error=%v", err)
+	}
+	user := harness.repository.users[harness.emergencyAdminID]
+	credential = harness.repository.credentials[harness.emergencyAdminID]
+	enrollment := harness.repository.enrollments[started.ID]
+	if user.Version != 2 || !user.MFAEnrolled || credential.MFASecretReference != "secret://iam-mfa/mfa-"+started.ID.String()+".totp" || credential.MFALastCounter != 42 {
+		t.Fatalf("rotated state user=%+v credential=%+v", user, credential)
+	}
+	if enrollment.Status != MFAEnrollmentStatusConfirmed || len(result.RecoveryCodes) != 10 || len(harness.repository.recoveryDigests[harness.emergencyAdminID]) != 10 {
+		t.Fatalf("confirmation state enrollment=%+v recovery=%+v", enrollment, result.RecoveryCodes)
+	}
+	if !harness.repository.mfaTombstones[oldReference] || len(harness.sessions.subjects) != 1 || harness.sessions.subjects[0] != harness.emergencyAdminID {
+		t.Fatalf("post-confirm governance tombstones=%+v sessions=%+v", harness.repository.mfaTombstones, harness.sessions.subjects)
+	}
+}
+
+func TestConfirmMFARotationRejectsExpiredEnrollmentBeforeSecretVerification(t *testing.T) {
+	harness := newIAMHarness(t)
+	governIAMAdminForMFA(harness)
+	started, err := harness.service.BeginMFARotation(context.Background(), harness.admin, harness.emergencyAdminID, BeginMFARotationCommand{
+		UserVersion: 1, Reason: "Rotate compromised factor.",
+	}, harness.proof(), harness.request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enrollment := harness.repository.enrollments[started.ID]
+	enrollment.ExpiresAt = harness.now.Add(-time.Second)
+	harness.repository.enrollments[started.ID] = enrollment
+	verifier := &countingMFAVerifier{assertion: MFAAssertion{Counter: 42}}
+	harness.service.mfaVerifier = verifier
+
+	_, err = harness.service.ConfirmMFARotation(context.Background(), harness.admin, harness.emergencyAdminID, started.ID, ConfirmMFARotationCommand{
+		UserVersion: 1, MFAProof: "123456", Reason: "Confirm replacement factor.",
+	}, harness.request)
+	if !errors.Is(err, ErrMFAEnrollmentNotFound) {
+		t.Fatalf("ConfirmMFARotation() error=%v, want ErrMFAEnrollmentNotFound", err)
+	}
+	if verifier.calls != 0 {
+		t.Fatalf("expired enrollment reached secret verifier %d times", verifier.calls)
+	}
+}
+
+type countingMFAVerifier struct {
+	calls     int
+	assertion MFAAssertion
+}
+
+func (verifier *countingMFAVerifier) Verify(context.Context, string, string) (MFAAssertion, error) {
+	verifier.calls++
+	return verifier.assertion, nil
+}
+
+func TestRegenerateMFARecoveryCodesChecksVersionBeforeProofAndRevokesSessions(t *testing.T) {
+	harness := newIAMHarness(t)
+	governIAMAdminForMFA(harness)
+	harness.repository.recoveryDigests[harness.emergencyAdminID] = []string{strings.Repeat("a", 64)}
+	if _, err := harness.service.RegenerateMFARecoveryCodes(context.Background(), harness.admin, harness.emergencyAdminID, RegenerateMFARecoveryCodesCommand{
+		UserVersion: 2, Reason: "Replace exposed recovery codes.",
+	}, harness.proof(), harness.request); !errors.Is(err, ErrIAMConflict) {
+		t.Fatalf("version mismatch error=%v", err)
+	}
+	if len(harness.highRisk.operations) != 0 {
+		t.Fatalf("version mismatch consumed proof: %+v", harness.highRisk.operations)
+	}
+
+	result, err := harness.service.RegenerateMFARecoveryCodes(context.Background(), harness.admin, harness.emergencyAdminID, RegenerateMFARecoveryCodesCommand{
+		UserVersion: 1, Reason: "Replace exposed recovery codes.",
+	}, harness.proof(), harness.request)
+	if err != nil {
+		t.Fatalf("RegenerateMFARecoveryCodes() error=%v", err)
+	}
+	if len(result.RecoveryCodes) != 10 || len(harness.repository.recoveryDigests[harness.emergencyAdminID]) != 10 || harness.repository.users[harness.emergencyAdminID].Version != 2 {
+		t.Fatalf("regenerated result=%+v user=%+v", result, harness.repository.users[harness.emergencyAdminID])
+	}
+	if len(harness.highRisk.operations) != 1 || harness.highRisk.operations[0] != "mfa.recovery_codes.regenerate" || len(harness.sessions.subjects) != 1 {
+		t.Fatalf("governance operations=%+v sessions=%+v", harness.highRisk.operations, harness.sessions.subjects)
+	}
+}
+
+func TestProvisionEmergencyUserCreatesOnlyFixedPendingAdministratorAggregate(t *testing.T) {
+	harness := newIAMHarness(t)
+	governIAMAdminForMFA(harness)
+	result, err := harness.service.ProvisionEmergencyUser(context.Background(), harness.admin, CreateEmergencyUserCommand{
+		Username: "emergency.secondary", DisplayName: "Secondary Emergency", Email: "emergency.secondary@example.com",
+		Reason: "Provision secondary break glass administrator.",
+	}, harness.proof(), harness.request)
+	if err != nil {
+		t.Fatalf("ProvisionEmergencyUser() error=%v", err)
+	}
+	user := harness.repository.users[result.User.ID]
+	credential := harness.repository.credentials[result.User.ID]
+	binding := harness.repository.roleBindingForUser(result.User.ID)
+	if user.Kind != UserKindEmergency || user.Status != UserStatusPending || user.MFAEnrolled || user.Version != 1 ||
+		credential.ActivationDigest == "" || credential.ActivationDigest == result.ActivationToken || !credential.ActivationExpiresAt.Equal(harness.now.Add(24*time.Hour)) {
+		t.Fatalf("emergency aggregate user=%+v credential=%+v", user, credential)
+	}
+	if binding.Role != identity.RoleAdmin || binding.ScopeType != ScopeTypePlatform || binding.Effect != BindingEffectAllow || binding.SubjectType != SubjectTypeUser {
+		t.Fatalf("fixed emergency binding=%+v", binding)
+	}
+	if len(harness.highRisk.operations) != 1 || harness.highRisk.operations[0] != "emergency.user.create" {
+		t.Fatalf("high-risk operations=%+v", harness.highRisk.operations)
+	}
+}
+
+func TestReissueEmergencyActivationRequiresExpiredPendingVersionBeforeProof(t *testing.T) {
+	harness := newIAMHarness(t)
+	governIAMAdminForMFA(harness)
+	pending := UserPrincipal{ID: uuid.MustParse("018f835d-7e4b-7abc-9f42-67a2f5f48e16"), Username: "emergency.pending", Kind: UserKindEmergency, Status: UserStatusPending, Version: 1, CreatedAt: harness.now.Add(-48 * time.Hour), UpdatedAt: harness.now.Add(-48 * time.Hour)}
+	harness.repository.users[pending.ID] = pending
+	harness.repository.credentials[pending.ID] = LocalCredential{UserID: pending.ID, ActivationDigest: strings.Repeat("a", 64), ActivationExpiresAt: harness.now.Add(time.Hour)}
+	if _, err := harness.service.ReissueEmergencyActivation(context.Background(), harness.admin, pending.ID, ReissueEmergencyActivationCommand{
+		UserVersion: 1, Reason: "Reissue expired emergency activation.",
+	}, harness.proof(), harness.request); !errors.Is(err, ErrUserInputInvalid) {
+		t.Fatalf("unexpired reissue error=%v", err)
+	}
+	if len(harness.highRisk.operations) != 0 {
+		t.Fatalf("unexpired token consumed proof: %+v", harness.highRisk.operations)
+	}
+	credential := harness.repository.credentials[pending.ID]
+	credential.ActivationExpiresAt = harness.now.Add(-time.Second)
+	harness.repository.credentials[pending.ID] = credential
+	result, err := harness.service.ReissueEmergencyActivation(context.Background(), harness.admin, pending.ID, ReissueEmergencyActivationCommand{
+		UserVersion: 1, Reason: "Reissue expired emergency activation.",
+	}, harness.proof(), harness.request)
+	if err != nil {
+		t.Fatalf("ReissueEmergencyActivation() error=%v", err)
+	}
+	if result.User.Version != 2 || result.ActivationToken == "" || !result.ActivationExpires.Equal(harness.now.Add(24*time.Hour)) {
+		t.Fatalf("reissue result=%+v", result)
+	}
+}
+
+func governIAMAdminForMFA(harness *iamHarness) {
+	actorID := uuid.MustParse("018f835d-7e4b-7abc-9f42-67a2f5f48e14")
+	harness.repository.users[actorID] = UserPrincipal{
+		ID: actorID, IdentitySourceID: harness.sourceID, ExternalSubject: "mfa-governed-admin",
+		Username: "mfa.governed.admin", Kind: UserKindExternal, Status: UserStatusActive, Version: 1,
+	}
+	harness.admin.Governed = true
+	harness.admin.GovernedUserID = actorID.String()
+	harness.admin.IdentitySourceID = harness.sourceID.String()
+	harness.admin.RoleScopes = []identity.RoleScope{{Role: identity.RoleAdmin, ScopeType: "platform", Effect: "allow"}}
+	source := harness.repository.sources[harness.sourceID]
+	source.Status = IdentitySourceStatusEnabled
+	harness.repository.sources[harness.sourceID] = source
+}
+
 func TestCreateLocalUserUsesUnicodeCharacterLimits(t *testing.T) {
 	t.Parallel()
 
@@ -1071,13 +1295,17 @@ func newIAMHarness(t *testing.T) *iamHarness {
 		catalogScopes:           map[string]map[string]bool{"ngep": {"stable": true}},
 		memberships:             make(map[uuid.UUID][]uuid.UUID),
 		organizationMemberships: make(map[organizationMembershipKey]OrganizationMembership),
+		enrollments:             make(map[uuid.UUID]MFAEnrollment),
+		mfaTombstones:           make(map[string]bool),
+		recoveryDigests:         make(map[uuid.UUID][]string),
 	}
 	auditor := &iamAuditRecorder{}
 	sessions := &iamSessionRecorder{}
 	highRisk := &recordingHighRiskAuthorizer{}
 	service, err := NewService(ServiceConfig{
 		Repository: repository, ScopeCatalog: repository, BreakGlass: NewBreakGlassInvariantAuthority(repository), Auditor: auditor, Sessions: sessions, Passwords: deterministicPasswordManager{}, Directory: iamDirectoryAdapter{report: CapabilityReport{Reachable: true, SupportsIncremental: true}}, HighRisk: highRisk,
-		Clock: func() time.Time { return now },
+		MFASecrets: &mfaSecretStoreFake{values: map[string][]byte{}}, MFAVerifier: fixedMFAVerifier{proof: "123456", counter: 42},
+		MFAEnrollmentTTL: 10 * time.Minute, MFAIssuer: "Xminds Release Platform", Clock: func() time.Time { return now },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1106,6 +1334,9 @@ type memoryIAMRepository struct {
 	catalogScopes           map[string]map[string]bool
 	memberships             map[uuid.UUID][]uuid.UUID
 	organizationMemberships map[organizationMembershipKey]OrganizationMembership
+	enrollments             map[uuid.UUID]MFAEnrollment
+	mfaTombstones           map[string]bool
+	recoveryDigests         map[uuid.UUID][]string
 }
 
 type organizationMembershipKey struct {
@@ -1114,24 +1345,172 @@ type organizationMembershipKey struct {
 	sourceOwned    bool
 }
 
+func (repository *memoryIAMRepository) roleBindingForUser(userID uuid.UUID) RoleBinding {
+	for _, binding := range repository.roleBindings {
+		if binding.SubjectType == SubjectTypeUser && binding.SubjectID == userID {
+			return binding
+		}
+	}
+	return RoleBinding{}
+}
+
+func (repository *memoryIAMRepository) CanonicalPrincipalAvailable(_ context.Context, username, email string) (bool, error) {
+	for _, user := range repository.users {
+		if strings.EqualFold(user.Username, username) || (email != "" && strings.EqualFold(user.Email, email)) {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func (repository *memoryIAMRepository) ProvisionPendingEmergency(_ context.Context, _ pgx.Tx, user UserPrincipal, credential LocalCredential, binding RoleBinding) error {
+	if user.Kind != UserKindEmergency || user.Status != UserStatusPending || user.MFAEnrolled || credential.UserID != user.ID ||
+		binding.SubjectType != SubjectTypeUser || binding.SubjectID != user.ID || binding.Role != identity.RoleAdmin ||
+		binding.ScopeType != ScopeTypePlatform || binding.Effect != BindingEffectAllow {
+		return ErrIAMConfiguration
+	}
+	available, _ := repository.CanonicalPrincipalAvailable(context.Background(), user.Username, user.Email)
+	if !available {
+		return ErrIAMConflict
+	}
+	repository.users[user.ID] = user
+	repository.credentials[user.ID] = credential
+	repository.roleBindings[binding.ID] = binding
+	return nil
+}
+
+func (repository *memoryIAMRepository) SaveEmergencyActivation(_ context.Context, _ pgx.Tx, userID uuid.UUID, activationDigest string, activationExpiresAt time.Time) error {
+	credential, exists := repository.credentials[userID]
+	if !exists {
+		return ErrUserNotFound
+	}
+	credential.ActivationDigest, credential.ActivationExpiresAt = activationDigest, activationExpiresAt
+	repository.credentials[userID] = credential
+	return nil
+}
+
 func (repository *memoryIAMRepository) WithinTransaction(_ context.Context, function func(pgx.Tx) error) error {
 	repository.withinTransactionCalls++
 	login := repository.login
 	users := cloneIAMUsers(repository.users)
+	credentials := cloneCredentials(repository.credentials)
 	sources := cloneIAMSources(repository.sources)
 	bindings := cloneIAMRoleBindings(repository.roleBindings)
 	organizations := cloneIAMOrganizations(repository.organizations)
 	memberships := cloneIAMOrganizationMemberships(repository.organizationMemberships)
+	enrollments := cloneMFAEnrollments(repository.enrollments)
+	recoveryDigests := cloneStringSlices(repository.recoveryDigests)
+	tombstones := make(map[string]bool, len(repository.mfaTombstones))
+	for reference, present := range repository.mfaTombstones {
+		tombstones[reference] = present
+	}
 	err := function(nil)
 	if err != nil {
 		repository.login = login
 		repository.users = users
+		repository.credentials = credentials
 		repository.sources = sources
 		repository.roleBindings = bindings
 		repository.organizations = organizations
 		repository.organizationMemberships = memberships
+		repository.enrollments = enrollments
+		repository.mfaTombstones = tombstones
+		repository.recoveryDigests = recoveryDigests
 	}
 	return err
+}
+
+func (repository *memoryIAMRepository) GetPendingMFAEnrollmentForUpdate(_ context.Context, _ pgx.Tx, userID uuid.UUID) (MFAEnrollment, error) {
+	for _, enrollment := range repository.enrollments {
+		if enrollment.UserID == userID && enrollment.Status == MFAEnrollmentStatusPending {
+			return enrollment, nil
+		}
+	}
+	return MFAEnrollment{}, ErrMFAEnrollmentNotFound
+}
+
+func (repository *memoryIAMRepository) ExpireMFAEnrollment(_ context.Context, _ pgx.Tx, enrollmentID uuid.UUID, expectedVersion int64, expiredAt time.Time) error {
+	enrollment, exists := repository.enrollments[enrollmentID]
+	if !exists || enrollment.Status != MFAEnrollmentStatusPending || enrollment.Version != expectedVersion {
+		return ErrIAMConflict
+	}
+	enrollment.Status = MFAEnrollmentStatusExpired
+	enrollment.Version++
+	enrollment.UpdatedAt = expiredAt
+	repository.enrollments[enrollmentID] = enrollment
+	repository.mfaTombstones[enrollment.SecretReference] = true
+	return nil
+}
+
+func (repository *memoryIAMRepository) InsertMFAEnrollment(_ context.Context, _ pgx.Tx, enrollment MFAEnrollment) error {
+	if repository.mfaTombstones[enrollment.SecretReference] {
+		return ErrIAMConflict
+	}
+	for _, current := range repository.enrollments {
+		if current.UserID == enrollment.UserID && current.Status == MFAEnrollmentStatusPending {
+			return ErrIAMConflict
+		}
+	}
+	repository.enrollments[enrollment.ID] = enrollment
+	return nil
+}
+
+func (repository *memoryIAMRepository) GetMFAEnrollment(_ context.Context, enrollmentID uuid.UUID) (MFAEnrollment, error) {
+	enrollment, exists := repository.enrollments[enrollmentID]
+	if !exists {
+		return MFAEnrollment{}, ErrMFAEnrollmentNotFound
+	}
+	return enrollment, nil
+}
+
+func (repository *memoryIAMRepository) GetMFAEnrollmentForUpdate(ctx context.Context, _ pgx.Tx, enrollmentID uuid.UUID) (MFAEnrollment, error) {
+	return repository.GetMFAEnrollment(ctx, enrollmentID)
+}
+
+func (repository *memoryIAMRepository) ConfirmMFAEnrollment(_ context.Context, _ pgx.Tx, enrollmentID uuid.UUID, expectedVersion int64, confirmedAt time.Time) error {
+	enrollment, exists := repository.enrollments[enrollmentID]
+	if !exists || enrollment.Status != MFAEnrollmentStatusPending || enrollment.Version != expectedVersion || !enrollment.ExpiresAt.After(confirmedAt) {
+		return ErrIAMConflict
+	}
+	enrollment.Status, enrollment.ConfirmedAt, enrollment.UpdatedAt, enrollment.Version = MFAEnrollmentStatusConfirmed, confirmedAt, confirmedAt, enrollment.Version+1
+	repository.enrollments[enrollmentID] = enrollment
+	return nil
+}
+
+func (repository *memoryIAMRepository) GetLocalCredential(_ context.Context, userID uuid.UUID) (LocalCredential, error) {
+	credential, exists := repository.credentials[userID]
+	if !exists {
+		return LocalCredential{}, ErrUserNotFound
+	}
+	return credential, nil
+}
+
+func (repository *memoryIAMRepository) GetLocalCredentialForUpdate(ctx context.Context, _ pgx.Tx, userID uuid.UUID) (LocalCredential, error) {
+	return repository.GetLocalCredential(ctx, userID)
+}
+
+func (repository *memoryIAMRepository) SaveMFACredential(_ context.Context, _ pgx.Tx, credential LocalCredential) error {
+	if _, exists := repository.credentials[credential.UserID]; !exists {
+		return ErrUserNotFound
+	}
+	repository.credentials[credential.UserID] = credential
+	return nil
+}
+
+func (*memoryIAMRepository) LockMFASecretReference(context.Context, pgx.Tx, string) error { return nil }
+
+func (repository *memoryIAMRepository) MFASecretReferenceHasTombstone(_ context.Context, _ pgx.Tx, reference string) (bool, error) {
+	return repository.mfaTombstones[reference], nil
+}
+
+func (repository *memoryIAMRepository) EnqueueMFASecretGC(_ context.Context, _ pgx.Tx, reference string, _, _ time.Time) error {
+	repository.mfaTombstones[reference] = true
+	return nil
+}
+
+func (repository *memoryIAMRepository) ReplaceMFARecoveryCodes(_ context.Context, _ pgx.Tx, userID, _ uuid.UUID, digests []string, _ time.Time) error {
+	repository.recoveryDigests[userID] = append([]string(nil), digests...)
+	return nil
 }
 
 func cloneIAMOrganizations(source map[uuid.UUID]OrganizationUnit) map[uuid.UUID]OrganizationUnit {

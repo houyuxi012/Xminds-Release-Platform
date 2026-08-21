@@ -402,8 +402,8 @@ func TestDirectorySyncMigrationUpgradesImmutableOriginal14ToCurrent(t *testing.T
 	if err := pool.QueryRow(ctx, `SELECT max(version) FROM schema_migrations`).Scan(&maximumVersion); err != nil {
 		t.Fatal(err)
 	}
-	if maximumVersion != 19 {
-		t.Fatalf("maximum migration version=%d, want 19", maximumVersion)
+	if maximumVersion != 20 {
+		t.Fatalf("maximum migration version=%d, want 20", maximumVersion)
 	}
 	var original14PreflightRows int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM schema_migration_preflights WHERE migration_version=14`).Scan(&original14PreflightRows); err != nil {

@@ -4,17 +4,23 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 
 	"xminds-release-platform/internal/platform/httpx"
 )
 
 type LocalAuthApplication interface {
-	Activate(ctx context.Context, command ActivateLocalAccountCommand, request RequestContext) error
+	ActivateWithResult(ctx context.Context, command ActivateLocalAccountCommand, request RequestContext) (LocalActivationResult, error)
 	LoginLocal(ctx context.Context, command LocalLoginCommand, request RequestContext) (LoginResult, error)
 	LoginEmergency(ctx context.Context, command LocalLoginCommand, request RequestContext) (LoginResult, error)
+}
+
+type MFAActivationEnrollmentApplication interface {
+	BeginActivationEnrollment(ctx context.Context, activationToken string, request RequestContext) (MFAEnrollmentStart, error)
 }
 
 func RegisterPublicAuthRoutes(router chi.Router, application LocalAuthApplication) {
@@ -26,12 +32,39 @@ func RegisterPublicAuthRoutes(router chi.Router, application LocalAuthApplicatio
 	router.Post("/api/v1/auth/emergency/login", localLoginHandler(application, true))
 }
 
+func RegisterPublicMFAEnrollmentRoutes(router chi.Router, application MFAActivationEnrollmentApplication) {
+	if application == nil {
+		return
+	}
+	router.Post("/api/v1/auth/local/mfa-enrollments", beginActivationMFAEnrollmentHandler(application))
+}
+
+func beginActivationMFAEnrollmentHandler(application MFAActivationEnrollmentApplication) http.HandlerFunc {
+	type input struct {
+		ActivationToken string `json:"activation_token"`
+	}
+	return func(writer http.ResponseWriter, request *http.Request) {
+		var body input
+		if err := decodeIAMJSON(request, &body); err != nil || len(body.ActivationToken) < 32 || body.ActivationToken != strings.TrimSpace(body.ActivationToken) || len(body.ActivationToken) > 1024 {
+			writeIAMProblem(writer, request, http.StatusBadRequest, "REQUEST_BODY_INVALID", "Request body is invalid", ErrUserInputInvalid)
+			return
+		}
+		result, err := application.BeginActivationEnrollment(request.Context(), body.ActivationToken, iamRequestContext(request))
+		if err != nil {
+			writeLocalAuthError(writer, request, err)
+			return
+		}
+		writer.Header().Set("Cache-Control", "no-store")
+		writeIAMJSON(writer, http.StatusCreated, result)
+	}
+}
+
 func activateLocalAccountHandler(application LocalAuthApplication) http.HandlerFunc {
 	type input struct {
-		ActivationToken    string `json:"activation_token"`
-		NewPassword        string `json:"new_password"`
-		MFASecretReference string `json:"mfa_secret_reference"`
-		MFAProof           string `json:"mfa_proof"`
+		ActivationToken string    `json:"activation_token"`
+		NewPassword     string    `json:"new_password"`
+		MFAEnrollmentID uuid.UUID `json:"mfa_enrollment_id"`
+		MFAProof        string    `json:"mfa_proof"`
 	}
 	return func(writer http.ResponseWriter, request *http.Request) {
 		var body input
@@ -39,24 +72,25 @@ func activateLocalAccountHandler(application LocalAuthApplication) http.HandlerF
 			writeIAMProblem(writer, request, http.StatusBadRequest, "REQUEST_BODY_INVALID", "Request body is invalid", err)
 			return
 		}
-		err := application.Activate(request.Context(), ActivateLocalAccountCommand{
+		result, err := application.ActivateWithResult(request.Context(), ActivateLocalAccountCommand{
 			ActivationToken: body.ActivationToken, NewPassword: body.NewPassword,
-			MFASecretReference: body.MFASecretReference, MFAProof: body.MFAProof,
+			MFAEnrollmentID: body.MFAEnrollmentID, MFAProof: body.MFAProof,
 		}, iamRequestContext(request))
 		if err != nil {
 			writeLocalAuthError(writer, request, err)
 			return
 		}
 		writer.Header().Set("Cache-Control", "no-store")
-		writer.WriteHeader(http.StatusNoContent)
+		writeIAMJSON(writer, http.StatusOK, result)
 	}
 }
 
 func localLoginHandler(application LocalAuthApplication, emergency bool) http.HandlerFunc {
 	type input struct {
-		Username string `json:"username"`
-		Password string `json:"password"`
-		MFAProof string `json:"mfa_proof"`
+		Username     string `json:"username"`
+		Password     string `json:"password"`
+		MFAProof     string `json:"mfa_proof"`
+		RecoveryCode string `json:"recovery_code"`
 	}
 	type response struct {
 		AccessToken string               `json:"access_token"`
@@ -70,7 +104,7 @@ func localLoginHandler(application LocalAuthApplication, emergency bool) http.Ha
 			writeIAMProblem(writer, request, http.StatusBadRequest, "REQUEST_BODY_INVALID", "Request body is invalid", err)
 			return
 		}
-		command := LocalLoginCommand{Username: body.Username, Password: body.Password, MFAProof: body.MFAProof}
+		command := LocalLoginCommand{Username: body.Username, Password: body.Password, MFAProof: body.MFAProof, RecoveryCode: body.RecoveryCode}
 		var result LoginResult
 		var err error
 		if emergency {
@@ -82,6 +116,7 @@ func localLoginHandler(application LocalAuthApplication, emergency bool) http.Ha
 			writeLocalAuthError(writer, request, err)
 			return
 		}
+		writer.Header().Set("Cache-Control", "no-store")
 		writeIAMJSON(writer, http.StatusOK, response{
 			AccessToken: result.AccessToken, TokenType: result.TokenType, ExpiresAt: result.ExpiresAt, Subject: result.Subject,
 		})
