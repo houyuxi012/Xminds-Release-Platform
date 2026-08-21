@@ -14,6 +14,11 @@ import (
 	"xminds-release-platform/internal/audit"
 )
 
+type directoryMembershipIdentity struct {
+	organizationID uuid.UUID
+	userID         uuid.UUID
+}
+
 func (executor *PostgresDirectorySyncExecutor) prepareSnapshot(ctx context.Context, tx pgx.Tx, job *DirectorySyncJob, source *IdentitySource) error {
 	if source.Kind == IdentitySourceOIDC {
 		if job.Mode != DirectorySyncModePreview {
@@ -68,7 +73,7 @@ SELECT
      JOIN organization_units organization ON organization.identity_source_id=$2 AND organization.external_id=staged.organization_external_id
      JOIN user_principals principal ON principal.identity_source_id=$2 AND principal.external_subject=staged.user_external_subject
      WHERE staged.sync_job_id=$1 AND staged.processed=FALSE
-       AND NOT EXISTS (SELECT 1 FROM organization_memberships membership WHERE membership.organization_id=organization.id AND membership.user_id=principal.id)),
+       AND NOT EXISTS (SELECT 1 FROM organization_memberships membership WHERE membership.organization_id=organization.id AND membership.user_id=principal.id AND membership.source_owned=TRUE AND membership.status='active')),
     (SELECT count(*) FROM user_principals principal
      WHERE principal.identity_source_id=$2 AND principal.status='active'
        AND NOT EXISTS (
@@ -121,10 +126,10 @@ UPDATE directory_sync_jobs SET status='completed', create_count=$2, update_count
 WHERE id=$1`, job.ID, job.CreateCount, job.UpdateCount, job.DisableCount, job.ConflictCount, now); err != nil {
 		return fmt.Errorf("complete directory synchronization preview: %w", err)
 	}
-	if err := executor.appendCompletionAudit(ctx, tx, *job); err != nil {
+	if err := executor.deleteStages(ctx, tx, job.ID); err != nil {
 		return err
 	}
-	return executor.deleteStages(ctx, tx, job.ID)
+	return executor.appendCompletionAudit(ctx, tx, *job)
 }
 
 func (executor *PostgresDirectorySyncExecutor) applyUsers(ctx context.Context, tx pgx.Tx, job *DirectorySyncJob) error {
@@ -384,22 +389,112 @@ LIMIT $2`, job.ID, executor.batchSize)
 		}
 		return executor.appendDirectoryBatchAudit(ctx, tx, *job, phase, 0, job.ProcessedMemberships, true)
 	}
+	type resolvedMembership struct {
+		stagedMembership
+		directoryMembershipIdentity
+	}
+	resolved := make([]resolvedMembership, 0, len(staged))
 	for _, stagedMembership := range staged {
-		if _, err := tx.Exec(ctx, `
-INSERT INTO organization_memberships (organization_id, user_id, source_owned, created_at)
-SELECT organization.id, principal.id, TRUE, $3
-FROM organization_units organization, user_principals principal
-WHERE organization.identity_source_id=$1 AND organization.external_id=$2
-  AND principal.identity_source_id=$1 AND principal.external_subject=$4
-ON CONFLICT (organization_id, user_id) DO NOTHING`,
-			job.IdentitySourceID, stagedMembership.organizationExternalID, now, stagedMembership.userExternalSubject); err != nil {
-			return fmt.Errorf("apply directory membership: %w", err)
+		var item resolvedMembership
+		item.stagedMembership = stagedMembership
+		if err := tx.QueryRow(ctx, `SELECT organization.id,principal.id FROM organization_units organization,user_principals principal WHERE organization.identity_source_id=$1 AND organization.external_id=$2 AND principal.identity_source_id=$1 AND principal.external_subject=$3`, job.IdentitySourceID, stagedMembership.organizationExternalID, stagedMembership.userExternalSubject).Scan(&item.organizationID, &item.userID); err != nil {
+			return fmt.Errorf("resolve directory membership subjects: %w", err)
+		}
+		resolved = append(resolved, item)
+	}
+	sort.Slice(resolved, func(left, right int) bool {
+		if resolved[left].organizationID != resolved[right].organizationID {
+			return resolved[left].organizationID.String() < resolved[right].organizationID.String()
+		}
+		return resolved[left].userID.String() < resolved[right].userID.String()
+	})
+	organizationIDs := make([]uuid.UUID, 0, len(resolved))
+	userIDs := make([]uuid.UUID, 0, len(resolved))
+	for _, membership := range resolved {
+		organizationIDs = append(organizationIDs, membership.organizationID)
+		userIDs = append(userIDs, membership.userID)
+	}
+	lockedOrganizations := make(map[uuid.UUID]OrganizationUnit, len(organizationIDs))
+	for _, organizationID := range sortedUniqueUUIDs(organizationIDs) {
+		organization, err := executor.repository.GetOrganization(ctx, tx, organizationID)
+		if err != nil {
+			return err
+		}
+		lockedOrganizations[organizationID] = organization
+	}
+	for _, userID := range sortedUniqueUUIDs(userIDs) {
+		if _, err := executor.repository.GetUser(ctx, tx, userID); err != nil {
+			return err
+		}
+	}
+	lockedMemberships := make(map[directoryMembershipIdentity]OrganizationMembership, len(resolved))
+	membershipExists := make(map[directoryMembershipIdentity]bool, len(resolved))
+	for _, resolvedMembership := range resolved {
+		identity := resolvedMembership.directoryMembershipIdentity
+		membership, err := executor.repository.GetOrganizationMembership(ctx, tx, identity.organizationID, identity.userID, true)
+		if errors.Is(err, ErrOrganizationMembershipNotFound) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		lockedMemberships[identity] = membership
+		membershipExists[identity] = true
+	}
+	changedUsers := make(map[uuid.UUID]struct{}, len(resolved))
+	for _, resolvedMembership := range resolved {
+		identity := resolvedMembership.directoryMembershipIdentity
+		organization := lockedOrganizations[identity.organizationID]
+		membership := lockedMemberships[identity]
+		membershipChanged := false
+		switch {
+		case !membershipExists[identity]:
+			if _, err := tx.Exec(ctx, `INSERT INTO organization_memberships (organization_id,user_id,source_owned,status,version,created_at,updated_at) VALUES ($1,$2,TRUE,'active',1,$3,$3)`, resolvedMembership.organizationID, resolvedMembership.userID, now); err != nil {
+				return fmt.Errorf("insert source-owned directory membership: %w", err)
+			}
+			membershipChanged = true
+		case membership.Status == OrganizationMembershipStatusRemoved:
+			result, err := tx.Exec(ctx, `UPDATE organization_memberships SET status='active',version=version+1,updated_at=$3 WHERE organization_id=$1 AND user_id=$2 AND source_owned=TRUE AND status='removed' AND version=$4`, resolvedMembership.organizationID, resolvedMembership.userID, now, membership.Version)
+			if err != nil {
+				return fmt.Errorf("reactivate source-owned directory membership: %w", err)
+			}
+			if result.RowsAffected() != 1 {
+				return ErrIAMConflict
+			}
+			membershipChanged = true
+		case membership.Status != OrganizationMembershipStatusActive:
+			return ErrDirectorySyncConfiguration
+		}
+		if membershipChanged {
+			previousOrganizationVersion := organization.Version
+			organization.Version++
+			organization.UpdatedAt = now
+			if err := executor.repository.SaveOrganization(ctx, tx, organization, previousOrganizationVersion); err != nil {
+				return err
+			}
+			lockedOrganizations[identity.organizationID] = organization
+			changedUsers[resolvedMembership.userID] = struct{}{}
 		}
 		if _, err := tx.Exec(ctx, `
 UPDATE directory_sync_stage_memberships SET processed=TRUE
 WHERE sync_job_id=$1 AND organization_external_id=$2 AND user_external_subject=$3`,
-			job.ID, stagedMembership.organizationExternalID, stagedMembership.userExternalSubject); err != nil {
+			job.ID, resolvedMembership.organizationExternalID, resolvedMembership.userExternalSubject); err != nil {
 			return fmt.Errorf("mark directory membership processed: %w", err)
+		}
+	}
+	if len(changedUsers) > 0 {
+		if err := executor.requireBreakGlassContinuity(ctx, tx, now); err != nil {
+			return err
+		}
+		userIDs := make([]uuid.UUID, 0, len(changedUsers))
+		for userID := range changedUsers {
+			userIDs = append(userIDs, userID)
+		}
+		sort.Slice(userIDs, func(left, right int) bool { return userIDs[left].String() < userIDs[right].String() })
+		for _, userID := range userIDs {
+			if err := executor.sessions.RevokeSubject(ctx, tx, userID, "directory membership changed"); err != nil {
+				return err
+			}
 		}
 	}
 	job.ProcessedMemberships += len(staged)
@@ -412,82 +507,169 @@ WHERE sync_job_id=$1 AND organization_external_id=$2 AND user_external_subject=$
 
 func (executor *PostgresDirectorySyncExecutor) finalizeApply(ctx context.Context, tx pgx.Tx, job *DirectorySyncJob) error {
 	now := executor.now()
-	userRows, err := tx.Query(ctx, `
-UPDATE user_principals principal
-SET status='disabled', disabled_at=$3, disabled_reason='directory snapshot missing', version=version+1, updated_at=$3
+	disabledUsers, err := queryDirectoryUUIDs(ctx, tx, `
+SELECT principal.id FROM user_principals principal
 WHERE principal.identity_source_id=$2 AND principal.status <> 'disabled'
-  AND principal.last_directory_run_id IS DISTINCT FROM $4
+  AND principal.last_directory_run_id IS DISTINCT FROM $3
   AND NOT EXISTS (
       SELECT 1 FROM directory_sync_stage_users staged
       WHERE staged.sync_job_id=$1 AND staged.external_subject=principal.external_subject
-  )
-RETURNING principal.id`, job.ID, job.IdentitySourceID, now, job.RunMarker)
+  ) ORDER BY principal.id`, job.ID, job.IdentitySourceID, job.RunMarker)
 	if err != nil {
-		return fmt.Errorf("disable missing directory users: %w", err)
+		return fmt.Errorf("list missing directory users: %w", err)
 	}
-	disabledUsers := make([]uuid.UUID, 0)
-	for userRows.Next() {
-		var id uuid.UUID
-		if err := userRows.Scan(&id); err != nil {
-			userRows.Close()
-			return err
-		}
-		disabledUsers = append(disabledUsers, id)
-	}
-	if err := userRows.Err(); err != nil {
-		userRows.Close()
-		return err
-	}
-	userRows.Close()
-	for _, id := range disabledUsers {
-		if err := executor.sessions.RevokeSubject(ctx, tx, id, "directory snapshot missing"); err != nil {
-			return err
-		}
-	}
-	organizationRows, err := tx.Query(ctx, `
-UPDATE organization_units organization
-SET status='disabled', version=version+1, updated_at=$3
+	disabledOrganizations, err := queryDirectoryUUIDs(ctx, tx, `
+SELECT organization.id FROM organization_units organization
 WHERE organization.identity_source_id=$2 AND organization.status <> 'disabled'
-  AND organization.last_directory_run_id IS DISTINCT FROM $4
+  AND organization.last_directory_run_id IS DISTINCT FROM $3
   AND NOT EXISTS (
       SELECT 1 FROM directory_sync_stage_organizations staged
       WHERE staged.sync_job_id=$1 AND staged.external_id=organization.external_id
-  )
-RETURNING organization.id`, job.ID, job.IdentitySourceID, now, job.RunMarker)
+  ) ORDER BY organization.id`, job.ID, job.IdentitySourceID, job.RunMarker)
 	if err != nil {
-		return fmt.Errorf("disable missing directory organizations: %w", err)
+		return fmt.Errorf("list missing directory organizations: %w", err)
 	}
-	disabledOrganizations := make([]uuid.UUID, 0)
-	for organizationRows.Next() {
-		var id uuid.UUID
-		if err := organizationRows.Scan(&id); err != nil {
-			organizationRows.Close()
-			return err
-		}
-		disabledOrganizations = append(disabledOrganizations, id)
-	}
-	if err := organizationRows.Err(); err != nil {
-		organizationRows.Close()
-		return err
-	}
-	organizationRows.Close()
-	for _, id := range disabledOrganizations {
-		if err := executor.sessions.RevokeOrganizationMembers(ctx, tx, id, "directory organization disabled"); err != nil {
-			return err
-		}
-	}
-	if _, err := tx.Exec(ctx, `
-DELETE FROM organization_memberships membership
-USING organization_units organization, user_principals principal
-WHERE membership.organization_id=organization.id AND membership.user_id=principal.id
-  AND membership.source_owned=TRUE
+	missingMembershipRows, err := tx.Query(ctx, `
+SELECT membership.organization_id,membership.user_id
+FROM organization_memberships membership
+JOIN organization_units organization ON organization.id=membership.organization_id
+JOIN user_principals principal ON principal.id=membership.user_id
+WHERE membership.source_owned=TRUE AND membership.status='active'
   AND organization.identity_source_id=$2 AND principal.identity_source_id=$2
   AND NOT EXISTS (
       SELECT 1 FROM directory_sync_stage_memberships staged
       WHERE staged.sync_job_id=$1 AND staged.organization_external_id=organization.external_id
         AND staged.user_external_subject=principal.external_subject
-  )`, job.ID, job.IdentitySourceID); err != nil {
-		return fmt.Errorf("clean missing directory memberships: %w", err)
+  )
+ORDER BY membership.organization_id,membership.user_id`, job.ID, job.IdentitySourceID)
+	if err != nil {
+		return fmt.Errorf("list missing directory memberships: %w", err)
+	}
+	missingMemberships := make([]directoryMembershipIdentity, 0)
+	for missingMembershipRows.Next() {
+		var identity directoryMembershipIdentity
+		if err := missingMembershipRows.Scan(&identity.organizationID, &identity.userID); err != nil {
+			missingMembershipRows.Close()
+			return err
+		}
+		missingMemberships = append(missingMemberships, identity)
+	}
+	if err := missingMembershipRows.Err(); err != nil {
+		missingMembershipRows.Close()
+		return err
+	}
+	missingMembershipRows.Close()
+	organizationIDs := append([]uuid.UUID(nil), disabledOrganizations...)
+	userIDs := append([]uuid.UUID(nil), disabledUsers...)
+	for _, membership := range missingMemberships {
+		organizationIDs = append(organizationIDs, membership.organizationID)
+		userIDs = append(userIDs, membership.userID)
+	}
+	organizationIDs = sortedUniqueUUIDs(organizationIDs)
+	userIDs = sortedUniqueUUIDs(userIDs)
+	lockedOrganizations := make(map[uuid.UUID]OrganizationUnit, len(organizationIDs))
+	for _, organizationID := range organizationIDs {
+		organization, err := executor.repository.GetOrganization(ctx, tx, organizationID)
+		if err != nil {
+			return err
+		}
+		lockedOrganizations[organizationID] = organization
+	}
+	lockedUsers := make(map[uuid.UUID]UserPrincipal, len(userIDs))
+	for _, userID := range userIDs {
+		user, err := executor.repository.GetUser(ctx, tx, userID)
+		if err != nil {
+			return err
+		}
+		lockedUsers[userID] = user
+	}
+	lockedMemberships := make(map[directoryMembershipIdentity]OrganizationMembership, len(missingMemberships))
+	for _, identity := range missingMemberships {
+		membership, err := executor.repository.GetOrganizationMembership(ctx, tx, identity.organizationID, identity.userID, true)
+		if err != nil {
+			return err
+		}
+		lockedMemberships[identity] = membership
+	}
+	for _, organizationID := range disabledOrganizations {
+		organization := lockedOrganizations[organizationID]
+		result, err := tx.Exec(ctx, `UPDATE organization_units SET status='disabled',version=version+1,updated_at=$2 WHERE id=$1 AND status<>'disabled' AND version=$3`, organizationID, now, organization.Version)
+		if err != nil {
+			return fmt.Errorf("disable missing directory organization: %w", err)
+		}
+		if result.RowsAffected() != 1 {
+			return ErrIAMConflict
+		}
+		organization.Status = OrganizationStatusDisabled
+		organization.Version++
+		organization.UpdatedAt = now
+		lockedOrganizations[organizationID] = organization
+	}
+	for _, userID := range disabledUsers {
+		user := lockedUsers[userID]
+		if user.Status == UserStatusDisabled {
+			continue
+		}
+		previousVersion := user.Version
+		user.Status = UserStatusDisabled
+		user.DisabledAt = now
+		user.DisabledReason = "directory snapshot missing"
+		user.Version++
+		user.UpdatedAt = now
+		if err := executor.repository.SaveUser(ctx, tx, user, previousVersion); err != nil {
+			return err
+		}
+		lockedUsers[userID] = user
+	}
+	revokedMembershipUsers := make(map[uuid.UUID]struct{}, len(missingMemberships))
+	for _, identity := range missingMemberships {
+		organization := lockedOrganizations[identity.organizationID]
+		membership := lockedMemberships[identity]
+		if membership.Status != OrganizationMembershipStatusActive {
+			continue
+		}
+		result, err := tx.Exec(ctx, `UPDATE organization_memberships SET status='removed',version=version+1,updated_at=$3 WHERE organization_id=$1 AND user_id=$2 AND source_owned=TRUE AND status='active' AND version=$4`, identity.organizationID, identity.userID, now, membership.Version)
+		if err != nil {
+			return fmt.Errorf("soft-remove missing source-owned directory membership: %w", err)
+		}
+		if result.RowsAffected() != 1 {
+			return ErrIAMConflict
+		}
+		previousOrganizationVersion := organization.Version
+		organization.Version++
+		organization.UpdatedAt = now
+		if err := executor.repository.SaveOrganization(ctx, tx, organization, previousOrganizationVersion); err != nil {
+			return err
+		}
+		lockedOrganizations[identity.organizationID] = organization
+		revokedMembershipUsers[identity.userID] = struct{}{}
+	}
+	if len(disabledUsers) > 0 || len(disabledOrganizations) > 0 || len(revokedMembershipUsers) > 0 {
+		if err := executor.requireBreakGlassContinuity(ctx, tx, now); err != nil {
+			return err
+		}
+		revokedUsers := append([]uuid.UUID(nil), disabledUsers...)
+		disabledUserSet := make(map[uuid.UUID]struct{}, len(disabledUsers))
+		for _, userID := range disabledUsers {
+			disabledUserSet[userID] = struct{}{}
+		}
+		for userID := range revokedMembershipUsers {
+			revokedUsers = append(revokedUsers, userID)
+		}
+		for _, userID := range sortedUniqueUUIDs(revokedUsers) {
+			reason := "directory membership removed"
+			if _, disabled := disabledUserSet[userID]; disabled {
+				reason = "directory snapshot missing"
+			}
+			if err := executor.sessions.RevokeSubject(ctx, tx, userID, reason); err != nil {
+				return err
+			}
+		}
+		for _, organizationID := range disabledOrganizations {
+			if err := executor.sessions.RevokeOrganizationMembers(ctx, tx, organizationID, "directory organization disabled"); err != nil {
+				return err
+			}
+		}
 	}
 	job.Status = DirectorySyncStatusCompleted
 	job.CompletedAt = now
@@ -496,10 +678,41 @@ WHERE membership.organization_id=organization.id AND membership.user_id=principa
 UPDATE directory_sync_jobs SET status='completed', completed_at=$2, updated_at=$2 WHERE id=$1`, job.ID, now); err != nil {
 		return fmt.Errorf("complete directory synchronization apply: %w", err)
 	}
-	if err := executor.appendCompletionAudit(ctx, tx, *job); err != nil {
+	if err := executor.deleteStages(ctx, tx, job.ID); err != nil {
 		return err
 	}
-	return executor.deleteStages(ctx, tx, job.ID)
+	return executor.appendCompletionAudit(ctx, tx, *job)
+}
+
+func queryDirectoryUUIDs(ctx context.Context, tx pgx.Tx, query string, arguments ...any) ([]uuid.UUID, error) {
+	rows, err := tx.Query(ctx, query, arguments...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make([]uuid.UUID, 0)
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		result = append(result, id)
+	}
+	return result, rows.Err()
+}
+
+func sortedUniqueUUIDs(values []uuid.UUID) []uuid.UUID {
+	seen := make(map[uuid.UUID]struct{}, len(values))
+	result := make([]uuid.UUID, 0, len(values))
+	for _, value := range values {
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	sort.Slice(result, func(left, right int) bool { return result[left].String() < result[right].String() })
+	return result
 }
 
 func (executor *PostgresDirectorySyncExecutor) appendCompletionAudit(ctx context.Context, tx pgx.Tx, job DirectorySyncJob) error {

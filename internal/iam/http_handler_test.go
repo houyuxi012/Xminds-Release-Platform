@@ -188,6 +188,101 @@ func TestHTTPHandlerNeverReturnsProvisioningSecretFromUserReads(t *testing.T) {
 	}
 }
 
+// Mutation caught: omitting any organization governance route leaves the
+// backend contract incomplete even if list/create still work.
+func TestHTTPHandlerExposesOrganizationDetailChildrenAndMembershipLifecycle(t *testing.T) {
+	t.Parallel()
+	organizationID, userID := uuid.New(), uuid.New()
+	now := time.Date(2026, 8, 21, 17, 0, 0, 0, time.UTC)
+	application := &stubIAMApplication{
+		organization:               OrganizationUnit{ID: organizationID, Name: "Engineering", Status: OrganizationStatusActive, Version: 4, CreatedAt: now, UpdatedAt: now},
+		organizationPage:           OrganizationPage{Items: []OrganizationUnit{{ID: uuid.New(), ParentID: organizationID, Name: "Release", Status: OrganizationStatusActive, Version: 1, CreatedAt: now, UpdatedAt: now}}},
+		organizationMembershipPage: OrganizationMembershipPage{Items: []OrganizationMembership{{OrganizationID: organizationID, UserID: userID, SourceOwned: true, Status: OrganizationMembershipStatusActive, Version: 2, CreatedAt: now, UpdatedAt: now}}},
+		organizationMembership:     OrganizationMembership{OrganizationID: organizationID, UserID: userID, Status: OrganizationMembershipStatusActive, Version: 1, CreatedAt: now, UpdatedAt: now},
+	}
+	handler := authenticatedIAMHandler(application)
+	for _, path := range []string{
+		"/api/v1/organizations/" + organizationID.String(),
+		"/api/v1/organizations/" + organizationID.String() + "/children?limit=10",
+		"/api/v1/organizations/" + organizationID.String() + "/memberships?limit=10",
+	} {
+		request := httptest.NewRequest(http.MethodGet, path, nil)
+		request.Header.Set("Authorization", "Bearer token")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusOK || response.Header().Get("Cache-Control") != "no-store" {
+			t.Fatalf("GET %s status=%d headers=%v body=%s", path, response.Code, response.Header(), response.Body)
+		}
+	}
+
+	postBody := `{"organization_version":4,"user_id":"` + userID.String() + `","user_version":3,"reason":"approved supplemental access","reauthentication":{"challenge_id":"challenge","evidence":"evidence","confirmed":true}}`
+	postRequest := httptest.NewRequest(http.MethodPost, "/api/v1/organizations/"+organizationID.String()+"/memberships", strings.NewReader(postBody))
+	postRequest.Header.Set("Authorization", "Bearer token")
+	postRequest.Header.Set("Content-Type", "application/json")
+	postResponse := httptest.NewRecorder()
+	handler.ServeHTTP(postResponse, postRequest)
+	if postResponse.Code != http.StatusCreated || postResponse.Header().Get("Location") != "/api/v1/organizations/"+organizationID.String()+"/memberships/"+userID.String() || application.membershipCreateCommand.Reason != "approved supplemental access" {
+		t.Fatalf("POST membership status=%d location=%q command=%+v body=%s", postResponse.Code, postResponse.Header().Get("Location"), application.membershipCreateCommand, postResponse.Body)
+	}
+
+	deleteBody := `{"organization_version":5,"user_version":3,"membership_version":1,"reason":"remove obsolete supplemental access","reauthentication":{"challenge_id":"challenge","evidence":"evidence","confirmed":true}}`
+	deleteRequest := httptest.NewRequest(http.MethodDelete, "/api/v1/organizations/"+organizationID.String()+"/memberships/"+userID.String(), strings.NewReader(deleteBody))
+	deleteRequest.Header.Set("Authorization", "Bearer token")
+	deleteRequest.Header.Set("Content-Type", "application/json")
+	deleteResponse := httptest.NewRecorder()
+	handler.ServeHTTP(deleteResponse, deleteRequest)
+	if deleteResponse.Code != http.StatusNoContent || application.membershipDeleteCommand.MembershipVersion != 1 {
+		t.Fatalf("DELETE membership status=%d command=%+v body=%s", deleteResponse.Code, application.membershipDeleteCommand, deleteResponse.Body)
+	}
+}
+
+func TestOrganizationMembershipHTTPRejectsUnknownFieldsAndTemplatesProblemInstance(t *testing.T) {
+	t.Parallel()
+	organizationID, userID := uuid.New(), uuid.New()
+	application := &stubIAMApplication{membershipError: ErrOrganizationMembershipNotFound}
+	handler := authenticatedIAMHandler(application)
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/organizations/"+organizationID.String()+"/memberships", strings.NewReader(`{"organization_version":1,"user_id":"`+userID.String()+`","user_version":1,"reason":"approved supplemental access","reauthentication":{"challenge_id":"challenge","evidence":"evidence","confirmed":true},"unexpected":true}`))
+	request.Header.Set("Authorization", "Bearer token")
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest || application.membershipCreateCalls != 0 {
+		t.Fatalf("unknown field status=%d calls=%d body=%s", response.Code, application.membershipCreateCalls, response.Body)
+	}
+	whitespaceRequest := httptest.NewRequest(http.MethodPost, "/api/v1/organizations/"+organizationID.String()+"/memberships", strings.NewReader(`{"organization_version":1,"user_id":"`+userID.String()+`","user_version":1,"reason":" approved supplemental access ","reauthentication":{"challenge_id":"challenge","evidence":"evidence","confirmed":true}}`))
+	whitespaceRequest.Header.Set("Authorization", "Bearer token")
+	whitespaceRequest.Header.Set("Content-Type", "application/json")
+	whitespaceResponse := httptest.NewRecorder()
+	handler.ServeHTTP(whitespaceResponse, whitespaceRequest)
+	if whitespaceResponse.Code != http.StatusBadRequest || application.membershipCreateCalls != 0 {
+		t.Fatalf("non-canonical reason status=%d calls=%d body=%s", whitespaceResponse.Code, application.membershipCreateCalls, whitespaceResponse.Body)
+	}
+
+	deleteRequest := httptest.NewRequest(http.MethodDelete, "/api/v1/organizations/"+organizationID.String()+"/memberships/"+userID.String(), strings.NewReader(`{"organization_version":1,"user_version":1,"membership_version":1,"reason":"remove obsolete supplemental access","reauthentication":{"challenge_id":"challenge","evidence":"evidence","confirmed":true}}`))
+	deleteRequest.Header.Set("Authorization", "Bearer token")
+	deleteRequest.Header.Set("Content-Type", "application/json")
+	deleteResponse := httptest.NewRecorder()
+	handler.ServeHTTP(deleteResponse, deleteRequest)
+	if deleteResponse.Code != http.StatusNotFound || !strings.Contains(deleteResponse.Body.String(), `"instance":"/api/v1/organizations/{organization_id}/memberships/{user_id}"`) || strings.Contains(deleteResponse.Body.String(), organizationID.String()) || strings.Contains(deleteResponse.Body.String(), userID.String()) {
+		t.Fatalf("templated problem status=%d body=%s", deleteResponse.Code, deleteResponse.Body)
+	}
+}
+
+func TestOrganizationMembershipHTTPParsesOwnershipAwareCursor(t *testing.T) {
+	t.Parallel()
+	organizationID, userID := uuid.New(), uuid.New()
+	createdAt := time.Date(2026, 8, 21, 17, 30, 0, 0, time.UTC)
+	application := &stubIAMApplication{}
+	handler := authenticatedIAMHandler(application)
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/organizations/"+organizationID.String()+"/memberships?limit=1&cursor="+encodeOrganizationMembershipCursor(createdAt, userID, true), nil)
+	request.Header.Set("Authorization", "Bearer token")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || application.membershipPageRequest.BeforeSourceOwned == nil || !*application.membershipPageRequest.BeforeSourceOwned || application.membershipPageRequest.BeforeID != userID || !application.membershipPageRequest.BeforeTime.Equal(createdAt) {
+		t.Fatalf("ownership cursor status=%d page=%+v body=%s", response.Code, application.membershipPageRequest, response.Body)
+	}
+}
+
 func TestHTTPHandlerListsUsersWithValidatedCursor(t *testing.T) {
 	t.Parallel()
 
@@ -426,22 +521,54 @@ func (verifier iamStaticVerifier) Verify(context.Context, string) (identity.Prin
 }
 
 type stubIAMApplication struct {
-	provisioning          LocalUserProvisioning
-	createError           error
-	createCalls           int
-	createCommand         CreateLocalUserCommand
-	createRequest         RequestContext
-	page                  UserPage
-	user                  UserPrincipal
-	listPage              Page
-	organization          OrganizationUnit
-	organizationCommand   CreateOrganizationCommand
-	identitySource        IdentitySource
-	identitySourceCommand CreateIdentitySourceCommand
-	roleBindingCommand    CreateRoleBindingCommand
-	highRiskProof         HighRiskProof
-	highRiskAction        string
-	highRiskVersion       int64
+	provisioning               LocalUserProvisioning
+	createError                error
+	createCalls                int
+	createCommand              CreateLocalUserCommand
+	createRequest              RequestContext
+	page                       UserPage
+	user                       UserPrincipal
+	listPage                   Page
+	organization               OrganizationUnit
+	organizationPage           OrganizationPage
+	organizationMembershipPage OrganizationMembershipPage
+	organizationMembership     OrganizationMembership
+	membershipCreateCommand    CreateOrganizationMembershipCommand
+	membershipDeleteCommand    DeleteOrganizationMembershipCommand
+	membershipPageRequest      Page
+	membershipCreateCalls      int
+	membershipError            error
+	organizationCommand        CreateOrganizationCommand
+	identitySource             IdentitySource
+	identitySourceCommand      CreateIdentitySourceCommand
+	roleBindingCommand         CreateRoleBindingCommand
+	highRiskProof              HighRiskProof
+	highRiskAction             string
+	highRiskVersion            int64
+}
+
+func (application *stubIAMApplication) GetOrganization(context.Context, identity.Principal, uuid.UUID) (OrganizationUnit, error) {
+	return application.organization, application.membershipError
+}
+
+func (application *stubIAMApplication) ListOrganizationChildren(context.Context, identity.Principal, uuid.UUID, Page) (OrganizationPage, error) {
+	return application.organizationPage, application.membershipError
+}
+
+func (application *stubIAMApplication) ListOrganizationMemberships(_ context.Context, _ identity.Principal, _ uuid.UUID, page Page) (OrganizationMembershipPage, error) {
+	application.membershipPageRequest = page
+	return application.organizationMembershipPage, application.membershipError
+}
+
+func (application *stubIAMApplication) CreateOrganizationMembership(_ context.Context, _ identity.Principal, _ uuid.UUID, command CreateOrganizationMembershipCommand, _ HighRiskProof, _ RequestContext) (OrganizationMembership, error) {
+	application.membershipCreateCalls++
+	application.membershipCreateCommand = command
+	return application.organizationMembership, application.membershipError
+}
+
+func (application *stubIAMApplication) DeleteOrganizationMembership(_ context.Context, _ identity.Principal, _, _ uuid.UUID, command DeleteOrganizationMembershipCommand, _ HighRiskProof, _ RequestContext) error {
+	application.membershipDeleteCommand = command
+	return application.membershipError
 }
 
 func (application *stubIAMApplication) CreateLocalUser(_ context.Context, _ identity.Principal, command CreateLocalUserCommand, request RequestContext) (LocalUserProvisioning, error) {

@@ -29,14 +29,16 @@ const (
 type ReauthenticationOperation string
 
 const (
-	ReauthenticationOperationRoleBindingCreate        ReauthenticationOperation = "identity.role_binding.create"
-	ReauthenticationOperationRoleBindingDelete        ReauthenticationOperation = "identity.role_binding.delete"
-	ReauthenticationOperationUserDisable              ReauthenticationOperation = "identity.user.disable"
-	ReauthenticationOperationUserEnable               ReauthenticationOperation = "identity.user.enable"
-	ReauthenticationOperationUserRevokeSessions       ReauthenticationOperation = "identity.user.revoke_sessions"
-	ReauthenticationOperationSSOEnable                ReauthenticationOperation = "identity.sso.enable"
-	ReauthenticationOperationSSODisable               ReauthenticationOperation = "identity.sso.disable"
-	ReauthenticationOperationDirectoryConflictResolve ReauthenticationOperation = "identity.directory_conflict.resolve"
+	ReauthenticationOperationRoleBindingCreate            ReauthenticationOperation = "identity.role_binding.create"
+	ReauthenticationOperationRoleBindingDelete            ReauthenticationOperation = "identity.role_binding.delete"
+	ReauthenticationOperationUserDisable                  ReauthenticationOperation = "identity.user.disable"
+	ReauthenticationOperationUserEnable                   ReauthenticationOperation = "identity.user.enable"
+	ReauthenticationOperationUserRevokeSessions           ReauthenticationOperation = "identity.user.revoke_sessions"
+	ReauthenticationOperationSSOEnable                    ReauthenticationOperation = "identity.sso.enable"
+	ReauthenticationOperationSSODisable                   ReauthenticationOperation = "identity.sso.disable"
+	ReauthenticationOperationDirectoryConflictResolve     ReauthenticationOperation = "identity.directory_conflict.resolve"
+	ReauthenticationOperationOrganizationMembershipCreate ReauthenticationOperation = "identity.organization_membership.create"
+	ReauthenticationOperationOrganizationMembershipDelete ReauthenticationOperation = "identity.organization_membership.delete"
 )
 
 type ReauthenticationStatus string
@@ -349,7 +351,8 @@ func validReauthenticationOperation(operation ReauthenticationOperation) bool {
 	switch operation {
 	case ReauthenticationOperationRoleBindingCreate, ReauthenticationOperationRoleBindingDelete,
 		ReauthenticationOperationUserDisable, ReauthenticationOperationUserEnable, ReauthenticationOperationUserRevokeSessions,
-		ReauthenticationOperationSSOEnable, ReauthenticationOperationSSODisable, ReauthenticationOperationDirectoryConflictResolve:
+		ReauthenticationOperationSSOEnable, ReauthenticationOperationSSODisable, ReauthenticationOperationDirectoryConflictResolve,
+		ReauthenticationOperationOrganizationMembershipCreate, ReauthenticationOperationOrganizationMembershipDelete:
 		return true
 	default:
 		return false

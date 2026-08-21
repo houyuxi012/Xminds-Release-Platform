@@ -257,6 +257,7 @@ WITH structural_candidates AS (
                              SELECT 1 FROM organization_memberships AS membership
                              WHERE membership.organization_id=binding.subject_id
                                AND membership.user_id=candidate.id
+								AND membership.status='active'
                          )
                      )
                  )
@@ -276,6 +277,7 @@ WITH structural_candidates AS (
                              SELECT 1 FROM organization_memberships AS membership
                              WHERE membership.organization_id=binding.subject_id
                                AND membership.user_id=candidate.id
+								AND membership.status='active'
                          )
                      )
                  )
@@ -531,6 +533,143 @@ LIMIT $3`, nullableTime(page.BeforeTime), page.BeforeID, limit+1)
 	return result, nil
 }
 
+func (repository *PostgresRepository) ListOrganizationChildren(ctx context.Context, organizationID uuid.UUID, page Page) (OrganizationPage, error) {
+	if repository == nil || repository.pool == nil || organizationID == uuid.Nil {
+		return OrganizationPage{}, ErrIAMConfiguration
+	}
+	limit, err := pageLimit(page)
+	if err != nil {
+		return OrganizationPage{}, err
+	}
+	rows, err := repository.pool.Query(ctx, organizationSelect+`
+WHERE parent_id=$1 AND ($2::timestamptz IS NULL OR (created_at,id) < ($2,$3))
+ORDER BY created_at DESC,id DESC
+LIMIT $4`, organizationID, nullableTime(page.BeforeTime), page.BeforeID, limit+1)
+	if err != nil {
+		return OrganizationPage{}, fmt.Errorf("list organization children: %w", err)
+	}
+	defer rows.Close()
+	items := make([]OrganizationUnit, 0, limit+1)
+	for rows.Next() {
+		item, scanErr := scanOrganization(rows)
+		if scanErr != nil {
+			return OrganizationPage{}, scanErr
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return OrganizationPage{}, fmt.Errorf("iterate organization children: %w", err)
+	}
+	result := OrganizationPage{Items: items}
+	if len(items) > limit {
+		last := items[limit-1]
+		result.Items, result.NextCursor = items[:limit], encodeIAMCursor(last.CreatedAt, last.ID)
+	}
+	return result, nil
+}
+
+func (repository *PostgresRepository) ListOrganizationMemberships(ctx context.Context, organizationID uuid.UUID, page Page) (OrganizationMembershipPage, error) {
+	if repository == nil || repository.pool == nil || organizationID == uuid.Nil {
+		return OrganizationMembershipPage{}, ErrIAMConfiguration
+	}
+	limit, err := pageLimit(page)
+	if err != nil || (page.BeforeTime.IsZero() != (page.BeforeSourceOwned == nil)) {
+		return OrganizationMembershipPage{}, ErrPageInvalid
+	}
+	beforeSourceOwned := false
+	if page.BeforeSourceOwned != nil {
+		beforeSourceOwned = *page.BeforeSourceOwned
+	}
+	rows, err := repository.pool.Query(ctx, organizationMembershipSelect+`
+ WHERE organization_id=$1 AND status='active'
+   AND ($2::timestamptz IS NULL OR (created_at,user_id,source_owned) < ($2,$3,$4))
+ ORDER BY created_at DESC,user_id DESC,source_owned DESC
+ LIMIT $5`, organizationID, nullableTime(page.BeforeTime), page.BeforeID, beforeSourceOwned, limit+1)
+	if err != nil {
+		return OrganizationMembershipPage{}, fmt.Errorf("list organization memberships: %w", err)
+	}
+	defer rows.Close()
+	items := make([]OrganizationMembership, 0, limit+1)
+	for rows.Next() {
+		item, scanErr := scanOrganizationMembership(rows)
+		if scanErr != nil {
+			return OrganizationMembershipPage{}, scanErr
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return OrganizationMembershipPage{}, fmt.Errorf("iterate organization memberships: %w", err)
+	}
+	result := OrganizationMembershipPage{Items: items}
+	if len(items) > limit {
+		last := items[limit-1]
+		result.Items, result.NextCursor = items[:limit], encodeOrganizationMembershipCursor(last.CreatedAt, last.UserID, last.SourceOwned)
+	}
+	return result, nil
+}
+
+func (repository *PostgresRepository) GetOrganizationMembership(ctx context.Context, tx pgx.Tx, organizationID, userID uuid.UUID, sourceOwned bool) (OrganizationMembership, error) {
+	if repository == nil || repository.pool == nil || organizationID == uuid.Nil || userID == uuid.Nil {
+		return OrganizationMembership{}, ErrOrganizationMembershipNotFound
+	}
+	queryer := iamQueryer(repository.pool)
+	query := organizationMembershipSelect + ` WHERE organization_id=$1 AND user_id=$2 AND source_owned=$3`
+	if tx != nil {
+		lockKey := "xminds-release-platform:iam:organization-membership:" + organizationID.String() + ":" + userID.String() + ":" + fmt.Sprint(sourceOwned)
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, lockKey); err != nil {
+			return OrganizationMembership{}, fmt.Errorf("lock organization membership key: %w", err)
+		}
+		query += ` FOR UPDATE`
+		queryer = tx
+	}
+	return scanOrganizationMembership(queryer.QueryRow(ctx, query, organizationID, userID, sourceOwned))
+}
+
+func (repository *PostgresRepository) InsertPlatformOrganizationMembership(ctx context.Context, tx pgx.Tx, membership OrganizationMembership) error {
+	if tx == nil || membership.OrganizationID == uuid.Nil || membership.UserID == uuid.Nil || membership.SourceOwned || membership.Status != OrganizationMembershipStatusActive || membership.Version != 1 || membership.CreatedAt.IsZero() || membership.UpdatedAt.IsZero() {
+		return ErrIAMConfiguration
+	}
+	_, err := tx.Exec(ctx, `INSERT INTO organization_memberships (organization_id,user_id,source_owned,status,version,created_at,updated_at) VALUES ($1,$2,FALSE,$3,$4,$5,$6)`,
+		membership.OrganizationID, membership.UserID, membership.Status, membership.Version, membership.CreatedAt.UTC(), membership.UpdatedAt.UTC())
+	if err != nil {
+		var postgresError *pgconn.PgError
+		if errors.As(err, &postgresError) && postgresError.Code == "23505" {
+			return ErrIAMConflict
+		}
+		return fmt.Errorf("insert organization membership: %w", err)
+	}
+	return nil
+}
+
+func (repository *PostgresRepository) SavePlatformOrganizationMembership(ctx context.Context, tx pgx.Tx, membership OrganizationMembership, expectedVersion int64) error {
+	if tx == nil || membership.OrganizationID == uuid.Nil || membership.UserID == uuid.Nil || membership.SourceOwned || expectedVersion < 1 || membership.Version != expectedVersion+1 || membership.UpdatedAt.IsZero() || (membership.Status != OrganizationMembershipStatusActive && membership.Status != OrganizationMembershipStatusRemoved) {
+		return ErrIAMConfiguration
+	}
+	result, err := tx.Exec(ctx, `UPDATE organization_memberships SET status=$3,version=$4,updated_at=$5 WHERE organization_id=$1 AND user_id=$2 AND source_owned=FALSE AND version=$6`,
+		membership.OrganizationID, membership.UserID, membership.Status, membership.Version, membership.UpdatedAt.UTC(), expectedVersion)
+	if err != nil {
+		return fmt.Errorf("save organization membership: %w", err)
+	}
+	if result.RowsAffected() != 1 {
+		return ErrIAMConflict
+	}
+	return nil
+}
+
+func (repository *PostgresRepository) SaveOrganization(ctx context.Context, tx pgx.Tx, organization OrganizationUnit, expectedVersion int64) error {
+	if tx == nil || organization.ID == uuid.Nil || expectedVersion < 1 || organization.Version != expectedVersion+1 || organization.UpdatedAt.IsZero() {
+		return ErrIAMConfiguration
+	}
+	result, err := tx.Exec(ctx, `UPDATE organization_units SET version=$2,updated_at=$3 WHERE id=$1 AND version=$4`, organization.ID, organization.Version, organization.UpdatedAt.UTC(), expectedVersion)
+	if err != nil {
+		return fmt.Errorf("save organization unit: %w", err)
+	}
+	if result.RowsAffected() != 1 {
+		return ErrIAMConflict
+	}
+	return nil
+}
+
 func (repository *PostgresRepository) InsertRoleBinding(ctx context.Context, tx pgx.Tx, binding RoleBinding) error {
 	if tx == nil || binding.ID == uuid.Nil || binding.Version != 1 {
 		return ErrIAMConfiguration
@@ -720,6 +859,9 @@ const organizationSelect = `SELECT id, COALESCE(identity_source_id, '00000000-00
        COALESCE(parent_id, '00000000-0000-0000-0000-000000000000'::uuid), name, source_owned, status, version, created_at, updated_at
 FROM organization_units`
 
+const organizationMembershipSelect = `SELECT organization_id,user_id,source_owned,status,version,created_at,updated_at
+FROM organization_memberships`
+
 const roleBindingSelect = `SELECT id, subject_type, subject_id, role_name, scope_type, COALESCE(product_id, ''), COALESCE(channel_name, ''), effect,
        valid_from, valid_until, created_by, version, created_at, updated_at
 FROM role_bindings`
@@ -765,6 +907,16 @@ func scanOrganization(row pgx.Row) (OrganizationUnit, error) {
 		return OrganizationUnit{}, fmt.Errorf("scan organization unit: %w", err)
 	}
 	return organization, nil
+}
+
+func scanOrganizationMembership(row pgx.Row) (OrganizationMembership, error) {
+	var membership OrganizationMembership
+	if err := row.Scan(&membership.OrganizationID, &membership.UserID, &membership.SourceOwned, &membership.Status, &membership.Version, &membership.CreatedAt, &membership.UpdatedAt); errors.Is(err, pgx.ErrNoRows) {
+		return OrganizationMembership{}, ErrOrganizationMembershipNotFound
+	} else if err != nil {
+		return OrganizationMembership{}, fmt.Errorf("scan organization membership: %w", err)
+	}
+	return membership, nil
 }
 
 func scanRoleBinding(row pgx.Row) (RoleBinding, error) {

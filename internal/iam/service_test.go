@@ -973,8 +973,9 @@ func newIAMHarness(t *testing.T) *iamHarness {
 			ID: emergencyBindingID, SubjectType: SubjectTypeUser, SubjectID: emergencyID, Role: identity.RoleAdmin,
 			ScopeType: ScopeTypePlatform, Effect: BindingEffectAllow, ValidFrom: now.Add(-24 * time.Hour), Version: 1,
 		}},
-		catalogScopes: map[string]map[string]bool{"ngep": {"stable": true}},
-		memberships:   make(map[uuid.UUID][]uuid.UUID),
+		catalogScopes:           map[string]map[string]bool{"ngep": {"stable": true}},
+		memberships:             make(map[uuid.UUID][]uuid.UUID),
+		organizationMemberships: make(map[organizationMembershipKey]OrganizationMembership),
 	}
 	auditor := &iamAuditRecorder{}
 	sessions := &iamSessionRecorder{}
@@ -1000,15 +1001,22 @@ func (harness *iamHarness) proof() HighRiskProof {
 }
 
 type memoryIAMRepository struct {
-	withinTransactionCalls int
-	login                  LoginState
-	sources                map[uuid.UUID]IdentitySource
-	users                  map[uuid.UUID]UserPrincipal
-	credentials            map[uuid.UUID]LocalCredential
-	organizations          map[uuid.UUID]OrganizationUnit
-	roleBindings           map[uuid.UUID]RoleBinding
-	catalogScopes          map[string]map[string]bool
-	memberships            map[uuid.UUID][]uuid.UUID
+	withinTransactionCalls  int
+	login                   LoginState
+	sources                 map[uuid.UUID]IdentitySource
+	users                   map[uuid.UUID]UserPrincipal
+	credentials             map[uuid.UUID]LocalCredential
+	organizations           map[uuid.UUID]OrganizationUnit
+	roleBindings            map[uuid.UUID]RoleBinding
+	catalogScopes           map[string]map[string]bool
+	memberships             map[uuid.UUID][]uuid.UUID
+	organizationMemberships map[organizationMembershipKey]OrganizationMembership
+}
+
+type organizationMembershipKey struct {
+	organizationID uuid.UUID
+	userID         uuid.UUID
+	sourceOwned    bool
 }
 
 func (repository *memoryIAMRepository) WithinTransaction(_ context.Context, function func(pgx.Tx) error) error {
@@ -1017,14 +1025,34 @@ func (repository *memoryIAMRepository) WithinTransaction(_ context.Context, func
 	users := cloneIAMUsers(repository.users)
 	sources := cloneIAMSources(repository.sources)
 	bindings := cloneIAMRoleBindings(repository.roleBindings)
+	organizations := cloneIAMOrganizations(repository.organizations)
+	memberships := cloneIAMOrganizationMemberships(repository.organizationMemberships)
 	err := function(nil)
 	if err != nil {
 		repository.login = login
 		repository.users = users
 		repository.sources = sources
 		repository.roleBindings = bindings
+		repository.organizations = organizations
+		repository.organizationMemberships = memberships
 	}
 	return err
+}
+
+func cloneIAMOrganizations(source map[uuid.UUID]OrganizationUnit) map[uuid.UUID]OrganizationUnit {
+	result := make(map[uuid.UUID]OrganizationUnit, len(source))
+	for key, value := range source {
+		result[key] = value
+	}
+	return result
+}
+
+func cloneIAMOrganizationMemberships(source map[organizationMembershipKey]OrganizationMembership) map[organizationMembershipKey]OrganizationMembership {
+	result := make(map[organizationMembershipKey]OrganizationMembership, len(source))
+	for key, value := range source {
+		result[key] = value
+	}
+	return result
 }
 
 func cloneIAMUsers(source map[uuid.UUID]UserPrincipal) map[uuid.UUID]UserPrincipal {
@@ -1234,6 +1262,74 @@ func (repository *memoryIAMRepository) ListOrganizations(context.Context, Page) 
 		items = append(items, organization)
 	}
 	return OrganizationPage{Items: items}, nil
+}
+
+func (repository *memoryIAMRepository) ListOrganizationChildren(_ context.Context, organizationID uuid.UUID, _ Page) (OrganizationPage, error) {
+	items := make([]OrganizationUnit, 0)
+	for _, organization := range repository.organizations {
+		if organization.ParentID == organizationID {
+			items = append(items, organization)
+		}
+	}
+	return OrganizationPage{Items: items}, nil
+}
+
+func (repository *memoryIAMRepository) ListOrganizationMemberships(_ context.Context, organizationID uuid.UUID, _ Page) (OrganizationMembershipPage, error) {
+	items := make([]OrganizationMembership, 0)
+	for _, membership := range repository.organizationMemberships {
+		if membership.OrganizationID == organizationID && membership.Status == OrganizationMembershipStatusActive {
+			items = append(items, membership)
+		}
+	}
+	return OrganizationMembershipPage{Items: items}, nil
+}
+
+func (repository *memoryIAMRepository) GetOrganizationMembership(_ context.Context, _ pgx.Tx, organizationID, userID uuid.UUID, sourceOwned bool) (OrganizationMembership, error) {
+	membership, exists := repository.organizationMemberships[organizationMembershipKey{organizationID: organizationID, userID: userID, sourceOwned: sourceOwned}]
+	if !exists {
+		return OrganizationMembership{}, ErrOrganizationMembershipNotFound
+	}
+	return membership, nil
+}
+
+func (repository *memoryIAMRepository) InsertPlatformOrganizationMembership(_ context.Context, _ pgx.Tx, membership OrganizationMembership) error {
+	if membership.SourceOwned {
+		return ErrIAMConfiguration
+	}
+	key := organizationMembershipKey{organizationID: membership.OrganizationID, userID: membership.UserID, sourceOwned: membership.SourceOwned}
+	if _, exists := repository.organizationMemberships[key]; exists {
+		return ErrIAMConflict
+	}
+	repository.organizationMemberships[key] = membership
+	return nil
+}
+
+func (repository *memoryIAMRepository) SavePlatformOrganizationMembership(_ context.Context, _ pgx.Tx, membership OrganizationMembership, expectedVersion int64) error {
+	if membership.SourceOwned {
+		return ErrIAMConfiguration
+	}
+	key := organizationMembershipKey{organizationID: membership.OrganizationID, userID: membership.UserID, sourceOwned: membership.SourceOwned}
+	current, exists := repository.organizationMemberships[key]
+	if !exists {
+		return ErrOrganizationMembershipNotFound
+	}
+	if current.Version != expectedVersion {
+		return ErrIAMConflict
+	}
+	repository.organizationMemberships[key] = membership
+	return nil
+}
+
+func (repository *memoryIAMRepository) SaveOrganization(_ context.Context, _ pgx.Tx, organization OrganizationUnit, expectedVersion int64) error {
+	current, exists := repository.organizations[organization.ID]
+	if !exists {
+		return ErrOrganizationNotFound
+	}
+	if current.Version != expectedVersion {
+		return ErrIAMConflict
+	}
+	repository.organizations[organization.ID] = organization
+	return nil
 }
 
 func (repository *memoryIAMRepository) InsertRoleBinding(_ context.Context, _ pgx.Tx, binding RoleBinding) error {

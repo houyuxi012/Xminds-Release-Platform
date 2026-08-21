@@ -26,6 +26,12 @@ type Repository interface {
 	InsertOrganization(ctx context.Context, tx pgx.Tx, organization OrganizationUnit) error
 	GetOrganization(ctx context.Context, tx pgx.Tx, id uuid.UUID) (OrganizationUnit, error)
 	ListOrganizations(ctx context.Context, page Page) (OrganizationPage, error)
+	ListOrganizationChildren(ctx context.Context, organizationID uuid.UUID, page Page) (OrganizationPage, error)
+	ListOrganizationMemberships(ctx context.Context, organizationID uuid.UUID, page Page) (OrganizationMembershipPage, error)
+	GetOrganizationMembership(ctx context.Context, tx pgx.Tx, organizationID, userID uuid.UUID, sourceOwned bool) (OrganizationMembership, error)
+	InsertPlatformOrganizationMembership(ctx context.Context, tx pgx.Tx, membership OrganizationMembership) error
+	SavePlatformOrganizationMembership(ctx context.Context, tx pgx.Tx, membership OrganizationMembership, expectedVersion int64) error
+	SaveOrganization(ctx context.Context, tx pgx.Tx, organization OrganizationUnit, expectedVersion int64) error
 	InsertRoleBinding(ctx context.Context, tx pgx.Tx, binding RoleBinding) error
 	GetRoleBinding(ctx context.Context, tx pgx.Tx, id uuid.UUID) (RoleBinding, error)
 	ListRoleBindings(ctx context.Context, page Page) (RoleBindingPage, error)
@@ -48,6 +54,8 @@ type BreakGlassInvariantRepository interface {
 }
 
 type BreakGlassInvariant interface {
+	LockAuthority(ctx context.Context, tx pgx.Tx) error
+	RequireUsableAdministrator(ctx context.Context, tx pgx.Tx, at time.Time) error
 	LockAndRequireUsableAdministrator(ctx context.Context, tx pgx.Tx, at time.Time) error
 }
 

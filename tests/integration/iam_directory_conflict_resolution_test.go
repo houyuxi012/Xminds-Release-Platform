@@ -210,8 +210,8 @@ func TestDirectoryConflictResolutionPostgresConcurrencyAndAuditRollback(t *testi
 	) VALUES ($1,$2,'last-safe-org','Last Safe Organization',TRUE,'active',5,$3,$3)`, representativeOrganizationID, sourceID, now.Add(-time.Hour)); err != nil {
 		t.Fatalf("seed representative organization: %v", err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO organization_memberships (organization_id,user_id,source_owned,created_at)
-		VALUES ($1,$2,TRUE,$3)`, representativeOrganizationID, representativeUserID, now.Add(-time.Hour)); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO organization_memberships (organization_id,user_id,source_owned,status,version,created_at,updated_at)
+		VALUES ($1,$2,TRUE,'active',1,$3,$3)`, representativeOrganizationID, representativeUserID, now.Add(-time.Hour)); err != nil {
 		t.Fatalf("seed representative membership: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO role_bindings (
@@ -307,6 +307,7 @@ func TestDirectoryConflictResolutionPostgresConcurrencyAndAuditRollback(t *testi
 		t.Fatalf("keep_last_safe changed representative business rows\nbefore=%v\nafter=%v", lastSafeSnapshot, afterResolution)
 	}
 	syncNow := now.Add(time.Hour)
+	seedDirectoryIntegrationEmergencyAdministrator(t, ctx, pool, syncNow)
 	listService, err := iam.NewDirectorySyncService(iam.DirectorySyncServiceConfig{
 		Store: repository, Jobs: jobs.NewPostgresRepository(pool), Auditor: auditor, HighRisk: reauthentication,
 		Clock: func() time.Time { return syncNow }, ConflictCursors: directoryIntegrationCursorCodec(t, syncNow),

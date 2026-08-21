@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -98,6 +99,264 @@ func (service *Service) ListOrganizations(ctx context.Context, actor identity.Pr
 	return service.repository.ListOrganizations(ctx, page)
 }
 
+func (service *Service) GetOrganization(ctx context.Context, actor identity.Principal, organizationID uuid.UUID) (OrganizationUnit, error) {
+	if err := service.authorizer.Require(actor, identity.ActionIdentityManage, ""); err != nil {
+		return OrganizationUnit{}, err
+	}
+	if organizationID == uuid.Nil {
+		return OrganizationUnit{}, ErrOrganizationNotFound
+	}
+	return service.repository.GetOrganization(ctx, nil, organizationID)
+}
+
+func (service *Service) ListOrganizationChildren(ctx context.Context, actor identity.Principal, organizationID uuid.UUID, page Page) (OrganizationPage, error) {
+	if err := service.authorizer.Require(actor, identity.ActionIdentityManage, ""); err != nil {
+		return OrganizationPage{}, err
+	}
+	if organizationID == uuid.Nil {
+		return OrganizationPage{}, ErrOrganizationNotFound
+	}
+	if !validIAMPage(page) {
+		return OrganizationPage{}, ErrPageInvalid
+	}
+	if _, err := service.repository.GetOrganization(ctx, nil, organizationID); err != nil {
+		return OrganizationPage{}, err
+	}
+	return service.repository.ListOrganizationChildren(ctx, organizationID, page)
+}
+
+func (service *Service) ListOrganizationMemberships(ctx context.Context, actor identity.Principal, organizationID uuid.UUID, page Page) (OrganizationMembershipPage, error) {
+	if err := service.authorizer.Require(actor, identity.ActionIdentityManage, ""); err != nil {
+		return OrganizationMembershipPage{}, err
+	}
+	if organizationID == uuid.Nil {
+		return OrganizationMembershipPage{}, ErrOrganizationNotFound
+	}
+	if !validIAMPage(page) {
+		return OrganizationMembershipPage{}, ErrPageInvalid
+	}
+	if _, err := service.repository.GetOrganization(ctx, nil, organizationID); err != nil {
+		return OrganizationMembershipPage{}, err
+	}
+	return service.repository.ListOrganizationMemberships(ctx, organizationID, page)
+}
+
+func (service *Service) CreateOrganizationMembership(ctx context.Context, actor identity.Principal, organizationID uuid.UUID, command CreateOrganizationMembershipCommand, proof HighRiskProof, request RequestContext) (OrganizationMembership, error) {
+	if err := service.requireGovernedIdentityManager(actor); err != nil {
+		return OrganizationMembership{}, err
+	}
+	reasonDigest, reasonCharacters, err := validateOrganizationMembershipCommand(organizationID, command.UserID, command.OrganizationVersion, command.UserVersion, command.Reason)
+	if err != nil {
+		return OrganizationMembership{}, err
+	}
+	if service.sessions == nil || service.breakGlass == nil {
+		return OrganizationMembership{}, ErrIAMConfiguration
+	}
+	organization, user, current, currentExists, err := service.preflightOrganizationMembership(ctx, nil, organizationID, command.UserID)
+	if err != nil {
+		return OrganizationMembership{}, err
+	}
+	if organization.Version != command.OrganizationVersion || user.Version != command.UserVersion {
+		return OrganizationMembership{}, ErrIAMConflict
+	}
+	if organization.Status != OrganizationStatusActive || user.Status != UserStatusActive {
+		return OrganizationMembership{}, ErrOrganizationMembershipInvalid
+	}
+	if currentExists && current.Status == OrganizationMembershipStatusActive {
+		return OrganizationMembership{}, ErrIAMConflict
+	}
+	if err := service.consumeHighRisk(ctx, actor, string(ReauthenticationOperationOrganizationMembershipCreate), proof, request); err != nil {
+		return OrganizationMembership{}, err
+	}
+
+	now := service.clock().UTC().Truncate(time.Microsecond)
+	var result OrganizationMembership
+	err = service.repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
+		if lockErr := service.breakGlass.LockAuthority(ctx, tx); lockErr != nil {
+			return lockErr
+		}
+		lockedOrganization, lockedUser, lockedMembership, membershipExists, lockErr := service.preflightOrganizationMembership(ctx, tx, organizationID, command.UserID)
+		if lockErr != nil {
+			return lockErr
+		}
+		if lockedOrganization.Version != command.OrganizationVersion || lockedUser.Version != command.UserVersion {
+			return ErrIAMConflict
+		}
+		if lockedOrganization.Status != OrganizationStatusActive || lockedUser.Status != UserStatusActive {
+			return ErrOrganizationMembershipInvalid
+		}
+		previousStatus, previousVersion := "absent", int64(0)
+		if membershipExists {
+			previousStatus, previousVersion = string(lockedMembership.Status), lockedMembership.Version
+			if lockedMembership.Status == OrganizationMembershipStatusActive {
+				return ErrIAMConflict
+			}
+			lockedMembership.Status = OrganizationMembershipStatusActive
+			lockedMembership.Version++
+			lockedMembership.UpdatedAt = now
+			if saveErr := service.repository.SavePlatformOrganizationMembership(ctx, tx, lockedMembership, previousVersion); saveErr != nil {
+				return saveErr
+			}
+			result = lockedMembership
+		} else {
+			result = OrganizationMembership{OrganizationID: organizationID, UserID: command.UserID, SourceOwned: false, Status: OrganizationMembershipStatusActive, Version: 1, CreatedAt: now, UpdatedAt: now}
+			if insertErr := service.repository.InsertPlatformOrganizationMembership(ctx, tx, result); insertErr != nil {
+				return insertErr
+			}
+		}
+		previousOrganizationVersion := lockedOrganization.Version
+		lockedOrganization.Version++
+		lockedOrganization.UpdatedAt = now
+		if saveErr := service.repository.SaveOrganization(ctx, tx, lockedOrganization, previousOrganizationVersion); saveErr != nil {
+			return saveErr
+		}
+		if invariantErr := service.breakGlass.RequireUsableAdministrator(ctx, tx, now); invariantErr != nil {
+			return invariantErr
+		}
+		if revokeErr := service.sessions.RevokeSubject(ctx, tx, command.UserID, "organization membership changed"); revokeErr != nil {
+			return fmt.Errorf("revoke membership subject sessions: %w", revokeErr)
+		}
+		_, appendErr := service.auditor.Append(ctx, tx, audit.AppendCommand{
+			Actor: scrubIAMHighRiskAuditActor(actor), Action: string(ReauthenticationOperationOrganizationMembershipCreate), ResourceType: "organization_membership", ResourceID: organizationMembershipResourceID(organizationID, command.UserID),
+			Outcome: audit.OutcomeSuccess, RequestID: request.RequestID, SourceIP: request.SourceIP,
+			Metadata: organizationMembershipAuditMetadata(organizationID, command.UserID, previousStatus, string(result.Status), previousVersion, result.Version, previousOrganizationVersion, lockedOrganization.Version, reasonDigest, reasonCharacters),
+		})
+		return appendErr
+	})
+	if err != nil {
+		return OrganizationMembership{}, err
+	}
+	return result, nil
+}
+
+func (service *Service) DeleteOrganizationMembership(ctx context.Context, actor identity.Principal, organizationID, userID uuid.UUID, command DeleteOrganizationMembershipCommand, proof HighRiskProof, request RequestContext) error {
+	if err := service.requireGovernedIdentityManager(actor); err != nil {
+		return err
+	}
+	reasonDigest, reasonCharacters, err := validateOrganizationMembershipCommand(organizationID, userID, command.OrganizationVersion, command.UserVersion, command.Reason)
+	if err != nil || command.MembershipVersion < 1 {
+		return ErrOrganizationMembershipInvalid
+	}
+	if service.sessions == nil || service.breakGlass == nil {
+		return ErrIAMConfiguration
+	}
+	organization, user, membership, exists, err := service.preflightOrganizationMembership(ctx, nil, organizationID, userID)
+	if err != nil {
+		return err
+	}
+	if organization.Version != command.OrganizationVersion || user.Version != command.UserVersion {
+		return ErrIAMConflict
+	}
+	if !exists || membership.Status != OrganizationMembershipStatusActive {
+		return ErrOrganizationMembershipNotFound
+	}
+	if membership.Version != command.MembershipVersion {
+		return ErrIAMConflict
+	}
+	if err := service.consumeHighRisk(ctx, actor, string(ReauthenticationOperationOrganizationMembershipDelete), proof, request); err != nil {
+		return err
+	}
+
+	now := service.clock().UTC().Truncate(time.Microsecond)
+	return service.repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
+		if lockErr := service.breakGlass.LockAuthority(ctx, tx); lockErr != nil {
+			return lockErr
+		}
+		lockedOrganization, lockedUser, lockedMembership, lockedExists, lockErr := service.preflightOrganizationMembership(ctx, tx, organizationID, userID)
+		if lockErr != nil {
+			return lockErr
+		}
+		if lockedOrganization.Version != command.OrganizationVersion || lockedUser.Version != command.UserVersion {
+			return ErrIAMConflict
+		}
+		if !lockedExists || lockedMembership.Status != OrganizationMembershipStatusActive {
+			return ErrOrganizationMembershipNotFound
+		}
+		if lockedMembership.Version != command.MembershipVersion {
+			return ErrIAMConflict
+		}
+		previousMembershipVersion := lockedMembership.Version
+		lockedMembership.Status = OrganizationMembershipStatusRemoved
+		lockedMembership.Version++
+		lockedMembership.UpdatedAt = now
+		if saveErr := service.repository.SavePlatformOrganizationMembership(ctx, tx, lockedMembership, previousMembershipVersion); saveErr != nil {
+			return saveErr
+		}
+		previousOrganizationVersion := lockedOrganization.Version
+		lockedOrganization.Version++
+		lockedOrganization.UpdatedAt = now
+		if saveErr := service.repository.SaveOrganization(ctx, tx, lockedOrganization, previousOrganizationVersion); saveErr != nil {
+			return saveErr
+		}
+		if invariantErr := service.breakGlass.RequireUsableAdministrator(ctx, tx, now); invariantErr != nil {
+			return invariantErr
+		}
+		if revokeErr := service.sessions.RevokeSubject(ctx, tx, userID, "organization membership changed"); revokeErr != nil {
+			return fmt.Errorf("revoke membership subject sessions: %w", revokeErr)
+		}
+		_, appendErr := service.auditor.Append(ctx, tx, audit.AppendCommand{
+			Actor: scrubIAMHighRiskAuditActor(actor), Action: string(ReauthenticationOperationOrganizationMembershipDelete), ResourceType: "organization_membership", ResourceID: organizationMembershipResourceID(organizationID, userID),
+			Outcome: audit.OutcomeSuccess, RequestID: request.RequestID, SourceIP: request.SourceIP,
+			Metadata: organizationMembershipAuditMetadata(organizationID, userID, string(OrganizationMembershipStatusActive), string(OrganizationMembershipStatusRemoved), previousMembershipVersion, lockedMembership.Version, previousOrganizationVersion, lockedOrganization.Version, reasonDigest, reasonCharacters),
+		})
+		return appendErr
+	})
+}
+
+func (service *Service) preflightOrganizationMembership(ctx context.Context, tx pgx.Tx, organizationID, userID uuid.UUID) (OrganizationUnit, UserPrincipal, OrganizationMembership, bool, error) {
+	organization, err := service.repository.GetOrganization(ctx, tx, organizationID)
+	if err != nil {
+		return OrganizationUnit{}, UserPrincipal{}, OrganizationMembership{}, false, err
+	}
+	user, err := service.repository.GetUser(ctx, tx, userID)
+	if err != nil {
+		return OrganizationUnit{}, UserPrincipal{}, OrganizationMembership{}, false, err
+	}
+	membership, err := service.repository.GetOrganizationMembership(ctx, tx, organizationID, userID, false)
+	if errors.Is(err, ErrOrganizationMembershipNotFound) {
+		return organization, user, OrganizationMembership{}, false, nil
+	}
+	if err != nil {
+		return OrganizationUnit{}, UserPrincipal{}, OrganizationMembership{}, false, err
+	}
+	return organization, user, membership, true, nil
+}
+
+func validateOrganizationMembershipCommand(organizationID, userID uuid.UUID, organizationVersion, userVersion int64, reason string) (string, int, error) {
+	reasonCharacters, validReason := canonicalOrganizationMembershipReason(reason)
+	if organizationID == uuid.Nil || userID == uuid.Nil || organizationVersion < 1 || userVersion < 1 || !validReason {
+		return "", 0, ErrOrganizationMembershipInvalid
+	}
+	digest := sha256.Sum256([]byte(reason))
+	return hex.EncodeToString(digest[:]), reasonCharacters, nil
+}
+
+func canonicalOrganizationMembershipReason(rawReason string) (int, bool) {
+	characters := len([]rune(rawReason))
+	return characters, rawReason == strings.TrimSpace(rawReason) && characters >= 8 && characters <= 512
+}
+
+func organizationMembershipResourceID(organizationID, userID uuid.UUID) string {
+	return organizationID.String() + ":" + userID.String() + ":platform"
+}
+
+func organizationMembershipAuditMetadata(organizationID, userID uuid.UUID, previousStatus, newStatus string, previousMembershipVersion, newMembershipVersion, previousOrganizationVersion, newOrganizationVersion int64, reasonDigest string, reasonCharacters int) map[string]any {
+	return map[string]any{
+		"organization_id": organizationID.String(), "user_id": userID.String(), "source_owned": false,
+		"previous_status": previousStatus, "new_status": newStatus,
+		"previous_membership_version": previousMembershipVersion, "new_membership_version": newMembershipVersion,
+		"previous_organization_version": previousOrganizationVersion, "new_organization_version": newOrganizationVersion,
+		"reason_digest": reasonDigest, "reason_characters": reasonCharacters,
+	}
+}
+
+func scrubIAMHighRiskAuditActor(actor identity.Principal) identity.Principal {
+	actor.TokenID = ""
+	actor.AuthenticatedAt = time.Time{}
+	actor.AuthenticationAssurance = 0
+	return actor
+}
+
 func (service *Service) CreateRoleBinding(ctx context.Context, actor identity.Principal, command CreateRoleBindingCommand, proof HighRiskProof, request RequestContext) (RoleBinding, error) {
 	if err := service.requireIdentityManage(actor); err != nil {
 		return RoleBinding{}, err
@@ -138,7 +397,13 @@ func (service *Service) CreateRoleBinding(ctx context.Context, actor identity.Pr
 		return RoleBinding{}, fmt.Errorf("generate role binding ID: %w", err)
 	}
 	binding := RoleBinding{ID: id, SubjectType: command.SubjectType, SubjectID: command.SubjectID, Role: command.Role, ScopeType: command.ScopeType, ProductID: strings.TrimSpace(command.ProductID), ChannelName: strings.TrimSpace(command.ChannelName), Effect: command.Effect, ValidFrom: command.ValidFrom, ValidUntil: command.ValidUntil, CreatedBy: actor.Subject, Version: 1, CreatedAt: now, UpdatedAt: now}
+	administratorReduction := binding.Role == identity.RoleAdmin && binding.ScopeType == ScopeTypePlatform && binding.Effect == BindingEffectDeny
 	err = service.repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
+		if administratorReduction {
+			if lockErr := service.breakGlass.LockAuthority(ctx, tx); lockErr != nil {
+				return lockErr
+			}
+		}
 		if validationErr := service.scopeCatalog.ValidateRoleBindingScope(ctx, tx, catalogScopeFromCommand(command)); validationErr != nil {
 			return validationErr
 		}
@@ -148,8 +413,8 @@ func (service *Service) CreateRoleBinding(ctx context.Context, actor identity.Pr
 		if insertErr := service.repository.InsertRoleBinding(ctx, tx, binding); insertErr != nil {
 			return insertErr
 		}
-		if binding.Role == identity.RoleAdmin && binding.ScopeType == ScopeTypePlatform && binding.Effect == BindingEffectDeny {
-			if invariantErr := service.breakGlass.LockAndRequireUsableAdministrator(ctx, tx, now); invariantErr != nil {
+		if administratorReduction {
+			if invariantErr := service.breakGlass.RequireUsableAdministrator(ctx, tx, now); invariantErr != nil {
 				return invariantErr
 			}
 		}
@@ -223,10 +488,16 @@ func (service *Service) DeleteRoleBinding(ctx context.Context, actor identity.Pr
 	if preflight.Version != expectedVersion {
 		return ErrIAMConflict
 	}
+	administratorReduction := preflight.Role == identity.RoleAdmin && preflight.ScopeType == ScopeTypePlatform && preflight.Effect == BindingEffectAllow
 	if err := service.consumeHighRisk(ctx, actor, string(ReauthenticationOperationRoleBindingDelete), proof, request); err != nil {
 		return err
 	}
 	err = service.repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
+		if administratorReduction {
+			if lockErr := service.breakGlass.LockAuthority(ctx, tx); lockErr != nil {
+				return lockErr
+			}
+		}
 		binding, err := service.repository.GetRoleBinding(ctx, tx, bindingID)
 		if err != nil {
 			return err
@@ -237,8 +508,8 @@ func (service *Service) DeleteRoleBinding(ctx context.Context, actor identity.Pr
 		if err := service.repository.DeleteRoleBinding(ctx, tx, bindingID, expectedVersion); err != nil {
 			return err
 		}
-		if binding.Role == identity.RoleAdmin && binding.ScopeType == ScopeTypePlatform && binding.Effect == BindingEffectAllow {
-			if invariantErr := service.breakGlass.LockAndRequireUsableAdministrator(ctx, tx, service.clock().UTC().Truncate(time.Microsecond)); invariantErr != nil {
+		if administratorReduction {
+			if invariantErr := service.breakGlass.RequireUsableAdministrator(ctx, tx, service.clock().UTC().Truncate(time.Microsecond)); invariantErr != nil {
 				return invariantErr
 			}
 		}
@@ -611,6 +882,9 @@ func (service *Service) EnableSSO(ctx context.Context, actor identity.Principal,
 	}
 	now := service.clock().UTC().Truncate(time.Microsecond)
 	return service.repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
+		if lockErr := service.breakGlass.LockAuthority(ctx, tx); lockErr != nil {
+			return lockErr
+		}
 		state, err := service.repository.GetLoginState(ctx, tx)
 		if err != nil {
 			return err
@@ -650,7 +924,7 @@ func (service *Service) EnableSSO(ctx context.Context, actor identity.Principal,
 		if err := service.sessions.RevokeRegularLocalSessions(ctx, tx, "login mode changed to sso"); err != nil {
 			return fmt.Errorf("revoke regular local sessions for SSO: %w", err)
 		}
-		if invariantErr := service.breakGlass.LockAndRequireUsableAdministrator(ctx, tx, now); invariantErr != nil {
+		if invariantErr := service.breakGlass.RequireUsableAdministrator(ctx, tx, now); invariantErr != nil {
 			if invariantErr == ErrLastEmergencyAdministrator {
 				return ErrSSOPreconditionFailed
 			}
@@ -801,6 +1075,11 @@ func (service *Service) DisableUser(ctx context.Context, actor identity.Principa
 	}
 	now := service.clock().UTC().Truncate(time.Microsecond)
 	err = service.repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
+		if preflight.Kind == UserKindEmergency {
+			if lockErr := service.breakGlass.LockAuthority(ctx, tx); lockErr != nil {
+				return lockErr
+			}
+		}
 		user, err := service.repository.GetUser(ctx, tx, userID)
 		if err != nil {
 			return err
@@ -822,7 +1101,7 @@ func (service *Service) DisableUser(ctx context.Context, actor identity.Principa
 			return err
 		}
 		if user.Kind == UserKindEmergency {
-			if invariantErr := service.breakGlass.LockAndRequireUsableAdministrator(ctx, tx, now); invariantErr != nil {
+			if invariantErr := service.breakGlass.RequireUsableAdministrator(ctx, tx, now); invariantErr != nil {
 				return invariantErr
 			}
 		}
@@ -964,6 +1243,20 @@ func (service *Service) requireIdentityManage(actor identity.Principal) error {
 		return ErrIAMConfiguration
 	}
 	return service.authorizer.Require(actor, identity.ActionIdentityManage, "")
+}
+
+func (service *Service) requireGovernedIdentityManager(actor identity.Principal) error {
+	if err := service.requireIdentityManage(actor); err != nil {
+		return err
+	}
+	if !actor.Governed || (actor.Kind != identity.PrincipalKindHuman && actor.Kind != identity.PrincipalKindLocal) {
+		return ErrHighRiskConfirmationRequired
+	}
+	governedUserID, err := uuid.Parse(strings.TrimSpace(actor.GovernedUserID))
+	if err != nil || governedUserID == uuid.Nil {
+		return ErrHighRiskConfirmationRequired
+	}
+	return nil
 }
 
 func (service *Service) consumeHighRisk(ctx context.Context, actor identity.Principal, operation string, proof HighRiskProof, request RequestContext) error {

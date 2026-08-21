@@ -82,35 +82,44 @@ const (
 	OrganizationStatusDisabled OrganizationStatus = "disabled"
 )
 
+type OrganizationMembershipStatus string
+
+const (
+	OrganizationMembershipStatusActive  OrganizationMembershipStatus = "active"
+	OrganizationMembershipStatusRemoved OrganizationMembershipStatus = "removed"
+)
+
 var (
-	ErrIAMConfiguration             = errors.New("IAM service configuration is invalid")
-	ErrIAMConflict                  = errors.New("IAM record changed concurrently")
-	ErrSSOPreconditionFailed        = errors.New("SSO enablement preconditions are not satisfied")
-	ErrLoginModeTransitionInvalid   = errors.New("login mode transition is invalid")
-	ErrLocalLoginDisabled           = errors.New("regular local login is disabled")
-	ErrLastEmergencyAdministrator   = errors.New("last usable emergency administrator cannot be disabled")
-	ErrHighRiskConfirmationRequired = errors.New("fresh reauthentication and explicit confirmation are required")
-	ErrIdentitySourceNotFound       = errors.New("identity source was not found")
-	ErrUserNotFound                 = errors.New("user was not found")
-	ErrUserAlreadyDisabled          = errors.New("user is already disabled")
-	ErrUserAlreadyEnabled           = errors.New("user is already enabled")
-	ErrUserCannotBeEnabled          = errors.New("user authentication source is not usable")
-	ErrLocalCredentialInvalid       = errors.New("local credential is invalid")
-	ErrLocalCredentialLocked        = errors.New("local credential is locked")
-	ErrDisableReasonRequired        = errors.New("user disable reason is required")
-	ErrEnableReasonRequired         = errors.New("user enable reason is required")
-	ErrRevokeReasonRequired         = errors.New("session revocation reason is required")
-	ErrIdentityFaultCodeInvalid     = errors.New("identity source fault code is invalid")
-	ErrUserInputInvalid             = errors.New("user input is invalid")
-	ErrPageInvalid                  = errors.New("IAM page parameters are invalid")
-	ErrOrganizationNotFound         = errors.New("organization was not found")
-	ErrRoleBindingNotFound          = errors.New("role binding was not found")
-	ErrRoleBindingInvalid           = errors.New("role binding input is invalid")
-	ErrIdentitySourceInputInvalid   = errors.New("identity source input is invalid")
-	ErrDirectoryAdapterUnavailable  = errors.New("directory adapter is unavailable")
-	ErrLocalAuthenticationFailed    = errors.New("local authentication failed")
-	ErrLocalAuthenticationLimited   = errors.New("local authentication rate limit exceeded")
-	ErrPasswordRecentlyUsed         = errors.New("password was recently used")
+	ErrIAMConfiguration               = errors.New("IAM service configuration is invalid")
+	ErrIAMConflict                    = errors.New("IAM record changed concurrently")
+	ErrSSOPreconditionFailed          = errors.New("SSO enablement preconditions are not satisfied")
+	ErrLoginModeTransitionInvalid     = errors.New("login mode transition is invalid")
+	ErrLocalLoginDisabled             = errors.New("regular local login is disabled")
+	ErrLastEmergencyAdministrator     = errors.New("last usable emergency administrator cannot be disabled")
+	ErrHighRiskConfirmationRequired   = errors.New("fresh reauthentication and explicit confirmation are required")
+	ErrIdentitySourceNotFound         = errors.New("identity source was not found")
+	ErrUserNotFound                   = errors.New("user was not found")
+	ErrUserAlreadyDisabled            = errors.New("user is already disabled")
+	ErrUserAlreadyEnabled             = errors.New("user is already enabled")
+	ErrUserCannotBeEnabled            = errors.New("user authentication source is not usable")
+	ErrLocalCredentialInvalid         = errors.New("local credential is invalid")
+	ErrLocalCredentialLocked          = errors.New("local credential is locked")
+	ErrDisableReasonRequired          = errors.New("user disable reason is required")
+	ErrEnableReasonRequired           = errors.New("user enable reason is required")
+	ErrRevokeReasonRequired           = errors.New("session revocation reason is required")
+	ErrIdentityFaultCodeInvalid       = errors.New("identity source fault code is invalid")
+	ErrUserInputInvalid               = errors.New("user input is invalid")
+	ErrPageInvalid                    = errors.New("IAM page parameters are invalid")
+	ErrOrganizationNotFound           = errors.New("organization was not found")
+	ErrOrganizationMembershipNotFound = errors.New("organization membership was not found")
+	ErrOrganizationMembershipInvalid  = errors.New("organization membership input is invalid")
+	ErrRoleBindingNotFound            = errors.New("role binding was not found")
+	ErrRoleBindingInvalid             = errors.New("role binding input is invalid")
+	ErrIdentitySourceInputInvalid     = errors.New("identity source input is invalid")
+	ErrDirectoryAdapterUnavailable    = errors.New("directory adapter is unavailable")
+	ErrLocalAuthenticationFailed      = errors.New("local authentication failed")
+	ErrLocalAuthenticationLimited     = errors.New("local authentication rate limit exceeded")
+	ErrPasswordRecentlyUsed           = errors.New("password was recently used")
 )
 
 type LoginState struct {
@@ -166,6 +175,16 @@ type OrganizationUnit struct {
 	Version          int64              `json:"version"`
 	CreatedAt        time.Time          `json:"created_at"`
 	UpdatedAt        time.Time          `json:"updated_at"`
+}
+
+type OrganizationMembership struct {
+	OrganizationID uuid.UUID                    `json:"organization_id"`
+	UserID         uuid.UUID                    `json:"user_id"`
+	SourceOwned    bool                         `json:"source_owned"`
+	Status         OrganizationMembershipStatus `json:"status"`
+	Version        int64                        `json:"version"`
+	CreatedAt      time.Time                    `json:"created_at"`
+	UpdatedAt      time.Time                    `json:"updated_at"`
 }
 
 type RoleBinding struct {
@@ -290,10 +309,11 @@ type RequestContext struct {
 }
 
 type Page struct {
-	Limit      int
-	BeforeTime time.Time
-	BeforeID   uuid.UUID
-	Cursor     string
+	Limit             int
+	BeforeTime        time.Time
+	BeforeID          uuid.UUID
+	BeforeSourceOwned *bool
+	Cursor            string
 }
 
 type UserPage struct {
@@ -318,6 +338,11 @@ type OrganizationPage struct {
 	NextCursor string             `json:"next_cursor,omitempty"`
 }
 
+type OrganizationMembershipPage struct {
+	Items      []OrganizationMembership `json:"items"`
+	NextCursor string                   `json:"next_cursor,omitempty"`
+}
+
 type RoleBindingPage struct {
 	Items      []RoleBinding `json:"items"`
 	NextCursor string        `json:"next_cursor,omitempty"`
@@ -331,6 +356,20 @@ type IdentitySourcePage struct {
 type CreateOrganizationCommand struct {
 	Name     string
 	ParentID uuid.UUID
+}
+
+type CreateOrganizationMembershipCommand struct {
+	OrganizationVersion int64
+	UserID              uuid.UUID
+	UserVersion         int64
+	Reason              string
+}
+
+type DeleteOrganizationMembershipCommand struct {
+	OrganizationVersion int64
+	UserVersion         int64
+	MembershipVersion   int64
+	Reason              string
 }
 
 type CreateRoleBindingCommand struct {

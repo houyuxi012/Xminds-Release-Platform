@@ -882,8 +882,8 @@ VALUES ($1, '', 'Emergency Administrators', FALSE, 'active', 1, $2, $2)`, organi
 					t.Fatal(seedErr)
 				}
 				if _, seedErr := pool.Exec(ctx, `
-INSERT INTO organization_memberships (organization_id, user_id, source_owned, created_at)
-VALUES ($1, $2, FALSE, $3)`, organizationID, emergencyID, now.Add(-time.Hour)); seedErr != nil {
+INSERT INTO organization_memberships (organization_id, user_id, source_owned, status, version, created_at, updated_at)
+VALUES ($1, $2, FALSE, 'active', 1, $3, $3)`, organizationID, emergencyID, now.Add(-time.Hour)); seedErr != nil {
 					t.Fatal(seedErr)
 				}
 				if _, seedErr := pool.Exec(ctx, `
@@ -1124,8 +1124,8 @@ VALUES ($1, '', 'Scheduled Emergency Administrators', FALSE, 'active', 1, $2, $2
 				t.Fatal(seedErr)
 			}
 			if _, seedErr := pool.Exec(ctx, `
-INSERT INTO organization_memberships (organization_id, user_id, source_owned, created_at)
-VALUES ($1, $3, FALSE, $2)`, organizationID, now.Add(-time.Hour), emergencyID); seedErr != nil {
+INSERT INTO organization_memberships (organization_id, user_id, source_owned, status, version, created_at, updated_at)
+VALUES ($1, $3, FALSE, 'active', 1, $2, $2)`, organizationID, now.Add(-time.Hour), emergencyID); seedErr != nil {
 				t.Fatal(seedErr)
 			}
 			if test.allow == iam.SubjectTypeOrganization {
@@ -1626,8 +1626,8 @@ INSERT INTO organization_units (
 		t.Fatalf("seed administrator organization: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
-INSERT INTO organization_memberships (organization_id, user_id, source_owned, created_at)
-VALUES ($1, $2, FALSE, $3)`, organizationID, userID, now.Add(-time.Hour)); err != nil {
+INSERT INTO organization_memberships (organization_id, user_id, source_owned, status, version, created_at, updated_at)
+VALUES ($1, $2, FALSE, 'active', 1, $3, $3)`, organizationID, userID, now.Add(-time.Hour)); err != nil {
 		t.Fatalf("seed inherited administrator membership: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `

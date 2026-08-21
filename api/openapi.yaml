@@ -1342,6 +1342,120 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Organization'
+  /api/v1/organizations/{organization_id}:
+    get:
+      operationId: getOrganization
+      summary: 查询组织详情
+      description: 返回组织当前状态与乐观并发版本。
+      tags: [Identity Governance]
+      x-required-action: identity.manage
+      parameters:
+        - $ref: '#/components/parameters/OrganizationIDPath'
+      responses:
+        '200':
+          description: 组织详情
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Organization'}
+        '400': {$ref: '#/components/responses/UnprocessableEntity'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /api/v1/organizations/{organization_id}/children:
+    get:
+      operationId: listOrganizationChildren
+      summary: 查询组织直属子节点
+      description: 仅返回指定组织的直属子节点，并使用稳定不透明游标分页。
+      tags: [Identity Governance]
+      x-required-action: identity.manage
+      parameters:
+        - $ref: '#/components/parameters/OrganizationIDPath'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: 直属子组织页
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OrganizationPage'}
+        '400': {$ref: '#/components/responses/UnprocessableEntity'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /api/v1/organizations/{organization_id}/memberships:
+    get:
+      operationId: listOrganizationMemberships
+      summary: 查询组织有效成员关系
+      description: 仅返回 active 边；同一用户的目录边与平台补充边作为独立权威事实分别展示。
+      tags: [Identity Governance]
+      x-required-action: identity.manage
+      parameters:
+        - $ref: '#/components/parameters/OrganizationIDPath'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: 组织成员关系页
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OrganizationMembershipPage'}
+        '400': {$ref: '#/components/responses/UnprocessableEntity'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/InternalError'}
+    post:
+      operationId: createOrganizationMembership
+      summary: 创建组织平台补充成员关系
+      description: 创建或重激活 source_owned=false 的平台边；必须使用新鲜、一次性的重认证证明。
+      tags: [Identity Governance]
+      x-required-action: identity.manage
+      parameters:
+        - $ref: '#/components/parameters/OrganizationIDPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreateOrganizationMembershipRequest'}
+      responses:
+        '201':
+          description: 平台成员关系已创建或重激活，会话已撤销并完成不可变审计。
+          headers:
+            Location:
+              description: 成员关系 URI，格式为 /api/v1/organizations/{organization_id}/memberships/{user_id}。
+              schema: {type: string, format: uri-reference}
+            Cache-Control:
+              description: 高风险操作响应不得缓存。
+              schema: {type: string, const: no-store}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/OrganizationMembership'}
+        '400': {$ref: '#/components/responses/UnprocessableEntity'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /api/v1/organizations/{organization_id}/memberships/{user_id}:
+    delete:
+      operationId: deleteOrganizationMembership
+      summary: 移除组织平台补充成员关系
+      description: 仅 soft-remove source_owned=false 的 active 平台边；目录边不受影响，必须使用精确成员代次与新鲜重认证证明。
+      tags: [Identity Governance]
+      x-required-action: identity.manage
+      parameters:
+        - $ref: '#/components/parameters/OrganizationIDPath'
+        - $ref: '#/components/parameters/UserIDPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DeleteOrganizationMembershipRequest'}
+      responses:
+        '204': {description: 平台成员关系已软移除，会话已撤销并完成不可变审计。}
+        '400': {$ref: '#/components/responses/UnprocessableEntity'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '500': {$ref: '#/components/responses/InternalError'}
   /api/v1/role-bindings:
     get:
       operationId: listRoleBindings
@@ -1869,6 +1983,11 @@ components:
         format: uuid
     UserIDPath:
       name: user_id
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
+    OrganizationIDPath:
+      name: organization_id
       in: path
       required: true
       schema: {type: string, format: uuid}
@@ -2908,6 +3027,58 @@ components:
           type: array
           items: {$ref: '#/components/schemas/Organization'}
         next_cursor: {type: string}
+    OrganizationMembership:
+      type: object
+      additionalProperties: false
+      required: [organization_id, user_id, source_owned, status, version, created_at, updated_at]
+      properties:
+        organization_id: {type: string, format: uuid}
+        user_id: {type: string, format: uuid}
+        source_owned: {type: boolean}
+        status: {type: string, enum: [active, removed]}
+        version: {type: integer, minimum: 1}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+    OrganizationMembershipPage:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          maxItems: 200
+          items: {$ref: '#/components/schemas/OrganizationMembership'}
+        next_cursor: {type: string, maxLength: 512}
+    CreateOrganizationMembershipRequest:
+      type: object
+      additionalProperties: false
+      required: [organization_version, user_id, user_version, reason, reauthentication]
+      properties:
+        organization_version: {type: integer, minimum: 1}
+        user_id: {type: string, format: uuid}
+        user_version: {type: integer, minimum: 1}
+        reason:
+          type: string
+          minLength: 8
+          maxLength: 512
+          pattern: '^\S(?:[\s\S]{6,510}\S)?$'
+          description: 处置理由必须是精确的 8–512 个 Unicode 字符，不允许首尾空白。
+        reauthentication: {$ref: '#/components/schemas/HighRiskProof'}
+    DeleteOrganizationMembershipRequest:
+      type: object
+      additionalProperties: false
+      required: [organization_version, user_version, membership_version, reason, reauthentication]
+      properties:
+        organization_version: {type: integer, minimum: 1}
+        user_version: {type: integer, minimum: 1}
+        membership_version: {type: integer, minimum: 1}
+        reason:
+          type: string
+          minLength: 8
+          maxLength: 512
+          pattern: '^\S(?:[\s\S]{6,510}\S)?$'
+          description: 处置理由必须是精确的 8–512 个 Unicode 字符，不允许首尾空白。
+        reauthentication: {$ref: '#/components/schemas/HighRiskProof'}
     RoleBinding:
       type: object
       additionalProperties: false
@@ -2938,6 +3109,8 @@ components:
         - identity.sso.enable
         - identity.sso.disable
         - identity.directory_conflict.resolve
+        - identity.organization_membership.create
+        - identity.organization_membership.delete
     HighRiskProof:
       type: object
       additionalProperties: false

@@ -71,7 +71,7 @@ WHERE lower(user_record.username) = lower($1) AND user_record.user_kind IN ('loc
 	if user.Status != UserStatusActive || (sourceStatus != nil && *sourceStatus != IdentitySourceStatusEnabled) {
 		return identity.Principal{}, ErrGovernedPrincipalUnavailable
 	}
-	rows, err := resolver.repository.pool.Query(ctx, `SELECT organization_id FROM organization_memberships WHERE user_id=$1`, user.ID)
+	rows, err := resolver.repository.pool.Query(ctx, `SELECT DISTINCT organization_id FROM organization_memberships WHERE user_id=$1 AND status='active'`, user.ID)
 	if err != nil {
 		return identity.Principal{}, ErrGovernedPrincipalUnavailable
 	}

@@ -28,6 +28,11 @@ type IAMApplication interface {
 	ListUsers(ctx context.Context, actor identity.Principal, page Page) (UserPage, error)
 	CreateOrganization(ctx context.Context, actor identity.Principal, command CreateOrganizationCommand, request RequestContext) (OrganizationUnit, error)
 	ListOrganizations(ctx context.Context, actor identity.Principal, page Page) (OrganizationPage, error)
+	GetOrganization(ctx context.Context, actor identity.Principal, organizationID uuid.UUID) (OrganizationUnit, error)
+	ListOrganizationChildren(ctx context.Context, actor identity.Principal, organizationID uuid.UUID, page Page) (OrganizationPage, error)
+	ListOrganizationMemberships(ctx context.Context, actor identity.Principal, organizationID uuid.UUID, page Page) (OrganizationMembershipPage, error)
+	CreateOrganizationMembership(ctx context.Context, actor identity.Principal, organizationID uuid.UUID, command CreateOrganizationMembershipCommand, proof HighRiskProof, request RequestContext) (OrganizationMembership, error)
+	DeleteOrganizationMembership(ctx context.Context, actor identity.Principal, organizationID, userID uuid.UUID, command DeleteOrganizationMembershipCommand, proof HighRiskProof, request RequestContext) error
 	ListRoleBindings(ctx context.Context, actor identity.Principal, page Page) (RoleBindingPage, error)
 	CreateRoleBinding(ctx context.Context, actor identity.Principal, command CreateRoleBindingCommand, proof HighRiskProof, request RequestContext) (RoleBinding, error)
 	DeleteRoleBinding(ctx context.Context, actor identity.Principal, bindingID uuid.UUID, expectedVersion int64, proof HighRiskProof, request RequestContext) error
@@ -72,6 +77,11 @@ func RegisterRoutes(router chi.Router, application IAMApplication) {
 	router.Route("/api/v1/organizations", func(router chi.Router) {
 		router.Get("/", listOrganizationsHandler(application))
 		router.Post("/", createOrganizationHandler(application))
+		router.Get("/{organization_id}", getOrganizationHandler(application))
+		router.Get("/{organization_id}/children", listOrganizationChildrenHandler(application))
+		router.Get("/{organization_id}/memberships", listOrganizationMembershipsHandler(application))
+		router.Post("/{organization_id}/memberships", createOrganizationMembershipHandler(application))
+		router.Delete("/{organization_id}/memberships/{user_id}", deleteOrganizationMembershipHandler(application))
 	})
 	router.Route("/api/v1/role-bindings", func(router chi.Router) {
 		router.Get("/", listRoleBindingsHandler(application))
@@ -420,6 +430,188 @@ func listOrganizationsHandler(application IAMApplication) http.HandlerFunc {
 	}
 }
 
+func getOrganizationHandler(application IAMApplication) http.HandlerFunc {
+	return func(writer http.ResponseWriter, request *http.Request) {
+		principal, ok := requireIAMPrincipal(writer, request)
+		if !ok {
+			return
+		}
+		organizationID, ok := parseIAMPathUUID(writer, request, "organization_id", "ORGANIZATION_ID_INVALID", ErrOrganizationMembershipInvalid)
+		if !ok {
+			return
+		}
+		organization, err := application.GetOrganization(request.Context(), principal, organizationID)
+		if err != nil {
+			writeIAMApplicationError(writer, request, err)
+			return
+		}
+		writeIAMJSON(writer, http.StatusOK, toOrganizationResponse(organization))
+	}
+}
+
+func listOrganizationChildrenHandler(application IAMApplication) http.HandlerFunc {
+	return func(writer http.ResponseWriter, request *http.Request) {
+		principal, ok := requireIAMPrincipal(writer, request)
+		if !ok {
+			return
+		}
+		organizationID, ok := parseIAMPathUUID(writer, request, "organization_id", "ORGANIZATION_ID_INVALID", ErrOrganizationMembershipInvalid)
+		if !ok {
+			return
+		}
+		page, err := parseIAMPage(request)
+		if err != nil {
+			writeIAMApplicationError(writer, request, err)
+			return
+		}
+		result, err := application.ListOrganizationChildren(request.Context(), principal, organizationID, page)
+		if err != nil {
+			writeIAMApplicationError(writer, request, err)
+			return
+		}
+		items := make([]organizationResponse, 0, len(result.Items))
+		for _, item := range result.Items {
+			items = append(items, toOrganizationResponse(item))
+		}
+		writeIAMJSON(writer, http.StatusOK, organizationPageResponse{Items: items, NextCursor: result.NextCursor})
+	}
+}
+
+func listOrganizationMembershipsHandler(application IAMApplication) http.HandlerFunc {
+	return func(writer http.ResponseWriter, request *http.Request) {
+		principal, ok := requireIAMPrincipal(writer, request)
+		if !ok {
+			return
+		}
+		organizationID, ok := parseIAMPathUUID(writer, request, "organization_id", "ORGANIZATION_ID_INVALID", ErrOrganizationMembershipInvalid)
+		if !ok {
+			return
+		}
+		page, err := parseOrganizationMembershipPage(request)
+		if err != nil {
+			writeIAMApplicationError(writer, request, err)
+			return
+		}
+		result, err := application.ListOrganizationMemberships(request.Context(), principal, organizationID, page)
+		if err != nil {
+			writeIAMApplicationError(writer, request, err)
+			return
+		}
+		items := make([]organizationMembershipResponse, 0, len(result.Items))
+		for _, item := range result.Items {
+			items = append(items, toOrganizationMembershipResponse(item))
+		}
+		writeIAMJSON(writer, http.StatusOK, organizationMembershipPageResponse{Items: items, NextCursor: result.NextCursor})
+	}
+}
+
+func createOrganizationMembershipHandler(application IAMApplication) http.HandlerFunc {
+	type input struct {
+		OrganizationVersion int64                      `json:"organization_version"`
+		UserID              uuid.UUID                  `json:"user_id"`
+		UserVersion         int64                      `json:"user_version"`
+		Reason              string                     `json:"reason"`
+		Reauthentication    reauthenticationProofInput `json:"reauthentication"`
+	}
+	return func(writer http.ResponseWriter, request *http.Request) {
+		principal, ok := requireIAMPrincipal(writer, request)
+		if !ok {
+			return
+		}
+		organizationID, ok := parseIAMPathUUID(writer, request, "organization_id", "ORGANIZATION_ID_INVALID", ErrOrganizationMembershipInvalid)
+		if !ok {
+			return
+		}
+		var body input
+		if err := decodeIAMJSON(request, &body); err != nil {
+			writeIAMProblem(writer, request, http.StatusBadRequest, "REQUEST_BODY_INVALID", "Request body is invalid", err)
+			return
+		}
+		if _, valid := canonicalOrganizationMembershipReason(body.Reason); !valid {
+			writeIAMApplicationError(writer, request, ErrOrganizationMembershipInvalid)
+			return
+		}
+		membership, err := application.CreateOrganizationMembership(request.Context(), principal, organizationID, CreateOrganizationMembershipCommand{
+			OrganizationVersion: body.OrganizationVersion, UserID: body.UserID, UserVersion: body.UserVersion, Reason: body.Reason,
+		}, body.Reauthentication.proof(), iamRequestContext(request))
+		if err != nil {
+			writeIAMApplicationError(writer, request, err)
+			return
+		}
+		writer.Header().Set("Location", "/api/v1/organizations/"+organizationID.String()+"/memberships/"+body.UserID.String())
+		writeIAMJSON(writer, http.StatusCreated, toOrganizationMembershipResponse(membership))
+	}
+}
+
+func deleteOrganizationMembershipHandler(application IAMApplication) http.HandlerFunc {
+	type input struct {
+		OrganizationVersion int64                      `json:"organization_version"`
+		UserVersion         int64                      `json:"user_version"`
+		MembershipVersion   int64                      `json:"membership_version"`
+		Reason              string                     `json:"reason"`
+		Reauthentication    reauthenticationProofInput `json:"reauthentication"`
+	}
+	return func(writer http.ResponseWriter, request *http.Request) {
+		principal, ok := requireIAMPrincipal(writer, request)
+		if !ok {
+			return
+		}
+		organizationID, ok := parseIAMPathUUID(writer, request, "organization_id", "ORGANIZATION_ID_INVALID", ErrOrganizationMembershipInvalid)
+		if !ok {
+			return
+		}
+		userID, ok := parseIAMPathUUID(writer, request, "user_id", "USER_ID_INVALID", ErrOrganizationMembershipInvalid)
+		if !ok {
+			return
+		}
+		var body input
+		if err := decodeIAMJSON(request, &body); err != nil {
+			writeIAMProblem(writer, request, http.StatusBadRequest, "REQUEST_BODY_INVALID", "Request body is invalid", err)
+			return
+		}
+		if _, valid := canonicalOrganizationMembershipReason(body.Reason); !valid {
+			writeIAMApplicationError(writer, request, ErrOrganizationMembershipInvalid)
+			return
+		}
+		err := application.DeleteOrganizationMembership(request.Context(), principal, organizationID, userID, DeleteOrganizationMembershipCommand{
+			OrganizationVersion: body.OrganizationVersion, UserVersion: body.UserVersion, MembershipVersion: body.MembershipVersion, Reason: body.Reason,
+		}, body.Reauthentication.proof(), iamRequestContext(request))
+		if err != nil {
+			writeIAMApplicationError(writer, request, err)
+			return
+		}
+		writer.WriteHeader(http.StatusNoContent)
+	}
+}
+
+func parseIAMPathUUID(writer http.ResponseWriter, request *http.Request, parameter, code string, cause error) (uuid.UUID, bool) {
+	id, err := uuid.Parse(chi.URLParam(request, parameter))
+	if err != nil || id == uuid.Nil {
+		writeIAMProblem(writer, request, http.StatusBadRequest, code, "Identity identifier is invalid", cause)
+		return uuid.Nil, false
+	}
+	return id, true
+}
+
+func parseOrganizationMembershipPage(request *http.Request) (Page, error) {
+	page := Page{}
+	if rawLimit := strings.TrimSpace(request.URL.Query().Get("limit")); rawLimit != "" {
+		limit, err := strconv.Atoi(rawLimit)
+		if err != nil || limit < 1 || limit > 200 {
+			return Page{}, ErrPageInvalid
+		}
+		page.Limit = limit
+	}
+	if cursor := strings.TrimSpace(request.URL.Query().Get("cursor")); cursor != "" {
+		createdAt, userID, sourceOwned, err := decodeOrganizationMembershipCursor(cursor)
+		if err != nil {
+			return Page{}, err
+		}
+		page.BeforeTime, page.BeforeID, page.BeforeSourceOwned = createdAt, userID, &sourceOwned
+	}
+	return page, nil
+}
+
 func listRoleBindingsHandler(application IAMApplication) http.HandlerFunc {
 	return func(writer http.ResponseWriter, request *http.Request) {
 		principal, ok := requireIAMPrincipal(writer, request)
@@ -714,7 +906,7 @@ func iamRequestContext(request *http.Request) RequestContext {
 func writeIAMApplicationError(writer http.ResponseWriter, request *http.Request, err error) {
 	switch {
 	case errors.Is(err, ErrUserInputInvalid), errors.Is(err, ErrPageInvalid), errors.Is(err, ErrRoleBindingInvalid), errors.Is(err, ErrIdentitySourceInputInvalid),
-		errors.Is(err, ErrDisableReasonRequired), errors.Is(err, ErrEnableReasonRequired), errors.Is(err, ErrRevokeReasonRequired):
+		errors.Is(err, ErrOrganizationMembershipInvalid), errors.Is(err, ErrDisableReasonRequired), errors.Is(err, ErrEnableReasonRequired), errors.Is(err, ErrRevokeReasonRequired):
 		writeIAMProblem(writer, request, http.StatusBadRequest, "IAM_INPUT_INVALID", "Identity request is invalid", err)
 	case errors.Is(err, identity.ErrActionDenied):
 		writeIAMProblem(writer, request, http.StatusForbidden, "IAM_ACCESS_DENIED", "Identity access is denied", err)
@@ -722,6 +914,8 @@ func writeIAMApplicationError(writer http.ResponseWriter, request *http.Request,
 		writeIAMProblem(writer, request, http.StatusNotFound, "USER_NOT_FOUND", "User was not found", err)
 	case errors.Is(err, ErrOrganizationNotFound):
 		writeIAMProblem(writer, request, http.StatusNotFound, "ORGANIZATION_NOT_FOUND", "Organization was not found", err)
+	case errors.Is(err, ErrOrganizationMembershipNotFound):
+		writeIAMProblem(writer, request, http.StatusNotFound, "ORGANIZATION_MEMBERSHIP_NOT_FOUND", "Organization membership was not found", err)
 	case errors.Is(err, ErrRoleBindingNotFound):
 		writeIAMProblem(writer, request, http.StatusNotFound, "ROLE_BINDING_NOT_FOUND", "Role binding was not found", err)
 	case errors.Is(err, ErrIdentitySourceNotFound) && iamProblemInstance(request.URL.Path) == "/api/v1/identity-sources/{source_id}/sync-conflicts/{conflict_id}/resolve":
@@ -780,6 +974,17 @@ func iamProblemInstance(path string) string {
 			segments[2] = "{conflict_id}"
 		}
 		return sourcePrefix + strings.Join(segments, "/")
+	}
+	const organizationPrefix = "/api/v1/organizations/"
+	if strings.HasPrefix(path, organizationPrefix) {
+		segments := strings.Split(strings.TrimPrefix(path, organizationPrefix), "/")
+		if len(segments) > 0 && segments[0] != "" {
+			segments[0] = "{organization_id}"
+		}
+		if len(segments) >= 3 && segments[1] == "memberships" && segments[2] != "" {
+			segments[2] = "{user_id}"
+		}
+		return organizationPrefix + strings.Join(segments, "/")
 	}
 	return path
 }
@@ -841,6 +1046,28 @@ type organizationResponse struct {
 type organizationPageResponse struct {
 	Items      []organizationResponse `json:"items"`
 	NextCursor string                 `json:"next_cursor,omitempty"`
+}
+
+type organizationMembershipResponse struct {
+	OrganizationID uuid.UUID                    `json:"organization_id"`
+	UserID         uuid.UUID                    `json:"user_id"`
+	SourceOwned    bool                         `json:"source_owned"`
+	Status         OrganizationMembershipStatus `json:"status"`
+	Version        int64                        `json:"version"`
+	CreatedAt      time.Time                    `json:"created_at"`
+	UpdatedAt      time.Time                    `json:"updated_at"`
+}
+
+type organizationMembershipPageResponse struct {
+	Items      []organizationMembershipResponse `json:"items"`
+	NextCursor string                           `json:"next_cursor,omitempty"`
+}
+
+func toOrganizationMembershipResponse(membership OrganizationMembership) organizationMembershipResponse {
+	return organizationMembershipResponse{
+		OrganizationID: membership.OrganizationID, UserID: membership.UserID, SourceOwned: membership.SourceOwned,
+		Status: membership.Status, Version: membership.Version, CreatedAt: membership.CreatedAt, UpdatedAt: membership.UpdatedAt,
+	}
 }
 
 type roleBindingResponse struct {

@@ -21,6 +21,7 @@ const platformAdministratorExistsSQL = `EXISTS (
                 SELECT 1 FROM organization_memberships membership
                 WHERE membership.organization_id=binding.subject_id
                   AND membership.user_id=user_record.id
+				  AND membership.status='active'
             )
         )
     )
@@ -345,8 +346,8 @@ func (repository *PostgresRepository) RevokeOrganizationMembers(ctx context.Cont
 UPDATE local_sessions session
 SET revoked_at=clock_timestamp(), revocation_reason=$2, version=version+1
 WHERE session.subject_id IN (
-    SELECT membership.user_id FROM organization_memberships membership
-    WHERE membership.organization_id=$1
+    SELECT DISTINCT membership.user_id FROM organization_memberships membership
+    WHERE membership.organization_id=$1 AND membership.status='active'
 )
   AND session.revoked_at IS NULL`, organizationID, reason)
 	if err != nil {

@@ -161,6 +161,11 @@ func (executor *PostgresDirectorySyncExecutor) Advance(ctx context.Context, expe
 	}
 	var advanced DirectorySyncJob
 	err := database.WithTx(ctx, executor.pool, func(tx pgx.Tx) error {
+		if expectedJob.Mode == DirectorySyncModeApply {
+			if err := executor.repository.LockBreakGlassInvariant(ctx, tx); err != nil {
+				return err
+			}
+		}
 		job, source, err := executor.lockExecution(ctx, tx, expectedJob.ID, expectedSource.ID)
 		if err != nil {
 			return err
@@ -246,6 +251,17 @@ FROM directory_sync_jobs WHERE id=$1 AND identity_source_id=$2 FOR UPDATE`, jobI
 
 func (executor *PostgresDirectorySyncExecutor) now() time.Time {
 	return executor.clock().UTC().Truncate(time.Microsecond)
+}
+
+func (executor *PostgresDirectorySyncExecutor) requireBreakGlassContinuity(ctx context.Context, tx pgx.Tx, at time.Time) error {
+	evaluation, err := executor.repository.EvaluateBreakGlassInvariant(ctx, tx, at.UTC())
+	if err != nil {
+		return err
+	}
+	if evaluation.CurrentUsableAdministrators < 1 || !evaluation.FirstScheduledPermissionGap.IsZero() {
+		return ErrLastEmergencyAdministrator
+	}
+	return nil
 }
 
 func directorySyncWorkerPrincipal() identity.Principal {

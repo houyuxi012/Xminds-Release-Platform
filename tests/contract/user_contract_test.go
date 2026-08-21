@@ -79,6 +79,26 @@ func (userRouteContractApplication) ListOrganizations(context.Context, identity.
 	return iam.OrganizationPage{}, nil
 }
 
+func (userRouteContractApplication) GetOrganization(context.Context, identity.Principal, uuid.UUID) (iam.OrganizationUnit, error) {
+	return iam.OrganizationUnit{}, nil
+}
+
+func (userRouteContractApplication) ListOrganizationChildren(context.Context, identity.Principal, uuid.UUID, iam.Page) (iam.OrganizationPage, error) {
+	return iam.OrganizationPage{}, nil
+}
+
+func (userRouteContractApplication) ListOrganizationMemberships(context.Context, identity.Principal, uuid.UUID, iam.Page) (iam.OrganizationMembershipPage, error) {
+	return iam.OrganizationMembershipPage{}, nil
+}
+
+func (userRouteContractApplication) CreateOrganizationMembership(context.Context, identity.Principal, uuid.UUID, iam.CreateOrganizationMembershipCommand, iam.HighRiskProof, iam.RequestContext) (iam.OrganizationMembership, error) {
+	return iam.OrganizationMembership{}, nil
+}
+
+func (userRouteContractApplication) DeleteOrganizationMembership(context.Context, identity.Principal, uuid.UUID, uuid.UUID, iam.DeleteOrganizationMembershipCommand, iam.HighRiskProof, iam.RequestContext) error {
+	return nil
+}
+
 func (userRouteContractApplication) ListRoleBindings(context.Context, identity.Principal, iam.Page) (iam.RoleBindingPage, error) {
 	return iam.RoleBindingPage{}, nil
 }

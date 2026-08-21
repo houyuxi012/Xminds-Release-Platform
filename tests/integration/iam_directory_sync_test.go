@@ -402,8 +402,8 @@ func TestDirectorySyncMigrationUpgradesImmutableOriginal14ToCurrent(t *testing.T
 	if err := pool.QueryRow(ctx, `SELECT max(version) FROM schema_migrations`).Scan(&maximumVersion); err != nil {
 		t.Fatal(err)
 	}
-	if maximumVersion != 17 {
-		t.Fatalf("maximum migration version=%d, want 17", maximumVersion)
+	if maximumVersion != 18 {
+		t.Fatalf("maximum migration version=%d, want 18", maximumVersion)
 	}
 	var original14PreflightRows int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM schema_migration_preflights WHERE migration_version=14`).Scan(&original14PreflightRows); err != nil {
@@ -728,6 +728,7 @@ func TestIAMDirectorySyncApplyBatchAuditFailureRollsBackBusinessProgressAndSessi
 			now := time.Date(2026, 8, 21, 11, 35, 0, 0, time.UTC)
 			sourceID := uuid.New()
 			seedDirectoryIntegrationSource(t, ctx, pool, sourceID, iam.IdentitySourceSCIM, now, 5)
+			seedDirectoryIntegrationEmergencyAdministrator(t, ctx, pool, now)
 			page := iam.SyncPage{Complete: true}
 			switch scenario {
 			case "users":
@@ -815,6 +816,7 @@ func TestIAMDirectorySyncCompletionAndFailAuditBehavior(t *testing.T) {
 	now := time.Date(2026, 8, 21, 11, 40, 0, 0, time.UTC)
 	sourceID, userID, sessionID := uuid.New(), uuid.New(), uuid.New()
 	seedDirectoryIntegrationSource(t, ctx, pool, sourceID, iam.IdentitySourceSCIM, now, 5)
+	seedDirectoryIntegrationEmergencyAdministrator(t, ctx, pool, now)
 	if _, err := pool.Exec(ctx, `
 INSERT INTO user_principals (id, identity_source_id, external_subject, username, display_name, email, user_kind, status, version, created_at, updated_at)
 VALUES ($1, $2, 'missing-user', 'missing.user', 'Missing User', 'missing@example.com', 'external', 'active', 1, $3, $3)`, userID, sourceID, now); err != nil {
@@ -1521,6 +1523,11 @@ VALUES
 		sourceID, now, existingID, missingID, duplicateID, localID); err != nil {
 		t.Fatalf("seed directory users: %v", err)
 	}
+	emergencyID := uuid.New()
+	if _, err := pool.Exec(ctx, `INSERT INTO user_principals (id,username,display_name,user_kind,status,mfa_enrolled,credential_rotated_at,version,created_at,updated_at) VALUES ($1,'directory.breakglass','Directory Break Glass','emergency','active',TRUE,$2,1,$2,$2)`, emergencyID, now.Add(-time.Hour)); err != nil {
+		t.Fatalf("seed directory break-glass user: %v", err)
+	}
+	seedIntegrationUsableEmergencyAdministrator(t, ctx, pool, emergencyID, now)
 	if _, err := pool.Exec(ctx, `
 INSERT INTO organization_units (id, identity_source_id, external_id, name, source_owned, status, version, created_at, updated_at)
 VALUES
@@ -1531,6 +1538,11 @@ VALUES
 ($7, $1, 'self-cycle', 'Last Safe Self Cycle', TRUE, 'active', 1, $2, $2)`,
 		sourceID, now, existingOrganizationID, missingOrganizationID, localOrganizationID, conflictingParentID, selfCycleID); err != nil {
 		t.Fatalf("seed directory organizations: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+INSERT INTO organization_memberships (organization_id,user_id,source_owned,status,version,created_at,updated_at)
+VALUES ($1,$2,FALSE,'active',1,$3,$3)`, existingOrganizationID, existingID, now); err != nil {
+		t.Fatalf("seed supplemental platform membership: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
 INSERT INTO role_bindings (id, subject_type, subject_id, role_name, scope_type, effect, valid_from, created_by, version, created_at, updated_at)
@@ -1673,7 +1685,7 @@ VALUES ($1, repeat('a',64), $2, 'local_password', 0, $3::timestamptz, $3::timest
 		conflictingParentName != "Last Safe Parent" || selfCycleName != "Last Safe Self Cycle" {
 		t.Fatalf("ownership state existing=%q missing=%q duplicate=%q local=%q org=%q missing_org=%q local_org=%q", existingName, missingStatus, duplicateName, localName, existingOrganizationName, missingOrganizationStatus, localOrganizationName)
 	}
-	var roleCount, revokedSessionCount, validMembershipCount, ambiguousCount, cycleCount, collisionCount, dependentCount int
+	var roleCount, revokedSessionCount, validMembershipCount, activeOwnershipCount, ambiguousCount, cycleCount, collisionCount, dependentCount int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM role_bindings WHERE id=$1 AND subject_id=$2`, roleBindingID, existingID).Scan(&roleCount); err != nil {
 		t.Fatal(err)
 	}
@@ -1681,6 +1693,9 @@ VALUES ($1, repeat('a',64), $2, 'local_password', 0, $3::timestamptz, $3::timest
 		t.Fatal(err)
 	}
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM organization_memberships membership JOIN organization_units organization ON organization.id=membership.organization_id JOIN user_principals principal ON principal.id=membership.user_id WHERE organization.external_id='group-existing' AND principal.external_subject='user-existing' AND membership.source_owned=TRUE`).Scan(&validMembershipCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM organization_memberships WHERE organization_id=$1 AND user_id=$2 AND status='active'`, existingOrganizationID, existingID).Scan(&activeOwnershipCount); err != nil {
 		t.Fatal(err)
 	}
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM user_principals WHERE identity_source_id=$1 AND external_subject='user-ambiguous'`, sourceID).Scan(&ambiguousCount); err != nil {
@@ -1695,8 +1710,8 @@ VALUES ($1, repeat('a',64), $2, 'local_password', 0, $3::timestamptz, $3::timest
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM organization_units WHERE identity_source_id=$1 AND external_id='group-dependent'`, sourceID).Scan(&dependentCount); err != nil {
 		t.Fatal(err)
 	}
-	if roleCount != 1 || revokedSessionCount != 1 || validMembershipCount != 1 || ambiguousCount != 0 || cycleCount != 0 || collisionCount != 0 || dependentCount != 0 {
-		t.Fatalf("preservation role=%d revoked=%d membership=%d ambiguous=%d cycles=%d collisions=%d dependents=%d", roleCount, revokedSessionCount, validMembershipCount, ambiguousCount, cycleCount, collisionCount, dependentCount)
+	if roleCount != 1 || revokedSessionCount != 1 || validMembershipCount != 1 || activeOwnershipCount != 2 || ambiguousCount != 0 || cycleCount != 0 || collisionCount != 0 || dependentCount != 0 {
+		t.Fatalf("preservation role=%d revoked=%d source_membership=%d ownership_edges=%d ambiguous=%d cycles=%d collisions=%d dependents=%d", roleCount, revokedSessionCount, validMembershipCount, activeOwnershipCount, ambiguousCount, cycleCount, collisionCount, dependentCount)
 	}
 	conflicts, err := service.ListConflicts(ctx, directorySyncIntegrationAdmin(), sourceID, iam.DirectorySyncConflictStatusOpen, iam.Page{Limit: 100})
 	if err != nil {
@@ -1713,6 +1728,76 @@ VALUES ($1, repeat('a',64), $2, 'local_password', 0, $3::timestamptz, $3::timest
 		if !codes[code] {
 			t.Fatalf("missing conflict %s in %v", code, codes)
 		}
+	}
+
+	// A later full snapshot may remove and then restore only the source edge.
+	// The platform edge remains effective across both transitions.
+	var nextSourceVersion int64
+	if err := pool.QueryRow(ctx, `SELECT version FROM identity_sources WHERE id=$1`, sourceID).Scan(&nextSourceVersion); err != nil {
+		t.Fatal(err)
+	}
+	adapter.pages = map[string]iam.SyncPage{"": {
+		Users:         []iam.DirectoryUser{{ExternalSubject: "user-existing", Username: "alice", DisplayName: "Alice Updated", Email: "alice@example.com", Enabled: true}},
+		Organizations: []iam.DirectoryOrganization{{ExternalID: "group-existing", Name: "Existing Group Updated"}},
+		Complete:      true,
+	}}
+	missingSnapshotSession := uuid.New()
+	if _, err := pool.Exec(ctx, `
+INSERT INTO local_sessions (id,token_digest,subject_id,authentication_method,mfa_level,authenticated_at,last_used_at,absolute_expires_at,idle_expires_at,version)
+VALUES ($1,$2,$3,'local_password',0,$4,$4,$5,$5,1)`, missingSnapshotSession, integrationSHA256Hex("membership-missing-snapshot"), existingID, now.Add(-time.Minute), now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	missingSnapshot := runJob(iam.DirectorySyncModeApply, nextSourceVersion)
+	if missingSnapshot.Status != iam.DirectorySyncStatusCompleted {
+		t.Fatalf("missing membership snapshot=%+v", missingSnapshot)
+	}
+	var sourceStatus, platformStatus string
+	var sourceMembershipVersion, platformMembershipVersion int64
+	var missingSessionRevoked bool
+	if err := pool.QueryRow(ctx, `SELECT status,version FROM organization_memberships WHERE organization_id=$1 AND user_id=$2 AND source_owned=TRUE`, existingOrganizationID, existingID).Scan(&sourceStatus, &sourceMembershipVersion); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT status,version FROM organization_memberships WHERE organization_id=$1 AND user_id=$2 AND source_owned=FALSE`, existingOrganizationID, existingID).Scan(&platformStatus, &platformMembershipVersion); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT revoked_at IS NOT NULL FROM local_sessions WHERE id=$1`, missingSnapshotSession).Scan(&missingSessionRevoked); err != nil {
+		t.Fatal(err)
+	}
+	if sourceStatus != "removed" || sourceMembershipVersion != 2 || platformStatus != "active" || platformMembershipVersion != 1 || !missingSessionRevoked {
+		t.Fatalf("missing snapshot source=%s/%d platform=%s/%d revoked=%v", sourceStatus, sourceMembershipVersion, platformStatus, platformMembershipVersion, missingSessionRevoked)
+	}
+
+	if err := pool.QueryRow(ctx, `SELECT version FROM identity_sources WHERE id=$1`, sourceID).Scan(&nextSourceVersion); err != nil {
+		t.Fatal(err)
+	}
+	adapter.pages[""] = iam.SyncPage{
+		Users:         []iam.DirectoryUser{{ExternalSubject: "user-existing", Username: "alice", DisplayName: "Alice Updated", Email: "alice@example.com", Enabled: true}},
+		Organizations: []iam.DirectoryOrganization{{ExternalID: "group-existing", Name: "Existing Group Updated"}},
+		Memberships:   []iam.DirectoryMembership{{OrganizationExternalID: "group-existing", UserExternalSubject: "user-existing"}},
+		Complete:      true,
+	}
+	recoverySession := uuid.New()
+	if _, err := pool.Exec(ctx, `
+INSERT INTO local_sessions (id,token_digest,subject_id,authentication_method,mfa_level,authenticated_at,last_used_at,absolute_expires_at,idle_expires_at,version)
+VALUES ($1,$2,$3,'local_password',0,$4,$4,$5,$5,1)`, recoverySession, integrationSHA256Hex("membership-recovery-snapshot"), existingID, now.Add(-time.Minute), now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	recoveredSnapshot := runJob(iam.DirectorySyncModeApply, nextSourceVersion)
+	if recoveredSnapshot.Status != iam.DirectorySyncStatusCompleted {
+		t.Fatalf("recovered membership snapshot=%+v", recoveredSnapshot)
+	}
+	var recoverySessionRevoked bool
+	if err := pool.QueryRow(ctx, `SELECT status,version FROM organization_memberships WHERE organization_id=$1 AND user_id=$2 AND source_owned=TRUE`, existingOrganizationID, existingID).Scan(&sourceStatus, &sourceMembershipVersion); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT status,version FROM organization_memberships WHERE organization_id=$1 AND user_id=$2 AND source_owned=FALSE`, existingOrganizationID, existingID).Scan(&platformStatus, &platformMembershipVersion); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT revoked_at IS NOT NULL FROM local_sessions WHERE id=$1`, recoverySession).Scan(&recoverySessionRevoked); err != nil {
+		t.Fatal(err)
+	}
+	if sourceStatus != "active" || sourceMembershipVersion != 3 || platformStatus != "active" || platformMembershipVersion != 1 || !recoverySessionRevoked {
+		t.Fatalf("recovery snapshot source=%s/%d platform=%s/%d revoked=%v", sourceStatus, sourceMembershipVersion, platformStatus, platformMembershipVersion, recoverySessionRevoked)
 	}
 }
 
@@ -1825,6 +1910,19 @@ INSERT INTO identity_sources (id, name, source_kind, status, secret_reference, r
 VALUES ($1, $5, $2, 'verified', 'secret://iam/directory', TRUE, $3, $4, $3, $3)`, sourceID, kind, now, version, "Directory Source "+sourceID.String()); err != nil {
 		t.Fatalf("seed directory source: %v", err)
 	}
+}
+
+func seedDirectoryIntegrationEmergencyAdministrator(t *testing.T, ctx context.Context, pool *pgxpool.Pool, now time.Time) uuid.UUID {
+	t.Helper()
+	emergencyID := uuid.New()
+	if _, err := pool.Exec(ctx, `
+INSERT INTO user_principals (
+    id,username,display_name,user_kind,status,mfa_enrolled,credential_rotated_at,version,created_at,updated_at
+) VALUES ($1,$2,'Directory Break Glass','emergency','active',TRUE,$3,1,$3,$3)`, emergencyID, "directory.breakglass."+emergencyID.String(), now.Add(-time.Hour)); err != nil {
+		t.Fatalf("seed directory break-glass user: %v", err)
+	}
+	seedIntegrationUsableEmergencyAdministrator(t, ctx, pool, emergencyID, now)
+	return emergencyID
 }
 
 func assertDirectoryBatchRollback(t *testing.T, ctx context.Context, pool *pgxpool.Pool, jobID, sourceID uuid.UUID, scenario string) {
