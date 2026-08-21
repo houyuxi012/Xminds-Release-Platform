@@ -442,6 +442,7 @@ func TestOpenAPIDefinesGovernedHighRiskIdentityWritesAndReauthentication(t *test
 		{path: "/api/v1/users/{user_id}/revoke-sessions", method: "POST"},
 		{path: "/api/v1/identity-sources", method: "GET"},
 		{path: "/api/v1/identity-sources", method: "POST"},
+		{path: "/api/v1/identity-sources/{source_id}", method: "GET"},
 		{path: "/api/v1/identity-sources/{source_id}", method: "PATCH"},
 		{path: "/api/v1/identity-sources/{source_id}/enable", method: "POST"},
 		{path: "/api/v1/identity-sources/{source_id}/disable", method: "POST"},
@@ -471,6 +472,19 @@ func TestOpenAPIDefinesGovernedHighRiskIdentityWritesAndReauthentication(t *test
 	identitySource := document.Components.Schemas["IdentitySource"].Value
 	if _, leaked := identitySource.Properties["secret_reference"]; leaked {
 		t.Fatal("identity source read schema must not expose secret_reference")
+	}
+	for _, required := range []string{"configuration_version"} {
+		if _, found := identitySource.Properties[required]; !found {
+			t.Fatalf("IdentitySource.%s is missing", required)
+		}
+	}
+	if _, found := identitySource.Properties["verified_configuration_version"]; !found {
+		t.Fatal("IdentitySource.verified_configuration_version is missing")
+	}
+	for _, requestSchema := range []string{"CreateIdentitySourceRequest", "PatchIdentitySourceRequest"} {
+		if _, found := document.Components.Schemas[requestSchema].Value.Properties["required_mappings_complete"]; found {
+			t.Fatalf("%s still accepts client-authored required_mappings_complete", requestSchema)
+		}
 	}
 }
 
@@ -529,6 +543,7 @@ func TestOpenAPIDefinesDurableDirectorySynchronizationWithoutWorkerState(t *test
 		{path: "/api/v1/identity-sources/{source_id}/verify", method: "POST"},
 		{path: "/api/v1/identity-sources/{source_id}/sync-preview", method: "POST"},
 		{path: "/api/v1/identity-sources/{source_id}/sync", method: "POST"},
+		{path: "/api/v1/identity-sources/{source_id}/sync-jobs", method: "GET"},
 		{path: "/api/v1/identity-sources/{source_id}/sync-jobs/{job_id}", method: "GET"},
 		{path: "/api/v1/identity-sources/{source_id}/sync-conflicts", method: "GET"},
 	} {
@@ -548,6 +563,18 @@ func TestOpenAPIDefinesDurableDirectorySynchronizationWithoutWorkerState(t *test
 	for _, forbidden := range []string{"secret_reference", "bearer_token", "ca_reference", "cursor", "phase", "run_marker"} {
 		if _, found := job.Value.Properties[forbidden]; found {
 			t.Fatalf("DirectorySyncJob exposes %s", forbidden)
+		}
+	}
+	jobPage := document.Components.Schemas["DirectorySyncJobPage"]
+	if jobPage == nil || jobPage.Value == nil || jobPage.Value.AdditionalProperties.Has == nil || *jobPage.Value.AdditionalProperties.Has {
+		t.Fatal("strict DirectorySyncJobPage schema is missing")
+	}
+	for _, path := range []string{"/api/v1/identity-sources/{source_id}", "/api/v1/identity-sources/{source_id}/sync-jobs"} {
+		operation := document.Paths.Find(path).Get
+		response := operation.Responses.Value("200")
+		noStore := response.Value.Headers["Cache-Control"]
+		if noStore == nil || noStore.Value == nil || noStore.Value.Schema == nil || noStore.Value.Schema.Value == nil || noStore.Value.Schema.Value.Const != "no-store" {
+			t.Errorf("GET %s must document Cache-Control: no-store", path)
 		}
 	}
 }

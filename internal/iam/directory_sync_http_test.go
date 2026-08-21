@@ -48,6 +48,51 @@ func TestDirectorySyncHTTPRoutesReturnVersionedRedactedJobContracts(t *testing.T
 	}
 }
 
+func TestDirectorySyncHTTPListsSourceScopedRedactedJobHistory(t *testing.T) {
+	sourceID := uuid.New()
+	now := time.Date(2026, 8, 21, 15, 0, 0, 0, time.UTC)
+	job := DirectorySyncJob{
+		ID: uuid.New(), IdentitySourceID: sourceID, SourceVersion: 5, RunMarker: uuid.New(), Mode: DirectorySyncModeApply,
+		Status: DirectorySyncStatusCompleted, Phase: DirectorySyncPhaseFinalize, Cursor: "private-worker-cursor", RequestedBy: "admin",
+		RequestID: uuid.New(), CreatedAt: now, UpdatedAt: now, CompletedAt: now,
+	}
+	application := &directoryHTTPApplication{
+		stubIAMApplication: &stubIAMApplication{},
+		jobPage:            DirectorySyncJobPage{Items: []DirectorySyncJob{job}, NextCursor: encodeIAMCursor(now, job.ID)},
+	}
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/identity-sources/"+sourceID.String()+"/sync-jobs?limit=25", nil)
+	request.Header.Set("Authorization", "Bearer token")
+	response := httptest.NewRecorder()
+
+	authenticatedIAMHandler(application).ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK || response.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("status=%d Cache-Control=%q body=%s", response.Code, response.Header().Get("Cache-Control"), response.Body)
+	}
+	if application.listedJobSourceID != sourceID || application.listedJobPage.Limit != 25 || application.listJobCalls != 1 {
+		t.Fatalf("list calls=%d source=%s page=%+v", application.listJobCalls, application.listedJobSourceID, application.listedJobPage)
+	}
+	if strings.Contains(response.Body.String(), "private-worker-cursor") || strings.Contains(response.Body.String(), "run_marker") || strings.Contains(response.Body.String(), `"phase"`) {
+		t.Fatalf("job history leaked worker state: %s", response.Body)
+	}
+}
+
+func TestDirectorySyncHTTPRejectsInvalidHistoryCursorBeforeApplication(t *testing.T) {
+	sourceID := uuid.New()
+	for _, cursor := range []string{strings.Repeat("a", maximumIAMCursorLength+1), canonicalIAMCursor + "="} {
+		application := &directoryHTTPApplication{stubIAMApplication: &stubIAMApplication{}}
+		request := httptest.NewRequest(http.MethodGet, "/api/v1/identity-sources/"+sourceID.String()+"/sync-jobs?cursor="+cursor, nil)
+		request.Header.Set("Authorization", "Bearer token")
+		response := httptest.NewRecorder()
+
+		authenticatedIAMHandler(application).ServeHTTP(response, request)
+
+		if response.Code != http.StatusBadRequest || application.listJobCalls != 0 {
+			t.Fatalf("cursor_length=%d status=%d calls=%d body=%s", len(cursor), response.Code, application.listJobCalls, response.Body)
+		}
+	}
+}
+
 func TestDirectorySyncHTTPVerifyRequiresExpectedVersionAndReturnsCapabilities(t *testing.T) {
 	sourceID := uuid.New()
 	application := &directoryHTTPApplication{
@@ -260,20 +305,31 @@ func TestIAMProblemInstanceTemplatesDirectorySourceJobAndConflictIdentifiers(t *
 
 type directoryHTTPApplication struct {
 	*stubIAMApplication
-	job              DirectorySyncJob
-	jobError         error
-	conflicts        DirectorySyncConflictPage
-	capabilities     CapabilityReport
-	startedMode      DirectorySyncMode
-	expectedVersion  int64
-	startedSourceID  uuid.UUID
-	verifiedSourceID uuid.UUID
-	listedPage       Page
-	listedStatus     DirectorySyncConflictStatusFilter
-	resolvedConflict DirectorySyncConflict
-	resolveCommand   ResolveDirectorySyncConflictCommand
-	resolveProof     HighRiskProof
-	resolveError     error
+	job               DirectorySyncJob
+	jobError          error
+	conflicts         DirectorySyncConflictPage
+	capabilities      CapabilityReport
+	startedMode       DirectorySyncMode
+	expectedVersion   int64
+	startedSourceID   uuid.UUID
+	verifiedSourceID  uuid.UUID
+	listedPage        Page
+	listedStatus      DirectorySyncConflictStatusFilter
+	resolvedConflict  DirectorySyncConflict
+	resolveCommand    ResolveDirectorySyncConflictCommand
+	resolveProof      HighRiskProof
+	resolveError      error
+	jobPage           DirectorySyncJobPage
+	listedJobPage     Page
+	listedJobSourceID uuid.UUID
+	listJobCalls      int
+}
+
+func (application *directoryHTTPApplication) ListDirectorySyncJobs(_ context.Context, _ identity.Principal, sourceID uuid.UUID, page Page) (DirectorySyncJobPage, error) {
+	application.listJobCalls++
+	application.listedJobSourceID = sourceID
+	application.listedJobPage = page
+	return application.jobPage, nil
 }
 
 func (application *directoryHTTPApplication) VerifyIdentitySourceVersioned(_ context.Context, _ identity.Principal, sourceID uuid.UUID, version int64, _ RequestContext) (CapabilityReport, error) {

@@ -603,6 +603,80 @@ func TestHTTPHandlerWritesIdentitySourceSecretReferenceButNeverReturnsIt(t *test
 	}
 }
 
+// Mutation caught: retaining required_mappings_complete in the create DTO
+// lets a client forge the server-owned verification result.
+func TestIdentitySourceHTTPRejectsClientDeclaredRequiredMappings(t *testing.T) {
+	sourceID := uuid.New()
+	application := &stubIAMApplication{identitySource: IdentitySource{ID: sourceID, Name: "Corporate OIDC", Kind: IdentitySourceOIDC, Status: IdentitySourceStatusDraft, Version: 1}}
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/identity-sources", strings.NewReader(`{"name":"Corporate OIDC","kind":"oidc","secret_reference":"secret://iam/corporate-oidc","required_mappings_complete":true}`))
+	request.Header.Set("Authorization", "Bearer token")
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+
+	authenticatedIAMHandler(application).ServeHTTP(response, request)
+
+	if response.Code != http.StatusBadRequest || application.identitySourceCreateCalls != 0 {
+		t.Fatalf("status=%d create_calls=%d body=%s", response.Code, application.identitySourceCreateCalls, response.Body)
+	}
+}
+
+// Mutation caught: retaining required_mappings_complete in the patch DTO lets
+// a client mark an unverified configuration ready for SSO.
+func TestIdentitySourcePatchHTTPRejectsClientDeclaredRequiredMappings(t *testing.T) {
+	sourceID := uuid.New()
+	application := &stubIAMApplication{identitySource: IdentitySource{ID: sourceID, Name: "Corporate OIDC", Kind: IdentitySourceOIDC, Status: IdentitySourceStatusDraft, Version: 1}}
+	request := httptest.NewRequest(http.MethodPatch, "/api/v1/identity-sources/"+sourceID.String(), strings.NewReader(`{"version":1,"required_mappings_complete":true}`))
+	request.Header.Set("Authorization", "Bearer token")
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+
+	authenticatedIAMHandler(application).ServeHTTP(response, request)
+
+	if response.Code != http.StatusBadRequest || application.identitySourcePatchCalls != 0 {
+		t.Fatalf("status=%d patch_calls=%d body=%s", response.Code, application.identitySourcePatchCalls, response.Body)
+	}
+}
+
+func TestIdentitySourceDetailHTTPReturnsNoStoreRedactedConfigurationGeneration(t *testing.T) {
+	t.Parallel()
+	sourceID := uuid.New()
+	now := time.Date(2026, 8, 21, 14, 0, 0, 0, time.UTC)
+	application := &stubIAMApplication{identitySource: IdentitySource{
+		ID: sourceID, Name: "Corporate OIDC", Kind: IdentitySourceOIDC, Status: IdentitySourceStatusVerified,
+		SecretReference: "secret://iam/private-upstream", RequiredMappingsComplete: true,
+		ConfigurationVersion: 7, VerifiedConfigurationVersion: 7, VerifiedAt: now, Version: 3, CreatedAt: now, UpdatedAt: now,
+	}}
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/identity-sources/"+sourceID.String(), nil)
+	request.Header.Set("Authorization", "Bearer token")
+	response := httptest.NewRecorder()
+
+	authenticatedIAMHandler(application).ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK || response.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("status=%d Cache-Control=%q body=%s", response.Code, response.Header().Get("Cache-Control"), response.Body)
+	}
+	if application.identitySourceGetCalls != 1 || application.identitySourceGetID != sourceID {
+		t.Fatalf("detail calls=%d source=%s", application.identitySourceGetCalls, application.identitySourceGetID)
+	}
+	if strings.Contains(response.Body.String(), "private-upstream") || strings.Contains(response.Body.String(), "secret_reference") ||
+		!strings.Contains(response.Body.String(), `"configuration_version":7`) || !strings.Contains(response.Body.String(), `"verified_configuration_version":7`) {
+		t.Fatalf("identity source detail contract = %s", response.Body)
+	}
+}
+
+func TestIdentitySourceDetailHTTPRejectsInvalidUUIDBeforeApplication(t *testing.T) {
+	application := &stubIAMApplication{}
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/identity-sources/not-a-uuid", nil)
+	request.Header.Set("Authorization", "Bearer token")
+	response := httptest.NewRecorder()
+
+	authenticatedIAMHandler(application).ServeHTTP(response, request)
+
+	if response.Code != http.StatusBadRequest || application.identitySourceGetCalls != 0 {
+		t.Fatalf("status=%d calls=%d body=%s", response.Code, application.identitySourceGetCalls, response.Body)
+	}
+}
+
 func authenticatedIAMHandler(application IAMApplication) http.Handler {
 	verifier := iamStaticVerifier{principal: identity.Principal{Subject: "admin", Kind: identity.PrincipalKindHuman, Roles: []identity.Role{identity.RoleAdmin}}}
 	return identity.AuthenticationMiddleware(verifier)(NewHTTPHandler(application))
@@ -637,6 +711,11 @@ type stubIAMApplication struct {
 	organizationCommand        CreateOrganizationCommand
 	identitySource             IdentitySource
 	identitySourceCommand      CreateIdentitySourceCommand
+	identitySourceCreateCalls  int
+	identitySourcePatchCalls   int
+	identitySourcePatchCommand PatchIdentitySourceCommand
+	identitySourceGetCalls     int
+	identitySourceGetID        uuid.UUID
 	roleBindingCommand         CreateRoleBindingCommand
 	highRiskProof              HighRiskProof
 	highRiskAction             string
@@ -739,7 +818,14 @@ func (application *stubIAMApplication) DisableSSO(_ context.Context, _ identity.
 }
 
 func (application *stubIAMApplication) CreateIdentitySource(_ context.Context, _ identity.Principal, command CreateIdentitySourceCommand, _ RequestContext) (IdentitySource, error) {
+	application.identitySourceCreateCalls++
 	application.identitySourceCommand = command
+	return application.identitySource, nil
+}
+
+func (application *stubIAMApplication) GetIdentitySource(_ context.Context, _ identity.Principal, sourceID uuid.UUID) (IdentitySource, error) {
+	application.identitySourceGetCalls++
+	application.identitySourceGetID = sourceID
 	return application.identitySource, nil
 }
 
@@ -763,6 +849,8 @@ func (application *stubIAMApplication) ListIdentitySources(context.Context, iden
 	return IdentitySourcePage{}, errors.New("unexpected ListIdentitySources call")
 }
 
-func (application *stubIAMApplication) PatchIdentitySourceDraft(context.Context, identity.Principal, uuid.UUID, PatchIdentitySourceCommand, RequestContext) (IdentitySource, error) {
-	return IdentitySource{}, errors.New("unexpected PatchIdentitySourceDraft call")
+func (application *stubIAMApplication) PatchIdentitySourceDraft(_ context.Context, _ identity.Principal, _ uuid.UUID, command PatchIdentitySourceCommand, _ RequestContext) (IdentitySource, error) {
+	application.identitySourcePatchCalls++
+	application.identitySourcePatchCommand = command
+	return application.identitySource, nil
 }

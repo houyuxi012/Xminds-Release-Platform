@@ -548,12 +548,12 @@ func (service *Service) CreateIdentitySource(ctx context.Context, actor identity
 	if err != nil {
 		return IdentitySource{}, fmt.Errorf("generate identity source ID: %w", err)
 	}
-	source := IdentitySource{ID: id, Name: name, Kind: command.Kind, Status: IdentitySourceStatusDraft, SecretReference: secretReference, RequiredMappingsComplete: command.RequiredMappingsComplete, Version: 1, CreatedAt: now, UpdatedAt: now}
+	source := IdentitySource{ID: id, Name: name, Kind: command.Kind, Status: IdentitySourceStatusDraft, SecretReference: secretReference, ConfigurationVersion: 1, Version: 1, CreatedAt: now, UpdatedAt: now}
 	err = service.repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
 		if insertErr := service.repository.InsertIdentitySource(ctx, tx, source); insertErr != nil {
 			return insertErr
 		}
-		_, appendErr := service.auditor.Append(ctx, tx, audit.AppendCommand{Actor: actor, Action: "identity.source.create", ResourceType: "identity_source", ResourceID: source.ID.String(), Outcome: audit.OutcomeSuccess, RequestID: request.RequestID, SourceIP: request.SourceIP, Metadata: map[string]any{"name": source.Name, "source_kind": source.Kind, "required_mappings_complete": source.RequiredMappingsComplete}})
+		_, appendErr := service.auditor.Append(ctx, tx, audit.AppendCommand{Actor: actor, Action: "identity.source.create", ResourceType: "identity_source", ResourceID: source.ID.String(), Outcome: audit.OutcomeSuccess, RequestID: request.RequestID, SourceIP: request.SourceIP, Metadata: map[string]any{"name": source.Name, "source_kind": source.Kind, "configuration_version": source.ConfigurationVersion}})
 		return appendErr
 	})
 	if err != nil {
@@ -579,11 +579,25 @@ func (service *Service) ListIdentitySources(ctx context.Context, actor identity.
 	return result, nil
 }
 
+func (service *Service) GetIdentitySource(ctx context.Context, actor identity.Principal, sourceID uuid.UUID) (IdentitySource, error) {
+	if err := service.authorizer.Require(actor, identity.ActionIdentityManage, ""); err != nil {
+		return IdentitySource{}, err
+	}
+	if sourceID == uuid.Nil {
+		return IdentitySource{}, ErrIdentitySourceNotFound
+	}
+	source, err := service.repository.GetIdentitySource(ctx, nil, sourceID)
+	if err != nil {
+		return IdentitySource{}, err
+	}
+	return redactIdentitySource(source), nil
+}
+
 func (service *Service) PatchIdentitySourceDraft(ctx context.Context, actor identity.Principal, sourceID uuid.UUID, command PatchIdentitySourceCommand, request RequestContext) (IdentitySource, error) {
 	if err := service.authorizer.Require(actor, identity.ActionIdentityManage, ""); err != nil {
 		return IdentitySource{}, err
 	}
-	if sourceID == uuid.Nil || command.Version < 1 || (command.Name == nil && command.SecretReference == nil && command.RequiredMappingsComplete == nil) {
+	if sourceID == uuid.Nil || command.Version < 1 || (command.Name == nil && command.SecretReference == nil) {
 		return IdentitySource{}, ErrIdentitySourceInputInvalid
 	}
 	now := service.clock().UTC().Truncate(time.Microsecond)
@@ -599,27 +613,35 @@ func (service *Service) PatchIdentitySourceDraft(ctx context.Context, actor iden
 			}
 			return ErrIdentitySourceInputInvalid
 		}
+		configurationChanged := false
 		if command.Name != nil {
-			source.Name = strings.TrimSpace(*command.Name)
-			if source.Name == "" || len([]rune(source.Name)) > 128 {
+			name := strings.TrimSpace(*command.Name)
+			if name == "" || len([]rune(name)) > 128 {
 				return ErrIdentitySourceInputInvalid
 			}
+			configurationChanged = configurationChanged || source.Name != name
+			source.Name = name
 		}
 		if command.SecretReference != nil {
-			source.SecretReference = strings.TrimSpace(*command.SecretReference)
-			if source.SecretReference == "" || len(source.SecretReference) > 256 {
+			secretReference := strings.TrimSpace(*command.SecretReference)
+			if secretReference == "" || len(secretReference) > 256 {
 				return ErrIdentitySourceInputInvalid
 			}
+			configurationChanged = configurationChanged || source.SecretReference != secretReference
+			source.SecretReference = secretReference
 		}
-		if command.RequiredMappingsComplete != nil {
-			source.RequiredMappingsComplete = *command.RequiredMappingsComplete
+		if configurationChanged {
+			source.ConfigurationVersion++
+			source.RequiredMappingsComplete = false
+			source.VerifiedConfigurationVersion = 0
+			source.VerifiedAt = time.Time{}
 		}
 		source.Version++
 		source.UpdatedAt = now
 		if err := service.repository.UpdateIdentitySourceDraft(ctx, tx, source, command.Version); err != nil {
 			return err
 		}
-		_, err = service.auditor.Append(ctx, tx, audit.AppendCommand{Actor: actor, Action: "identity.source.patch", ResourceType: "identity_source", ResourceID: source.ID.String(), Outcome: audit.OutcomeSuccess, RequestID: request.RequestID, SourceIP: request.SourceIP, Metadata: map[string]any{"name": source.Name, "required_mappings_complete": source.RequiredMappingsComplete, "version": source.Version}})
+		_, err = service.auditor.Append(ctx, tx, audit.AppendCommand{Actor: actor, Action: "identity.source.patch", ResourceType: "identity_source", ResourceID: source.ID.String(), Outcome: audit.OutcomeSuccess, RequestID: request.RequestID, SourceIP: request.SourceIP, Metadata: map[string]any{"name": source.Name, "configuration_version": source.ConfigurationVersion, "version": source.Version}})
 		patched = source
 		return err
 	})
@@ -663,14 +685,25 @@ func (service *Service) VerifyIdentitySourceVersioned(ctx context.Context, actor
 		if err != nil {
 			return err
 		}
-		if current.Version != source.Version || (current.Status != IdentitySourceStatusDraft && current.Status != IdentitySourceStatusVerified) {
+		if current.Version != source.Version || current.ConfigurationVersion != source.ConfigurationVersion ||
+			(current.Status != IdentitySourceStatusDraft && current.Status != IdentitySourceStatusVerified) {
 			return ErrIAMConflict
 		}
-		current.Status, current.VerifiedAt, current.Version, current.UpdatedAt = IdentitySourceStatusVerified, now, current.Version+1, now
+		current.Status = IdentitySourceStatusVerified
+		current.RequiredMappingsComplete = report.RequiredMappingsComplete
+		current.VerifiedConfigurationVersion = 0
+		if report.RequiredMappingsComplete {
+			current.VerifiedConfigurationVersion = current.ConfigurationVersion
+		}
+		current.VerifiedAt, current.Version, current.UpdatedAt = now, current.Version+1, now
 		if err := service.repository.SaveIdentitySource(ctx, tx, current, current.Version-1); err != nil {
 			return err
 		}
-		_, err = service.auditor.Append(ctx, tx, audit.AppendCommand{Actor: actor, Action: "identity.source.verify", ResourceType: "identity_source", ResourceID: current.ID.String(), Outcome: audit.OutcomeSuccess, RequestID: request.RequestID, SourceIP: request.SourceIP, Metadata: map[string]any{"source_kind": current.Kind, "supports_incremental": report.SupportsIncremental}})
+		_, err = service.auditor.Append(ctx, tx, audit.AppendCommand{Actor: actor, Action: "identity.source.verify", ResourceType: "identity_source", ResourceID: current.ID.String(), Outcome: audit.OutcomeSuccess, RequestID: request.RequestID, SourceIP: request.SourceIP, Metadata: map[string]any{
+			"configuration_version":      current.ConfigurationVersion,
+			"required_mappings_complete": report.RequiredMappingsComplete,
+			"supports_incremental":       report.SupportsIncremental, "supports_pagination": report.SupportsPagination,
+		}})
 		return err
 	})
 	return report, err
@@ -688,6 +721,13 @@ func (service *Service) GetDirectorySyncJob(ctx context.Context, actor identity.
 		return DirectorySyncJob{}, ErrDirectorySyncConfiguration
 	}
 	return service.directorySync.GetJob(ctx, actor, sourceID, jobID)
+}
+
+func (service *Service) ListDirectorySyncJobs(ctx context.Context, actor identity.Principal, sourceID uuid.UUID, page Page) (DirectorySyncJobPage, error) {
+	if service == nil || service.directorySync == nil {
+		return DirectorySyncJobPage{}, ErrDirectorySyncConfiguration
+	}
+	return service.directorySync.ListJobs(ctx, actor, sourceID, page)
 }
 
 func (service *Service) ListDirectorySyncConflicts(ctx context.Context, actor identity.Principal, sourceID uuid.UUID, status DirectorySyncConflictStatusFilter, page Page) (DirectorySyncConflictPage, error) {
@@ -880,7 +920,7 @@ func (service *Service) EnableSSO(ctx context.Context, actor identity.Principal,
 	if preflightSource.Version != expectedVersion {
 		return ErrIAMConflict
 	}
-	if preflightSource.Kind != IdentitySourceOIDC {
+	if !identitySourceReadyForSSO(preflightSource) {
 		return ErrSSOPreconditionFailed
 	}
 	if err := service.consumeHighRisk(ctx, actor, string(ReauthenticationOperationSSOEnable), proof, request); err != nil {
@@ -902,12 +942,11 @@ func (service *Service) EnableSSO(ctx context.Context, actor identity.Principal,
 		if err != nil {
 			return err
 		}
+		if !identitySourceReadyForSSO(source) {
+			return ErrSSOPreconditionFailed
+		}
 		if source.Version != expectedVersion {
 			return ErrIAMConflict
-		}
-		if source.Kind != IdentitySourceOIDC || source.Status != IdentitySourceStatusVerified || source.VerifiedAt.IsZero() || source.PreviewedAt.IsZero() ||
-			!source.RequiredMappingsComplete {
-			return ErrSSOPreconditionFailed
 		}
 		previousMode := state.Mode
 		state.Mode = LoginModeSSO
@@ -943,6 +982,12 @@ func (service *Service) EnableSSO(ctx context.Context, actor identity.Principal,
 		})
 		return err
 	})
+}
+
+func identitySourceReadyForSSO(source IdentitySource) bool {
+	return source.Kind == IdentitySourceOIDC && source.Status == IdentitySourceStatusVerified &&
+		!source.VerifiedAt.IsZero() && !source.PreviewedAt.IsZero() && source.RequiredMappingsComplete &&
+		source.ConfigurationVersion >= 1 && source.VerifiedConfigurationVersion == source.ConfigurationVersion
 }
 
 func (service *Service) MarkIdentitySourceFault(ctx context.Context, actor identity.Principal, sourceID uuid.UUID, code string, request RequestContext) error {

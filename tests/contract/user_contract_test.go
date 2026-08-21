@@ -127,6 +127,10 @@ func (userRouteContractApplication) CreateIdentitySource(context.Context, identi
 	return iam.IdentitySource{}, nil
 }
 
+func (userRouteContractApplication) GetIdentitySource(context.Context, identity.Principal, uuid.UUID) (iam.IdentitySource, error) {
+	return iam.IdentitySource{}, nil
+}
+
 func (userRouteContractApplication) ListIdentitySources(context.Context, identity.Principal, iam.Page) (iam.IdentitySourcePage, error) {
 	return iam.IdentitySourcePage{}, nil
 }

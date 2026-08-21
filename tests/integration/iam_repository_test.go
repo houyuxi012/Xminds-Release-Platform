@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"io/fs"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,6 +23,155 @@ import (
 	"xminds-release-platform/internal/platform/database"
 	"xminds-release-platform/migrations"
 )
+
+// Mutation caught: preserving the legacy client-authored readiness bit during
+// upgrade allows an unverified configuration to satisfy the SSO gate.
+func TestIdentitySourceCapabilityMigrationV18UpgradeRollbackAndReapply(t *testing.T) {
+	databaseURL := integrationDatabaseURL(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	adminPool, pool, databaseName := isolatedIntegrationDatabase(t, ctx, databaseURL, "identity_source_capability_migration_")
+	t.Cleanup(func() {
+		pool.Close()
+		_, _ = adminPool.Exec(context.Background(), `DROP DATABASE `+databaseName)
+		adminPool.Close()
+	})
+	if err := database.ApplyMigrations(ctx, pool, directoryMigrationSubset(t, 18)); err != nil {
+		t.Fatalf("apply migrations 1..18: %v", err)
+	}
+	now := time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)
+	sourceID := uuid.New()
+	if _, err := pool.Exec(ctx, `INSERT INTO identity_sources (id,name,source_kind,status,required_mappings_complete,verified_at,version,created_at,updated_at) VALUES ($1,'Legacy Ready OIDC','oidc','verified',TRUE,$2,4,$2,$2)`, sourceID, now); err != nil {
+		t.Fatal(err)
+	}
+	checksums := migrationChecksums(t, ctx, pool, 18)
+	if err := database.ApplyMigrations(ctx, pool, migrations.FS); err != nil {
+		t.Fatalf("upgrade v18 to v19: %v", err)
+	}
+	for version, checksum := range checksums {
+		var current string
+		if err := pool.QueryRow(ctx, `SELECT checksum FROM schema_migrations WHERE version=$1`, version).Scan(&current); err != nil || current != checksum {
+			t.Fatalf("migration %d checksum changed: before=%s after=%s error=%v", version, checksum, current, err)
+		}
+	}
+	var configurationVersion int64
+	var verifiedConfigurationVersion *int64
+	var mappingsComplete bool
+	if err := pool.QueryRow(ctx, `SELECT configuration_version,verified_configuration_version,required_mappings_complete FROM identity_sources WHERE id=$1`, sourceID).Scan(&configurationVersion, &verifiedConfigurationVersion, &mappingsComplete); err != nil {
+		t.Fatal(err)
+	}
+	if configurationVersion != 1 || verifiedConfigurationVersion != nil || mappingsComplete {
+		t.Fatalf("upgraded capability config=%d verified=%v mappings=%t", configurationVersion, verifiedConfigurationVersion, mappingsComplete)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE identity_sources SET configuration_version=0 WHERE id=$1`, sourceID); err == nil {
+		t.Fatal("configuration_version=0 accepted")
+	}
+	for name, statement := range map[string]string{
+		"true without verified generation": `UPDATE identity_sources SET required_mappings_complete=TRUE,verified_configuration_version=NULL WHERE id=$1`,
+		"false with verified generation":   `UPDATE identity_sources SET required_mappings_complete=FALSE,verified_configuration_version=1 WHERE id=$1`,
+		"mismatched verified generation":   `UPDATE identity_sources SET required_mappings_complete=TRUE,verified_configuration_version=2 WHERE id=$1`,
+	} {
+		_, updateErr := pool.Exec(ctx, statement, sourceID)
+		var postgresError *pgconn.PgError
+		if !errors.As(updateErr, &postgresError) || postgresError.Code != "23514" {
+			t.Errorf("%s error=%v, want SQLSTATE 23514", name, updateErr)
+			if _, resetErr := pool.Exec(ctx, `UPDATE identity_sources SET required_mappings_complete=FALSE,verified_configuration_version=NULL WHERE id=$1`, sourceID); resetErr != nil {
+				t.Fatal(resetErr)
+			}
+		}
+	}
+	downSQL, err := fs.ReadFile(migrations.FS, "000019_identity_source_capabilities.down.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, string(downSQL)); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM schema_migrations WHERE version=19`); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var capabilityColumns int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM information_schema.columns WHERE table_schema='public' AND table_name='identity_sources' AND column_name IN ('configuration_version','verified_configuration_version')`).Scan(&capabilityColumns); err != nil || capabilityColumns != 0 {
+		t.Fatalf("capability columns after down=%d error=%v", capabilityColumns, err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT required_mappings_complete FROM identity_sources WHERE id=$1`, sourceID).Scan(&mappingsComplete); err != nil || mappingsComplete {
+		t.Fatalf("down restored untrusted mapping readiness=%t error=%v", mappingsComplete, err)
+	}
+	if err := database.ApplyMigrations(ctx, pool, migrations.FS); err != nil {
+		t.Fatalf("reapply v19: %v", err)
+	}
+	var serverVersion string
+	if err := pool.QueryRow(ctx, `SHOW server_version`).Scan(&serverVersion); err != nil || !strings.HasPrefix(serverVersion, "17.10") {
+		t.Fatalf("PostgreSQL server_version=%q error=%v, require 17.10", serverVersion, err)
+	}
+}
+
+// Mutation caught: leaving configuration fields out of repository scans or
+// updates silently drops the generation binding created by Verify.
+func TestIdentitySourceCapabilityRepositoryRoundTrip(t *testing.T) {
+	databaseURL := integrationDatabaseURL(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	adminPool, pool, databaseName := isolatedIntegrationDatabase(t, ctx, databaseURL, "identity_source_capability_repository_")
+	t.Cleanup(func() {
+		pool.Close()
+		_, _ = adminPool.Exec(context.Background(), `DROP DATABASE `+databaseName)
+		adminPool.Close()
+	})
+	if err := database.ApplyMigrations(ctx, pool, migrations.FS); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `TRUNCATE TABLE identity_sources CASCADE`); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 21, 12, 30, 0, 0, time.UTC)
+	source := iam.IdentitySource{
+		ID: uuid.New(), Name: "Repository OIDC", Kind: iam.IdentitySourceOIDC, Status: iam.IdentitySourceStatusDraft,
+		SecretReference: "secret://iam/repository", ConfigurationVersion: 1, Version: 1, CreatedAt: now, UpdatedAt: now,
+	}
+	repository := iam.NewPostgresRepository(pool)
+	if err := repository.WithinTransaction(ctx, func(tx pgx.Tx) error { return repository.InsertIdentitySource(ctx, tx, source) }); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := repository.GetIdentitySource(ctx, nil, source.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.ConfigurationVersion != 1 || loaded.VerifiedConfigurationVersion != 0 || loaded.RequiredMappingsComplete {
+		t.Fatalf("created source=%+v", loaded)
+	}
+	if err := repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
+		current, getErr := repository.GetIdentitySource(ctx, tx, source.ID)
+		if getErr != nil {
+			return getErr
+		}
+		current.Status = iam.IdentitySourceStatusVerified
+		current.RequiredMappingsComplete = true
+		current.VerifiedConfigurationVersion = current.ConfigurationVersion
+		current.VerifiedAt = now.Add(time.Minute)
+		current.Version++
+		current.UpdatedAt = now.Add(time.Minute)
+		return repository.SaveIdentitySource(ctx, tx, current, 1)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err = repository.GetIdentitySource(ctx, nil, source.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.ConfigurationVersion != 1 || loaded.VerifiedConfigurationVersion != 1 || !loaded.RequiredMappingsComplete || loaded.VerifiedAt.IsZero() || loaded.Version != 2 {
+		t.Fatalf("verified source=%+v", loaded)
+	}
+}
 
 func TestIAMPostgresLocalAuthenticationConcurrencyAndRollback(t *testing.T) {
 	databaseURL := integrationDatabaseURL(t)
@@ -518,9 +668,9 @@ VALUES (TRUE, 'local', 1, 'test:bootstrap', clock_timestamp())`); err != nil {
 	sourceID, userID, emergencyID := uuid.New(), uuid.New(), uuid.New()
 	if _, err := pool.Exec(ctx, `
 INSERT INTO identity_sources (
-    id, name, source_kind, status, required_mappings_complete, verified_at, previewed_at,
+    id, name, source_kind, status, required_mappings_complete, verified_configuration_version, verified_at, previewed_at,
     version, created_at, updated_at
-) VALUES ($1, 'High Risk OIDC', 'oidc', 'verified', TRUE, $2, $2, 1, $2, $2)`, sourceID, now.Add(-time.Hour)); err != nil {
+) VALUES ($1, 'High Risk OIDC', 'oidc', 'verified', TRUE, 1, $2, $2, 1, $2, $2)`, sourceID, now.Add(-time.Hour)); err != nil {
 		t.Fatalf("seed high-risk source: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
@@ -853,9 +1003,9 @@ VALUES (TRUE, 'local', 1, 'test:bootstrap', clock_timestamp())`); resetErr != ni
 			sourceID, emergencyID, organizationID := uuid.New(), uuid.New(), uuid.New()
 			if _, seedErr := pool.Exec(ctx, `
 INSERT INTO identity_sources (
-    id, name, source_kind, status, required_mappings_complete, verified_at, previewed_at,
+    id, name, source_kind, status, required_mappings_complete, verified_configuration_version, verified_at, previewed_at,
     version, created_at, updated_at
-) VALUES ($1, 'Break Glass OIDC', 'oidc', 'verified', TRUE, $2, $2, 1, $2, $2)`, sourceID, now.Add(-time.Hour)); seedErr != nil {
+) VALUES ($1, 'Break Glass OIDC', 'oidc', 'verified', TRUE, 1, $2, $2, 1, $2, $2)`, sourceID, now.Add(-time.Hour)); seedErr != nil {
 				t.Fatal(seedErr)
 			}
 			if _, seedErr := pool.Exec(ctx, `
@@ -994,9 +1144,9 @@ INSERT INTO user_principals (
 		sourceID := uuid.New()
 		if _, seedErr := pool.Exec(ctx, `
 INSERT INTO identity_sources (
-    id, name, source_kind, status, required_mappings_complete, verified_at, previewed_at,
+    id, name, source_kind, status, required_mappings_complete, verified_configuration_version, verified_at, previewed_at,
     version, created_at, updated_at
-) VALUES ($1, 'Scheduled OIDC', 'oidc', 'verified', TRUE, $2, $2, 1, $2, $2)`, sourceID, now.Add(-time.Hour)); seedErr != nil {
+) VALUES ($1, 'Scheduled OIDC', 'oidc', 'verified', TRUE, 1, $2, $2, 1, $2, $2)`, sourceID, now.Add(-time.Hour)); seedErr != nil {
 			t.Fatal(seedErr)
 		}
 		return sourceID
@@ -1391,9 +1541,9 @@ INSERT INTO user_principals (
 		sourceID := uuid.New()
 		if _, seedErr := pool.Exec(ctx, `
 INSERT INTO identity_sources (
-    id, name, source_kind, status, required_mappings_complete, verified_at, previewed_at,
+    id, name, source_kind, status, required_mappings_complete, verified_configuration_version, verified_at, previewed_at,
     version, created_at, updated_at
-) VALUES ($1, 'Concurrent OIDC', 'oidc', 'verified', TRUE, $2, $2, 1, $2, $2)`, sourceID, now.Add(-time.Hour)); seedErr != nil {
+) VALUES ($1, 'Concurrent OIDC', 'oidc', 'verified', TRUE, 1, $2, $2, 1, $2, $2)`, sourceID, now.Add(-time.Hour)); seedErr != nil {
 			t.Fatal(seedErr)
 		}
 		repository := iam.NewPostgresRepository(pool)
@@ -1507,9 +1657,9 @@ VALUES (TRUE, 'local', 1, 'test:bootstrap', clock_timestamp())`); err != nil {
 	tokenDigest := sha256.Sum256([]byte(rawToken))
 	if _, err := pool.Exec(ctx, `
 INSERT INTO identity_sources (
-    id, name, source_kind, status, required_mappings_complete, verified_at, previewed_at,
+    id, name, source_kind, status, required_mappings_complete, verified_configuration_version, verified_at, previewed_at,
     version, created_at, updated_at
-) VALUES ($1, 'Barrier OIDC', 'oidc', 'verified', TRUE, $2, $2, 1, $2, $2)`, sourceID, now.Add(-time.Hour)); err != nil {
+) VALUES ($1, 'Barrier OIDC', 'oidc', 'verified', TRUE, 1, $2, $2, 1, $2, $2)`, sourceID, now.Add(-time.Hour)); err != nil {
 		t.Fatalf("seed barrier source: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
@@ -1739,9 +1889,9 @@ VALUES (TRUE, 'local', 1, 'test:bootstrap', clock_timestamp())
 	emergencyID := uuid.New()
 	if _, err := pool.Exec(ctx, `
 INSERT INTO identity_sources (
-    id, name, source_kind, status, required_mappings_complete, verified_at, previewed_at,
+    id, name, source_kind, status, required_mappings_complete, verified_configuration_version, verified_at, previewed_at,
     version, created_at, updated_at
-) VALUES ($1, 'Corporate OIDC', 'oidc', 'verified', TRUE, $2, $2, 1, $2, $2)
+) VALUES ($1, 'Corporate OIDC', 'oidc', 'verified', TRUE, 1, $2, $2, 1, $2, $2)
 `, sourceID, now.Add(-time.Hour)); err != nil {
 		t.Fatalf("seed identity source: %v", err)
 	}

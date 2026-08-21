@@ -55,6 +55,44 @@ FROM directory_sync_jobs WHERE id=$1 AND identity_source_id=$2`, jobID, sourceID
 	return job, nil
 }
 
+func (repository *PostgresRepository) ListDirectorySyncJobs(ctx context.Context, sourceID uuid.UUID, page Page) (DirectorySyncJobPage, error) {
+	if repository == nil || repository.pool == nil || sourceID == uuid.Nil {
+		return DirectorySyncJobPage{}, ErrIdentitySourceNotFound
+	}
+	limit, err := pageLimit(page)
+	if err != nil {
+		return DirectorySyncJobPage{}, err
+	}
+	rows, err := repository.pool.Query(ctx, `SELECT `+directorySyncJobColumns+`
+FROM directory_sync_jobs
+WHERE identity_source_id=$1
+  AND ($2::timestamptz IS NULL OR (created_at, id) < ($2, $3))
+ORDER BY created_at DESC, id DESC
+LIMIT $4`, sourceID, nullableTime(page.BeforeTime), page.BeforeID, limit+1)
+	if err != nil {
+		return DirectorySyncJobPage{}, fmt.Errorf("list directory synchronization jobs: %w", err)
+	}
+	defer rows.Close()
+	items := make([]DirectorySyncJob, 0, limit+1)
+	for rows.Next() {
+		job, scanErr := scanDirectorySyncJob(rows)
+		if scanErr != nil {
+			return DirectorySyncJobPage{}, fmt.Errorf("scan directory synchronization job: %w", scanErr)
+		}
+		items = append(items, job)
+	}
+	if err := rows.Err(); err != nil {
+		return DirectorySyncJobPage{}, fmt.Errorf("iterate directory synchronization jobs: %w", err)
+	}
+	result := DirectorySyncJobPage{Items: items}
+	if len(items) > limit {
+		last := items[limit-1]
+		result.Items = items[:limit]
+		result.NextCursor = encodeIAMCursor(last.CreatedAt, last.ID)
+	}
+	return result, nil
+}
+
 func (repository *PostgresRepository) ListDirectorySyncConflicts(ctx context.Context, sourceID uuid.UUID, status DirectorySyncConflictStatusFilter, page Page) (DirectorySyncConflictPage, error) {
 	if repository == nil || repository.pool == nil || sourceID == uuid.Nil || !validDirectoryConflictStatusFilter(status) {
 		return DirectorySyncConflictPage{}, ErrDirectorySyncNotFound

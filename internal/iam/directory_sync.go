@@ -131,11 +131,17 @@ type DirectorySyncConflictPage struct {
 	NextCursor string                  `json:"next_cursor,omitempty"`
 }
 
+type DirectorySyncJobPage struct {
+	Items      []DirectorySyncJob `json:"items"`
+	NextCursor string             `json:"next_cursor,omitempty"`
+}
+
 type DirectorySyncStore interface {
 	WithinTransaction(ctx context.Context, function func(pgx.Tx) error) error
 	GetIdentitySource(ctx context.Context, tx pgx.Tx, id uuid.UUID) (IdentitySource, error)
 	InsertDirectorySyncJob(ctx context.Context, tx pgx.Tx, job DirectorySyncJob) error
 	GetDirectorySyncJob(ctx context.Context, sourceID, jobID uuid.UUID) (DirectorySyncJob, error)
+	ListDirectorySyncJobs(ctx context.Context, sourceID uuid.UUID, page Page) (DirectorySyncJobPage, error)
 	ListDirectorySyncConflicts(ctx context.Context, sourceID uuid.UUID, status DirectorySyncConflictStatusFilter, page Page) (DirectorySyncConflictPage, error)
 	GetDirectorySyncConflict(ctx context.Context, sourceID, conflictID uuid.UUID) (DirectorySyncConflict, DirectorySyncStatus, error)
 	LockDirectorySyncConflict(ctx context.Context, tx pgx.Tx, sourceID, conflictID uuid.UUID) (DirectorySyncConflict, DirectorySyncStatus, error)
@@ -251,6 +257,32 @@ func (service *DirectorySyncService) GetJob(ctx context.Context, actor identity.
 		return DirectorySyncJob{}, err
 	}
 	return redactDirectorySyncJob(job), nil
+}
+
+func (service *DirectorySyncService) ListJobs(ctx context.Context, actor identity.Principal, sourceID uuid.UUID, page Page) (DirectorySyncJobPage, error) {
+	if service == nil || service.authorizer == nil || service.store == nil {
+		return DirectorySyncJobPage{}, ErrDirectorySyncConfiguration
+	}
+	if err := service.authorizer.Require(actor, identity.ActionIdentityManage, ""); err != nil {
+		return DirectorySyncJobPage{}, err
+	}
+	if sourceID == uuid.Nil {
+		return DirectorySyncJobPage{}, ErrIdentitySourceNotFound
+	}
+	if !validIAMPage(page) || page.Cursor != "" {
+		return DirectorySyncJobPage{}, ErrPageInvalid
+	}
+	if _, err := service.store.GetIdentitySource(ctx, nil, sourceID); err != nil {
+		return DirectorySyncJobPage{}, err
+	}
+	result, err := service.store.ListDirectorySyncJobs(ctx, sourceID, page)
+	if err != nil {
+		return DirectorySyncJobPage{}, err
+	}
+	for index := range result.Items {
+		result.Items[index] = redactDirectorySyncJob(result.Items[index])
+	}
+	return result, nil
 }
 
 func (service *DirectorySyncService) ListConflicts(ctx context.Context, actor identity.Principal, sourceID uuid.UUID, status DirectorySyncConflictStatusFilter, page Page) (DirectorySyncConflictPage, error) {

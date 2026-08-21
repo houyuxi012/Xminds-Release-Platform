@@ -23,7 +23,7 @@ func TestEnableSSORequiresVerifiedSourceMappingPreviewAndEmergencyAccount(t *tes
 	harness := newIAMHarness(t)
 	harness.repository.sources[harness.sourceID] = IdentitySource{
 		ID: harness.sourceID, Kind: IdentitySourceOIDC, Status: IdentitySourceStatusDraft,
-		RequiredMappingsComplete: false, Version: 1,
+		ConfigurationVersion: 1, Version: 1,
 	}
 
 	err := harness.service.EnableSSO(context.Background(), harness.admin, harness.sourceID, 1, harness.proof(), harness.request)
@@ -34,8 +34,8 @@ func TestEnableSSORequiresVerifiedSourceMappingPreviewAndEmergencyAccount(t *tes
 	if harness.repository.login.Mode != LoginModeLocal {
 		t.Fatalf("login mode = %q", harness.repository.login.Mode)
 	}
-	if len(harness.highRisk.operations) != 1 || harness.highRisk.operations[0] != string(ReauthenticationOperationSSOEnable) {
-		t.Fatalf("business precondition did not consume proof: %+v", harness.highRisk.operations)
+	if len(harness.highRisk.operations) != 0 {
+		t.Fatalf("static source precondition consumed proof: %+v", harness.highRisk.operations)
 	}
 }
 
@@ -740,6 +740,100 @@ func TestIdentitySourceDraftVerifyAndPreviewDoNotExposeSecretReference(t *testin
 	if len(harness.auditor.commands) != 3 || harness.auditor.commands[0].Metadata["secret_reference"] != nil {
 		t.Fatalf("audit commands = %+v", harness.auditor.commands)
 	}
+	verifyMetadata := harness.auditor.commands[1].Metadata
+	if len(verifyMetadata) != 4 || verifyMetadata["configuration_version"] == nil || verifyMetadata["required_mappings_complete"] == nil ||
+		verifyMetadata["supports_incremental"] == nil || verifyMetadata["supports_pagination"] == nil {
+		t.Fatalf("verification audit metadata = %+v", verifyMetadata)
+	}
+}
+
+// Mutation caught: omitting the independent configuration generation makes a
+// later verification impossible to bind to the exact server-side settings.
+func TestCreateIdentitySourceStartsUnverifiedConfigurationGeneration(t *testing.T) {
+	harness := newIAMHarness(t)
+
+	created, err := harness.service.CreateIdentitySource(context.Background(), harness.admin, CreateIdentitySourceCommand{
+		Name: "Corporate OIDC", Kind: IdentitySourceOIDC, SecretReference: "secret://iam/corporate-oidc",
+	}, harness.request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored := harness.repository.sources[created.ID]
+	if created.ConfigurationVersion != 1 || created.VerifiedConfigurationVersion != 0 || created.RequiredMappingsComplete ||
+		stored.ConfigurationVersion != 1 || stored.VerifiedConfigurationVersion != 0 || stored.RequiredMappingsComplete {
+		t.Fatalf("created=%+v stored=%+v", created, stored)
+	}
+}
+
+// Mutation caught: changing server-side connection settings without advancing
+// the configuration generation leaves a stale verification usable.
+func TestPatchIdentitySourceConfigurationInvalidatesVerifiedCapability(t *testing.T) {
+	harness := newIAMHarness(t)
+	source := IdentitySource{
+		ID: harness.sourceID, Name: "Corporate OIDC", Kind: IdentitySourceOIDC, Status: IdentitySourceStatusDraft,
+		SecretReference: "secret://iam/old", RequiredMappingsComplete: true, ConfigurationVersion: 1,
+		VerifiedConfigurationVersion: 1, VerifiedAt: harness.now.Add(-time.Minute), Version: 1,
+	}
+	harness.repository.sources[source.ID] = source
+	name := "Corporate Workforce OIDC"
+
+	patched, err := harness.service.PatchIdentitySourceDraft(context.Background(), harness.admin, source.ID, PatchIdentitySourceCommand{Name: &name, Version: 1}, harness.request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored := harness.repository.sources[source.ID]
+	if patched.ConfigurationVersion != 2 || patched.VerifiedConfigurationVersion != 0 || patched.RequiredMappingsComplete || !patched.VerifiedAt.IsZero() || patched.Version != 2 ||
+		stored.ConfigurationVersion != 2 || stored.VerifiedConfigurationVersion != 0 || stored.RequiredMappingsComplete || !stored.VerifiedAt.IsZero() {
+		t.Fatalf("patched=%+v stored=%+v", patched, stored)
+	}
+}
+
+// Mutation caught: saving only the aggregate status after Verify leaves the
+// adapter result unbound to the configuration generation it inspected.
+func TestVerifyIdentitySourceBindsServerCapabilityToConfigurationGeneration(t *testing.T) {
+	harness := newIAMHarness(t)
+	source := IdentitySource{
+		ID: harness.sourceID, Name: "Corporate OIDC", Kind: IdentitySourceOIDC, Status: IdentitySourceStatusDraft,
+		SecretReference: "secret://iam/corporate", ConfigurationVersion: 7, Version: 3,
+	}
+	harness.repository.sources[source.ID] = source
+	harness.service.directory = iamDirectoryAdapter{report: CapabilityReport{
+		Reachable: true, RequiredAttributes: []string{"subject", "roles"}, RequiredMappingsComplete: true, SupportsPagination: true,
+	}}
+
+	report, err := harness.service.VerifyIdentitySourceVersioned(context.Background(), harness.admin, source.ID, 3, harness.request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored := harness.repository.sources[source.ID]
+	if !report.RequiredMappingsComplete || stored.Status != IdentitySourceStatusVerified || !stored.RequiredMappingsComplete ||
+		stored.ConfigurationVersion != 7 || stored.VerifiedConfigurationVersion != 7 || stored.VerifiedAt.IsZero() || stored.Version != 4 {
+		t.Fatalf("report=%+v stored=%+v", report, stored)
+	}
+}
+
+func TestGetIdentitySourceRequiresManagePermissionAndRedactsServerConfiguration(t *testing.T) {
+	harness := newIAMHarness(t)
+	source := harness.repository.sources[harness.sourceID]
+	source.SecretReference = "secret://iam/private-upstream"
+	source.ConfigurationVersion = 5
+	source.VerifiedConfigurationVersion = 5
+	harness.repository.sources[source.ID] = source
+
+	viewer := identity.Principal{Subject: "source.viewer", Kind: identity.PrincipalKindHuman, Roles: []identity.Role{identity.RoleViewer}}
+	if _, err := harness.service.GetIdentitySource(context.Background(), viewer, source.ID); !errors.Is(err, identity.ErrActionDenied) {
+		t.Fatalf("GetIdentitySource(viewer) error = %v", err)
+	}
+	if _, err := harness.service.GetIdentitySource(context.Background(), harness.admin, uuid.Nil); !errors.Is(err, ErrIdentitySourceNotFound) {
+		t.Fatalf("GetIdentitySource(nil) error = %v", err)
+	}
+	loaded, err := harness.service.GetIdentitySource(context.Background(), harness.admin, source.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.SecretReference != "" || loaded.ConfigurationVersion != 5 || loaded.VerifiedConfigurationVersion != 5 {
+		t.Fatalf("GetIdentitySource() = %+v", loaded)
+	}
 }
 
 func TestHighRiskWritesValidateVersionBeforeProofAndConsumeBeforeBusinessTransaction(t *testing.T) {
@@ -957,7 +1051,8 @@ func newIAMHarness(t *testing.T) *iamHarness {
 		login: LoginState{Mode: LoginModeLocal, Version: 1, UpdatedAt: now},
 		sources: map[uuid.UUID]IdentitySource{sourceID: {
 			ID: sourceID, Kind: IdentitySourceOIDC, Status: IdentitySourceStatusVerified,
-			VerifiedAt: now.Add(-time.Minute), RequiredMappingsComplete: true, PreviewedAt: now.Add(-30 * time.Second), Version: 1,
+			VerifiedAt: now.Add(-time.Minute), RequiredMappingsComplete: true, ConfigurationVersion: 1,
+			VerifiedConfigurationVersion: 1, PreviewedAt: now.Add(-30 * time.Second), Version: 1,
 		}},
 		users: map[uuid.UUID]UserPrincipal{emergencyID: {
 			ID: emergencyID, Username: "break-glass", Kind: UserKindEmergency, Status: UserStatusActive,
@@ -981,7 +1076,7 @@ func newIAMHarness(t *testing.T) *iamHarness {
 	sessions := &iamSessionRecorder{}
 	highRisk := &recordingHighRiskAuthorizer{}
 	service, err := NewService(ServiceConfig{
-		Repository: repository, ScopeCatalog: repository, BreakGlass: NewBreakGlassInvariantAuthority(repository), Auditor: auditor, Sessions: sessions, Passwords: deterministicPasswordManager{}, Directory: iamDirectoryAdapter{}, HighRisk: highRisk,
+		Repository: repository, ScopeCatalog: repository, BreakGlass: NewBreakGlassInvariantAuthority(repository), Auditor: auditor, Sessions: sessions, Passwords: deterministicPasswordManager{}, Directory: iamDirectoryAdapter{report: CapabilityReport{Reachable: true, SupportsIncremental: true}}, HighRisk: highRisk,
 		Clock: func() time.Time { return now },
 	})
 	if err != nil {
@@ -1464,10 +1559,10 @@ func (authorizer *recordingHighRiskAuthorizer) Authorize(_ context.Context, _ id
 	return nil
 }
 
-type iamDirectoryAdapter struct{}
+type iamDirectoryAdapter struct{ report CapabilityReport }
 
-func (iamDirectoryAdapter) Verify(context.Context, IdentitySource) (CapabilityReport, error) {
-	return CapabilityReport{Reachable: true, SupportsIncremental: true}, nil
+func (adapter iamDirectoryAdapter) Verify(context.Context, IdentitySource) (CapabilityReport, error) {
+	return adapter.report, nil
 }
 
 func (iamDirectoryAdapter) Preview(context.Context, IdentitySource) (SyncDiff, error) {

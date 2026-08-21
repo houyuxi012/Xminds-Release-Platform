@@ -323,7 +323,7 @@ func (adapter *SecretBackedDirectoryAdapter) verifyOIDC(ctx context.Context, sou
 	}
 	return CapabilityReport{
 		Reachable: true, RequiredAttributes: []string{"subject", "display_name", "email", "roles", "product_ids"},
-		RequiredMappingsComplete: source.RequiredMappingsComplete,
+		RequiredMappingsComplete: true,
 	}, nil
 }
 
@@ -348,7 +348,7 @@ func (adapter *SecretBackedDirectoryAdapter) verifySCIM(ctx context.Context, sou
 	}
 	return CapabilityReport{
 		Reachable: true, RequiredAttributes: []string{"subject", "display_name", "email", "organizations"},
-		RequiredMappingsComplete: source.RequiredMappingsComplete, SupportsPagination: true,
+		RequiredMappingsComplete: true, SupportsPagination: true,
 	}, nil
 }
 

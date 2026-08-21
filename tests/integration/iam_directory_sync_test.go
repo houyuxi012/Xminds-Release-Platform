@@ -53,9 +53,9 @@ VALUES (TRUE, 'local', 1, 'test:bootstrap', clock_timestamp())`); err != nil {
 	now := time.Date(2026, 8, 21, 11, 0, 0, 0, time.UTC)
 	if _, err := pool.Exec(ctx, `
 INSERT INTO identity_sources (
-    id, name, source_kind, status, secret_reference, required_mappings_complete,
+    id, name, source_kind, status, secret_reference, required_mappings_complete, verified_configuration_version,
     verified_at, version, created_at, updated_at
-) VALUES ($1, 'Corporate SCIM', 'scim', 'verified', 'secret://iam/scim', TRUE, $2, 5, $2, $2)`, sourceID, now); err != nil {
+) VALUES ($1, 'Corporate SCIM', 'scim', 'verified', 'secret://iam/scim', TRUE, 1, $2, 5, $2, $2)`, sourceID, now); err != nil {
 		t.Fatalf("insert source: %v", err)
 	}
 
@@ -402,8 +402,8 @@ func TestDirectorySyncMigrationUpgradesImmutableOriginal14ToCurrent(t *testing.T
 	if err := pool.QueryRow(ctx, `SELECT max(version) FROM schema_migrations`).Scan(&maximumVersion); err != nil {
 		t.Fatal(err)
 	}
-	if maximumVersion != 18 {
-		t.Fatalf("maximum migration version=%d, want 18", maximumVersion)
+	if maximumVersion != 19 {
+		t.Fatalf("maximum migration version=%d, want 19", maximumVersion)
 	}
 	var original14PreflightRows int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM schema_migration_preflights WHERE migration_version=14`).Scan(&original14PreflightRows); err != nil {
@@ -496,9 +496,9 @@ VALUES (TRUE, 'local', 1, 'test:bootstrap', clock_timestamp())`); err != nil {
 	now := time.Date(2026, 8, 21, 11, 30, 0, 0, time.UTC)
 	if _, err := pool.Exec(ctx, `
 INSERT INTO identity_sources (
-    id, name, source_kind, status, secret_reference, required_mappings_complete,
+    id, name, source_kind, status, secret_reference, required_mappings_complete, verified_configuration_version,
     verified_at, version, created_at, updated_at
-) VALUES ($1, 'Corporate SCIM', 'scim', 'verified', 'secret://iam/scim', TRUE, $2, 5, $2, $2)`, sourceID, now); err != nil {
+) VALUES ($1, 'Corporate SCIM', 'scim', 'verified', 'secret://iam/scim', TRUE, 1, $2, 5, $2, $2)`, sourceID, now); err != nil {
 		t.Fatal(err)
 	}
 	service, err := iam.NewDirectorySyncService(iam.DirectorySyncServiceConfig{
@@ -934,8 +934,8 @@ VALUES (TRUE, 'local', 1, 'test:bootstrap', clock_timestamp())`); err != nil {
 	now := time.Date(2026, 8, 21, 11, 45, 0, 0, time.UTC)
 	sourceID, userID := uuid.New(), uuid.New()
 	if _, err := pool.Exec(ctx, `
-INSERT INTO identity_sources (id, name, source_kind, status, secret_reference, required_mappings_complete, verified_at, version, created_at, updated_at)
-VALUES ($1, 'Corporate OIDC', 'oidc', 'verified', 'secret://iam/oidc', TRUE, $2, 2, $2, $2)`, sourceID, now); err != nil {
+INSERT INTO identity_sources (id, name, source_kind, status, secret_reference, required_mappings_complete, verified_configuration_version, verified_at, version, created_at, updated_at)
+VALUES ($1, 'Corporate OIDC', 'oidc', 'verified', 'secret://iam/oidc', TRUE, 1, $2, 2, $2, $2)`, sourceID, now); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `
@@ -1509,8 +1509,8 @@ VALUES (TRUE, 'local', 1, 'test:bootstrap', clock_timestamp())`); err != nil {
 	existingOrganizationID, missingOrganizationID, localOrganizationID, conflictingParentID, selfCycleID := uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New()
 	roleBindingID, sessionID := uuid.New(), uuid.New()
 	if _, err := pool.Exec(ctx, `
-INSERT INTO identity_sources (id, name, source_kind, status, secret_reference, required_mappings_complete, verified_at, version, created_at, updated_at)
-VALUES ($1, 'Corporate SCIM', 'scim', 'verified', 'secret://iam/scim', TRUE, $2, 5, $2, $2)`, sourceID, now); err != nil {
+INSERT INTO identity_sources (id, name, source_kind, status, secret_reference, required_mappings_complete, verified_configuration_version, verified_at, version, created_at, updated_at)
+VALUES ($1, 'Corporate SCIM', 'scim', 'verified', 'secret://iam/scim', TRUE, 1, $2, 5, $2, $2)`, sourceID, now); err != nil {
 		t.Fatalf("seed directory source: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
@@ -1906,8 +1906,8 @@ func directoryMigrationSubset(t *testing.T, maximumVersion int) fstest.MapFS {
 func seedDirectoryIntegrationSource(t *testing.T, ctx context.Context, pool *pgxpool.Pool, sourceID uuid.UUID, kind iam.IdentitySourceKind, now time.Time, version int64) {
 	t.Helper()
 	if _, err := pool.Exec(ctx, `
-INSERT INTO identity_sources (id, name, source_kind, status, secret_reference, required_mappings_complete, verified_at, version, created_at, updated_at)
-VALUES ($1, $5, $2, 'verified', 'secret://iam/directory', TRUE, $3, $4, $3, $3)`, sourceID, kind, now, version, "Directory Source "+sourceID.String()); err != nil {
+INSERT INTO identity_sources (id, name, source_kind, status, secret_reference, required_mappings_complete, verified_configuration_version, verified_at, version, created_at, updated_at)
+VALUES ($1, $5, $2, 'verified', 'secret://iam/directory', TRUE, 1, $3, $4, $3, $3)`, sourceID, kind, now, version, "Directory Source "+sourceID.String()); err != nil {
 		t.Fatalf("seed directory source: %v", err)
 	}
 }

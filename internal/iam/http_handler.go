@@ -40,6 +40,7 @@ type IAMApplication interface {
 	EnableUser(ctx context.Context, actor identity.Principal, userID uuid.UUID, expectedVersion int64, reason string, proof HighRiskProof, request RequestContext) error
 	RevokeUserSessions(ctx context.Context, actor identity.Principal, userID uuid.UUID, expectedVersion int64, reason string, proof HighRiskProof, request RequestContext) error
 	CreateIdentitySource(ctx context.Context, actor identity.Principal, command CreateIdentitySourceCommand, request RequestContext) (IdentitySource, error)
+	GetIdentitySource(ctx context.Context, actor identity.Principal, sourceID uuid.UUID) (IdentitySource, error)
 	ListIdentitySources(ctx context.Context, actor identity.Principal, page Page) (IdentitySourcePage, error)
 	PatchIdentitySourceDraft(ctx context.Context, actor identity.Principal, sourceID uuid.UUID, command PatchIdentitySourceCommand, request RequestContext) (IdentitySource, error)
 	EnableSSO(ctx context.Context, actor identity.Principal, sourceID uuid.UUID, expectedVersion int64, proof HighRiskProof, request RequestContext) error
@@ -50,6 +51,7 @@ type DirectorySyncApplication interface {
 	VerifyIdentitySourceVersioned(ctx context.Context, actor identity.Principal, sourceID uuid.UUID, expectedVersion int64, request RequestContext) (CapabilityReport, error)
 	StartDirectorySync(ctx context.Context, actor identity.Principal, sourceID uuid.UUID, mode DirectorySyncMode, expectedVersion int64, request RequestContext) (DirectorySyncJob, error)
 	GetDirectorySyncJob(ctx context.Context, actor identity.Principal, sourceID, jobID uuid.UUID) (DirectorySyncJob, error)
+	ListDirectorySyncJobs(ctx context.Context, actor identity.Principal, sourceID uuid.UUID, page Page) (DirectorySyncJobPage, error)
 	ListDirectorySyncConflicts(ctx context.Context, actor identity.Principal, sourceID uuid.UUID, status DirectorySyncConflictStatusFilter, page Page) (DirectorySyncConflictPage, error)
 	ResolveDirectorySyncConflict(ctx context.Context, actor identity.Principal, sourceID, conflictID uuid.UUID, command ResolveDirectorySyncConflictCommand, proof HighRiskProof, request RequestContext) (DirectorySyncConflict, error)
 }
@@ -91,6 +93,7 @@ func RegisterRoutes(router chi.Router, application IAMApplication) {
 	router.Route("/api/v1/identity-sources", func(router chi.Router) {
 		router.Get("/", listIdentitySourcesHandler(application))
 		router.Post("/", createIdentitySourceHandler(application))
+		router.Get("/{source_id}", getIdentitySourceHandler(application))
 		router.Patch("/{source_id}", patchIdentitySourceHandler(application))
 		router.Post("/{source_id}/enable", identitySourceLifecycleHandler(application, true))
 		router.Post("/{source_id}/disable", identitySourceLifecycleHandler(application, false))
@@ -104,6 +107,7 @@ func registerDirectorySyncRoutes(router chi.Router, application DirectorySyncApp
 	router.Post("/api/v1/identity-sources/{source_id}/verify", verifyIdentitySourceHandler(application))
 	router.Post("/api/v1/identity-sources/{source_id}/sync-preview", startDirectorySyncHandler(application, DirectorySyncModePreview))
 	router.Post("/api/v1/identity-sources/{source_id}/sync", startDirectorySyncHandler(application, DirectorySyncModeApply))
+	router.Get("/api/v1/identity-sources/{source_id}/sync-jobs", listDirectorySyncJobsHandler(application))
 	router.Get("/api/v1/identity-sources/{source_id}/sync-jobs/{job_id}", getDirectorySyncJobHandler(application))
 	router.Get("/api/v1/identity-sources/{source_id}/sync-conflicts", listDirectorySyncConflictsHandler(application))
 	router.Post("/api/v1/identity-sources/{source_id}/sync-conflicts/{conflict_id}/resolve", resolveDirectorySyncConflictHandler(application))
@@ -184,6 +188,34 @@ func getDirectorySyncJobHandler(application DirectorySyncApplication) http.Handl
 			return
 		}
 		writeIAMJSON(writer, http.StatusOK, toDirectorySyncJobResponse(job))
+	}
+}
+
+func listDirectorySyncJobsHandler(application DirectorySyncApplication) http.HandlerFunc {
+	return func(writer http.ResponseWriter, request *http.Request) {
+		principal, ok := requireIAMPrincipal(writer, request)
+		if !ok {
+			return
+		}
+		sourceID, ok := parseDirectoryPathID(writer, request, "source_id", "IDENTITY_SOURCE_ID_INVALID")
+		if !ok {
+			return
+		}
+		page, err := parseIAMPage(request)
+		if err != nil {
+			writeIAMApplicationError(writer, request, err)
+			return
+		}
+		result, err := application.ListDirectorySyncJobs(request.Context(), principal, sourceID, page)
+		if err != nil {
+			writeIAMApplicationError(writer, request, err)
+			return
+		}
+		items := make([]directorySyncJobResponse, 0, len(result.Items))
+		for _, job := range result.Items {
+			items = append(items, toDirectorySyncJobResponse(job))
+		}
+		writeIAMJSON(writer, http.StatusOK, directorySyncJobPageResponse{Items: items, NextCursor: result.NextCursor})
 	}
 }
 
@@ -830,10 +862,9 @@ func identitySourceLifecycleHandler(application IAMApplication, enable bool) htt
 
 func createIdentitySourceHandler(application IAMApplication) http.HandlerFunc {
 	type input struct {
-		Name                     string             `json:"name"`
-		Kind                     IdentitySourceKind `json:"kind"`
-		SecretReference          string             `json:"secret_reference"`
-		RequiredMappingsComplete bool               `json:"required_mappings_complete"`
+		Name            string             `json:"name"`
+		Kind            IdentitySourceKind `json:"kind"`
+		SecretReference string             `json:"secret_reference"`
 	}
 	return func(writer http.ResponseWriter, request *http.Request) {
 		principal, ok := requireIAMPrincipal(writer, request)
@@ -845,7 +876,7 @@ func createIdentitySourceHandler(application IAMApplication) http.HandlerFunc {
 			writeIAMProblem(writer, request, http.StatusBadRequest, "REQUEST_BODY_INVALID", "Request body is invalid", err)
 			return
 		}
-		source, err := application.CreateIdentitySource(request.Context(), principal, CreateIdentitySourceCommand{Name: body.Name, Kind: body.Kind, SecretReference: body.SecretReference, RequiredMappingsComplete: body.RequiredMappingsComplete}, iamRequestContext(request))
+		source, err := application.CreateIdentitySource(request.Context(), principal, CreateIdentitySourceCommand{Name: body.Name, Kind: body.Kind, SecretReference: body.SecretReference}, iamRequestContext(request))
 		if err != nil {
 			writeIAMApplicationError(writer, request, err)
 			return
@@ -879,12 +910,30 @@ func listIdentitySourcesHandler(application IAMApplication) http.HandlerFunc {
 	}
 }
 
+func getIdentitySourceHandler(application IAMApplication) http.HandlerFunc {
+	return func(writer http.ResponseWriter, request *http.Request) {
+		principal, ok := requireIAMPrincipal(writer, request)
+		if !ok {
+			return
+		}
+		sourceID, ok := parseDirectoryPathID(writer, request, "source_id", "IDENTITY_SOURCE_ID_INVALID")
+		if !ok {
+			return
+		}
+		source, err := application.GetIdentitySource(request.Context(), principal, sourceID)
+		if err != nil {
+			writeIAMApplicationError(writer, request, err)
+			return
+		}
+		writeIAMJSON(writer, http.StatusOK, toIdentitySourceResponse(source))
+	}
+}
+
 func patchIdentitySourceHandler(application IAMApplication) http.HandlerFunc {
 	type input struct {
-		Name                     *string `json:"name"`
-		SecretReference          *string `json:"secret_reference"`
-		RequiredMappingsComplete *bool   `json:"required_mappings_complete"`
-		Version                  int64   `json:"version"`
+		Name            *string `json:"name"`
+		SecretReference *string `json:"secret_reference"`
+		Version         int64   `json:"version"`
 	}
 	return func(writer http.ResponseWriter, request *http.Request) {
 		principal, ok := requireIAMPrincipal(writer, request)
@@ -901,7 +950,7 @@ func patchIdentitySourceHandler(application IAMApplication) http.HandlerFunc {
 			writeIAMProblem(writer, request, http.StatusBadRequest, "REQUEST_BODY_INVALID", "Request body is invalid", err)
 			return
 		}
-		source, err := application.PatchIdentitySourceDraft(request.Context(), principal, sourceID, PatchIdentitySourceCommand{Name: body.Name, SecretReference: body.SecretReference, RequiredMappingsComplete: body.RequiredMappingsComplete, Version: body.Version}, iamRequestContext(request))
+		source, err := application.PatchIdentitySourceDraft(request.Context(), principal, sourceID, PatchIdentitySourceCommand{Name: body.Name, SecretReference: body.SecretReference, Version: body.Version}, iamRequestContext(request))
 		if err != nil {
 			writeIAMApplicationError(writer, request, err)
 			return
@@ -1145,17 +1194,19 @@ type roleBindingPageResponse struct {
 }
 
 type identitySourceResponse struct {
-	ID                       uuid.UUID            `json:"id"`
-	Name                     string               `json:"name"`
-	Kind                     IdentitySourceKind   `json:"kind"`
-	Status                   IdentitySourceStatus `json:"status"`
-	RequiredMappingsComplete bool                 `json:"required_mappings_complete"`
-	VerifiedAt               *time.Time           `json:"verified_at,omitempty"`
-	PreviewedAt              *time.Time           `json:"previewed_at,omitempty"`
-	FaultCode                string               `json:"fault_code,omitempty"`
-	Version                  int64                `json:"version"`
-	CreatedAt                time.Time            `json:"created_at"`
-	UpdatedAt                time.Time            `json:"updated_at"`
+	ID                           uuid.UUID            `json:"id"`
+	Name                         string               `json:"name"`
+	Kind                         IdentitySourceKind   `json:"kind"`
+	Status                       IdentitySourceStatus `json:"status"`
+	RequiredMappingsComplete     bool                 `json:"required_mappings_complete"`
+	ConfigurationVersion         int64                `json:"configuration_version"`
+	VerifiedConfigurationVersion *int64               `json:"verified_configuration_version,omitempty"`
+	VerifiedAt                   *time.Time           `json:"verified_at,omitempty"`
+	PreviewedAt                  *time.Time           `json:"previewed_at,omitempty"`
+	FaultCode                    string               `json:"fault_code,omitempty"`
+	Version                      int64                `json:"version"`
+	CreatedAt                    time.Time            `json:"created_at"`
+	UpdatedAt                    time.Time            `json:"updated_at"`
 }
 type identitySourcePageResponse struct {
 	Items      []identitySourceResponse `json:"items"`
@@ -1181,6 +1232,11 @@ type directorySyncJobResponse struct {
 	CreatedAt              time.Time           `json:"created_at"`
 	UpdatedAt              time.Time           `json:"updated_at"`
 	CompletedAt            *time.Time          `json:"completed_at,omitempty"`
+}
+
+type directorySyncJobPageResponse struct {
+	Items      []directorySyncJobResponse `json:"items"`
+	NextCursor string                     `json:"next_cursor,omitempty"`
 }
 
 func toUserResponse(user UserPrincipal) userResponse {
@@ -1227,7 +1283,11 @@ func toRoleBindingResponse(binding RoleBinding) roleBindingResponse {
 }
 
 func toIdentitySourceResponse(source IdentitySource) identitySourceResponse {
-	result := identitySourceResponse{ID: source.ID, Name: source.Name, Kind: source.Kind, Status: source.Status, RequiredMappingsComplete: source.RequiredMappingsComplete, FaultCode: source.FaultCode, Version: source.Version, CreatedAt: source.CreatedAt, UpdatedAt: source.UpdatedAt}
+	result := identitySourceResponse{ID: source.ID, Name: source.Name, Kind: source.Kind, Status: source.Status, RequiredMappingsComplete: source.RequiredMappingsComplete, ConfigurationVersion: source.ConfigurationVersion, FaultCode: source.FaultCode, Version: source.Version, CreatedAt: source.CreatedAt, UpdatedAt: source.UpdatedAt}
+	if source.VerifiedConfigurationVersion > 0 {
+		value := source.VerifiedConfigurationVersion
+		result.VerifiedConfigurationVersion = &value
+	}
 	if !source.VerifiedAt.IsZero() {
 		value := source.VerifiedAt
 		result.VerifiedAt = &value

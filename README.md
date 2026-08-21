@@ -42,6 +42,8 @@ Xminds Release Platform 是面向企业软件交付场景的多产品可信发�
 - `endpoint.sync.v1` 五角色目录与引用制品复制、目标端回读 SHA-256 校验和三次失败摘除；
 - 独立公网监听端口、默认产品兼容目录路径、产品/通道隔离目录路径和支持单段 Range 的内容寻址制品下载。
 - 基于受信任 Secret 根的 OIDC discovery/JWKS 与 SCIM 2.0 连接验证，并强制非对称签名算法、可用公钥材料、同源 JWKS、TLS 1.2+、禁用环境代理与重定向；
+- 身份源映射完整性仅由服务端 Verify 结果产生，并与独立 `configuration_version` 精确绑定；名称或 Secret 引用实际变化会推进配置代际并立即清除旧验证能力，客户端不能声明或恢复该状态；
+- 身份源详情和来源范围的同步作业历史提供稳定分页与 `identity.manage` 授权，响应不暴露 Secret 引用、上游游标、运行阶段或 worker 运行标记；
 - 基于当前 `iam_login_state.active_source_id` 的活动人员 OIDC 验签，来源切换、状态变更或 Secret/CA 原子轮换后立即失效旧信任；
 - SCIM Users/Groups 分页归一化、有界对象计数与持久化 preview/apply 作业，支持 Worker 崩溃后从服务端游标幂等恢复；
 - 目录来源字段所有权、本地角色/补充成员关系保留、full snapshot 终页停用及冲突对象最后安全状态保留。

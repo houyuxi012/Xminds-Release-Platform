@@ -54,11 +54,11 @@ func TestIAMActiveOIDCVerifierTracksPostgresSourceAndStatusTransitions(t *testin
 		t.Fatalf("reset active OIDC state: %v", err)
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO identity_sources (
-    id, name, source_kind, status, secret_reference, required_mappings_complete,
+    id, name, source_kind, status, secret_reference, required_mappings_complete, verified_configuration_version,
     verified_at, previewed_at, version, created_at, updated_at
 ) VALUES
-    ($1, 'Active PG OIDC A', 'oidc', 'enabled', 'secret://iam/pg-oidc-a', TRUE, clock_timestamp(), clock_timestamp(), 3, clock_timestamp(), clock_timestamp()),
-	($2, 'Active PG OIDC B', 'oidc', 'enabled', 'secret://iam/pg-oidc-b', TRUE, clock_timestamp(), clock_timestamp(), 5, clock_timestamp(), clock_timestamp())`, sourceA, sourceB); err != nil {
+    ($1, 'Active PG OIDC A', 'oidc', 'enabled', 'secret://iam/pg-oidc-a', TRUE, 1, clock_timestamp(), clock_timestamp(), 3, clock_timestamp(), clock_timestamp()),
+	($2, 'Active PG OIDC B', 'oidc', 'enabled', 'secret://iam/pg-oidc-b', TRUE, 1, clock_timestamp(), clock_timestamp(), 5, clock_timestamp(), clock_timestamp())`, sourceA, sourceB); err != nil {
 		t.Fatalf("seed active OIDC state: %v", err)
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO iam_login_state (singleton, login_mode, active_source_id, version, updated_by, updated_at)

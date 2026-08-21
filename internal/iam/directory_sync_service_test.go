@@ -122,6 +122,39 @@ func TestDirectorySyncServiceConflictListHidesUnknownSource(t *testing.T) {
 	}
 }
 
+func TestDirectorySyncServiceListsSourceScopedRedactedJobHistory(t *testing.T) {
+	now := time.Date(2026, 8, 21, 13, 30, 0, 0, time.UTC)
+	source := IdentitySource{ID: uuid.New(), Kind: IdentitySourceSCIM, Status: IdentitySourceStatusVerified, VerifiedAt: now, Version: 2}
+	job := DirectorySyncJob{
+		ID: uuid.New(), IdentitySourceID: source.ID, SourceVersion: 2, RunMarker: uuid.New(), Mode: DirectorySyncModeApply,
+		Status: DirectorySyncStatusCompleted, Phase: DirectorySyncPhaseFinalize, Cursor: "private-upstream-cursor", CreatedAt: now,
+	}
+	store := &directorySyncStoreFake{source: source, jobPage: DirectorySyncJobPage{Items: []DirectorySyncJob{job}, NextCursor: "next-page"}}
+	service, err := NewDirectorySyncService(DirectorySyncServiceConfig{
+		Store: store, Jobs: &directorySyncJobQueueFake{}, Auditor: &directorySyncAuditFake{}, Clock: func() time.Time { return now }, ConflictCursors: newDirectoryTestConflictCursorCodec(t, func() time.Time { return now }),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	viewer := identity.Principal{Subject: "directory.viewer", Kind: identity.PrincipalKindHuman, Roles: []identity.Role{identity.RoleViewer}}
+	if _, err := service.ListJobs(context.Background(), viewer, source.ID, Page{Limit: 25}); !errors.Is(err, identity.ErrActionDenied) {
+		t.Fatalf("ListJobs(viewer) error = %v", err)
+	}
+	if _, err := service.ListJobs(context.Background(), directorySyncAdmin(), uuid.Nil, Page{Limit: 25}); !errors.Is(err, ErrIdentitySourceNotFound) {
+		t.Fatalf("ListJobs(nil source) error = %v", err)
+	}
+	result, err := service.ListJobs(context.Background(), directorySyncAdmin(), source.ID, Page{Limit: 25})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Items) != 1 || result.Items[0].RunMarker != uuid.Nil || result.Items[0].Phase != "" || result.Items[0].Cursor != "" || result.NextCursor != "next-page" {
+		t.Fatalf("ListJobs() = %+v", result)
+	}
+	if store.listedSourceID != source.ID || store.listedPage.Limit != 25 {
+		t.Fatalf("repository scope=%s page=%+v", store.listedSourceID, store.listedPage)
+	}
+}
+
 func TestDirectorySyncServiceReplacesRepositoryCursorWithBoundOpaqueCursor(t *testing.T) {
 	now := time.Date(2026, 8, 21, 13, 45, 0, 0, time.UTC)
 	source := IdentitySource{ID: uuid.New(), Kind: IdentitySourceSCIM, Status: IdentitySourceStatusVerified, VerifiedAt: now, Version: 2}
@@ -348,6 +381,8 @@ type directorySyncStoreFake struct {
 	listedPage        Page
 	conflict          DirectorySyncConflict
 	conflictJobStatus DirectorySyncStatus
+	jobPage           DirectorySyncJobPage
+	listedSourceID    uuid.UUID
 }
 
 func (store *directorySyncStoreFake) WithinTransaction(ctx context.Context, function func(pgx.Tx) error) error {
@@ -375,6 +410,12 @@ func (store *directorySyncStoreFake) InsertDirectorySyncJob(_ context.Context, _
 
 func (store *directorySyncStoreFake) GetDirectorySyncJob(context.Context, uuid.UUID, uuid.UUID) (DirectorySyncJob, error) {
 	return DirectorySyncJob{}, errors.New("unexpected GetDirectorySyncJob call")
+}
+
+func (store *directorySyncStoreFake) ListDirectorySyncJobs(_ context.Context, sourceID uuid.UUID, page Page) (DirectorySyncJobPage, error) {
+	store.listedSourceID = sourceID
+	store.listedPage = page
+	return store.jobPage, nil
 }
 
 func (store *directorySyncStoreFake) ListDirectorySyncConflicts(_ context.Context, _ uuid.UUID, _ DirectorySyncConflictStatusFilter, page Page) (DirectorySyncConflictPage, error) {

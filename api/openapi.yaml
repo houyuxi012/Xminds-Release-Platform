@@ -1678,6 +1678,27 @@ paths:
               schema:
                 $ref: '#/components/schemas/IdentitySource'
   /api/v1/identity-sources/{source_id}:
+    get:
+      operationId: getIdentitySource
+      summary: 查询身份源详情
+      description: 返回服务端验证能力与配置代际；不返回 Secret 引用。
+      tags: [Identity Governance]
+      x-required-action: identity.manage
+      parameters:
+        - $ref: '#/components/parameters/IdentitySourceIDPath'
+      responses:
+        '200':
+          description: 身份源详情
+          headers:
+            Cache-Control:
+              schema: {type: string, const: no-store}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/IdentitySource'}
+        '400': {$ref: '#/components/responses/UnprocessableEntity'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/InternalError'}
     patch:
       operationId: patchIdentitySourceDraft
       summary: 更新身份源草稿
@@ -1781,6 +1802,30 @@ paths:
         '404': {$ref: '#/components/responses/NotFound'}
         '409': {$ref: '#/components/responses/Conflict'}
         '422': {$ref: '#/components/responses/UnprocessableEntity'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /api/v1/identity-sources/{source_id}/sync-jobs:
+    get:
+      operationId: listIdentitySourceSynchronizationJobs
+      summary: 分页查询来源范围内的目录同步作业历史
+      description: 仅返回公开状态、计数与时间，不返回 worker 游标、阶段或运行标记。
+      tags: [Identity Governance]
+      x-required-action: identity.manage
+      parameters:
+        - $ref: '#/components/parameters/IdentitySourceIDPath'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: 来源范围内的目录同步作业历史页
+          headers:
+            Cache-Control:
+              schema: {type: string, const: no-store}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DirectorySyncJobPage'}
+        '400': {$ref: '#/components/responses/UnprocessableEntity'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
         '500': {$ref: '#/components/responses/InternalError'}
   /api/v1/identity-sources/{source_id}/sync-jobs/{job_id}:
     get:
@@ -3225,7 +3270,6 @@ components:
           minLength: 1
           maxLength: 256
           writeOnly: true
-        required_mappings_complete: {type: boolean}
     PatchIdentitySourceRequest:
       type: object
       additionalProperties: false
@@ -3237,18 +3281,19 @@ components:
           minLength: 1
           maxLength: 256
           writeOnly: true
-        required_mappings_complete: {type: boolean}
         version: {type: integer, minimum: 1}
     IdentitySource:
       type: object
       additionalProperties: false
-      required: [id, name, kind, status, required_mappings_complete, version, created_at, updated_at]
+      required: [id, name, kind, status, required_mappings_complete, configuration_version, version, created_at, updated_at]
       properties:
         id: {type: string, format: uuid}
         name: {type: string}
         kind: {type: string, enum: [local, oidc, scim]}
         status: {type: string, enum: [draft, verified, enabled, fault, disabled]}
         required_mappings_complete: {type: boolean}
+        configuration_version: {type: integer, minimum: 1}
+        verified_configuration_version: {type: integer, minimum: 1}
         verified_at: {type: string, format: date-time}
         previewed_at: {type: string, format: date-time}
         fault_code: {type: string}
@@ -3326,6 +3371,17 @@ components:
         created_at: {type: string, format: date-time}
         updated_at: {type: string, format: date-time}
         completed_at: {type: string, format: date-time}
+    DirectorySyncJobPage:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/DirectorySyncJob'}
+        next_cursor:
+          type: string
+          maxLength: 512
     DirectorySyncConflict:
       type: object
       additionalProperties: false

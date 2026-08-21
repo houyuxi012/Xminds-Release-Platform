@@ -50,7 +50,7 @@ func TestSecretBackedDirectoryAdapterVerifiesOIDCDiscoveryJWKSAndPrivateCA(t *te
 		t.Fatalf("NewSecretBackedDirectoryAdapter() error = %v", err)
 	}
 	report, err := adapter.Verify(context.Background(), IdentitySource{
-		ID: uuid.New(), Kind: IdentitySourceOIDC, SecretReference: "secret://iam/corporate-oidc", RequiredMappingsComplete: true,
+		ID: uuid.New(), Kind: IdentitySourceOIDC, SecretReference: "secret://iam/corporate-oidc",
 	})
 	if err != nil {
 		t.Fatalf("Verify() error = %v", err)
@@ -535,12 +535,12 @@ func TestSecretBackedDirectoryAdapterVerifiesSCIMAndPaginatesNormalizedSnapshot(
 	if err != nil {
 		t.Fatalf("NewSecretBackedDirectoryAdapter() error = %v", err)
 	}
-	source := IdentitySource{ID: uuid.New(), Kind: IdentitySourceSCIM, SecretReference: "secret://iam/scim", RequiredMappingsComplete: true}
+	source := IdentitySource{ID: uuid.New(), Kind: IdentitySourceSCIM, SecretReference: "secret://iam/scim"}
 	report, err := adapter.Verify(context.Background(), source)
 	if err != nil {
 		t.Fatalf("Verify() error = %v", err)
 	}
-	if !report.Reachable || !report.SupportsPagination || report.SupportsIncremental {
+	if !report.Reachable || !report.RequiredMappingsComplete || !report.SupportsPagination || report.SupportsIncremental {
 		t.Fatalf("Verify() report = %#v", report)
 	}
 

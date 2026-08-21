@@ -70,9 +70,10 @@ SELECT login.login_mode,
        COALESCE(login.active_source_id, '00000000-0000-0000-0000-000000000000'::uuid),
        login.fault_code, login.version, login.updated_by, login.updated_at,
        COALESCE(source.id, '00000000-0000-0000-0000-000000000000'::uuid),
-       COALESCE(source.name, ''), COALESCE(source.source_kind, ''), COALESCE(source.status, ''),
-       COALESCE(source.secret_reference, ''), COALESCE(source.required_mappings_complete, FALSE),
-       source.verified_at, source.previewed_at, COALESCE(source.fault_code, ''),
+	       COALESCE(source.name, ''), COALESCE(source.source_kind, ''), COALESCE(source.status, ''),
+	       COALESCE(source.secret_reference, ''), COALESCE(source.required_mappings_complete, FALSE),
+	       COALESCE(source.configuration_version, 0), COALESCE(source.verified_configuration_version, 0),
+	       source.verified_at, source.previewed_at, COALESCE(source.fault_code, ''),
        COALESCE(source.version, 0), COALESCE(source.created_at, 'epoch'::timestamptz),
        COALESCE(source.updated_at, 'epoch'::timestamptz)
 FROM iam_login_state AS login
@@ -81,6 +82,7 @@ WHERE login.singleton = TRUE
 `).Scan(
 		&state.Mode, &state.ActiveSourceID, &state.FaultCode, &state.Version, &state.UpdatedBy, &state.UpdatedAt,
 		&source.ID, &source.Name, &source.Kind, &source.Status, &source.SecretReference, &source.RequiredMappingsComplete,
+		&source.ConfigurationVersion, &source.VerifiedConfigurationVersion,
 		&verifiedAt, &previewedAt, &source.FaultCode, &source.Version, &source.CreatedAt, &source.UpdatedAt,
 	)
 	if err != nil {
@@ -124,7 +126,8 @@ func (repository *PostgresRepository) GetIdentitySource(ctx context.Context, tx 
 	}
 	query := `
 SELECT id, name, source_kind, status, secret_reference, required_mappings_complete,
-       verified_at, previewed_at, fault_code, version, created_at, updated_at
+	   configuration_version, COALESCE(verified_configuration_version, 0),
+	   verified_at, previewed_at, fault_code, version, created_at, updated_at
 FROM identity_sources WHERE id = $1`
 	queryer := iamQueryer(repository.pool)
 	if tx != nil {
@@ -135,6 +138,7 @@ FROM identity_sources WHERE id = $1`
 	var verifiedAt, previewedAt *time.Time
 	err := queryer.QueryRow(ctx, query, id).Scan(
 		&source.ID, &source.Name, &source.Kind, &source.Status, &source.SecretReference, &source.RequiredMappingsComplete,
+		&source.ConfigurationVersion, &source.VerifiedConfigurationVersion,
 		&verifiedAt, &previewedAt, &source.FaultCode, &source.Version, &source.CreatedAt, &source.UpdatedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -158,11 +162,11 @@ func (repository *PostgresRepository) SaveIdentitySource(ctx context.Context, tx
 	}
 	result, err := tx.Exec(ctx, `
 UPDATE identity_sources
-SET status = $2, required_mappings_complete = $3, verified_at = $4, previewed_at = $5,
-    fault_code = $6, version = $7, updated_at = $8
-WHERE id = $1 AND version = $9
-`, source.ID, source.Status, source.RequiredMappingsComplete, nullableTime(source.VerifiedAt), nullableTime(source.PreviewedAt),
-		source.FaultCode, source.Version, source.UpdatedAt.UTC(), expectedVersion)
+SET status = $2, required_mappings_complete = $3, verified_configuration_version = $4,
+	 verified_at = $5, previewed_at = $6, fault_code = $7, version = $8, updated_at = $9
+WHERE id = $1 AND version = $10
+`, source.ID, source.Status, source.RequiredMappingsComplete, nullablePositiveInt64(source.VerifiedConfigurationVersion),
+		nullableTime(source.VerifiedAt), nullableTime(source.PreviewedAt), source.FaultCode, source.Version, source.UpdatedAt.UTC(), expectedVersion)
 	if err != nil {
 		return fmt.Errorf("save identity source: %w", err)
 	}
@@ -781,12 +785,13 @@ func (repository *PostgresRepository) DeleteRoleBinding(ctx context.Context, tx 
 }
 
 func (repository *PostgresRepository) InsertIdentitySource(ctx context.Context, tx pgx.Tx, source IdentitySource) error {
-	if tx == nil || source.ID == uuid.Nil || source.Status != IdentitySourceStatusDraft || source.Version != 1 {
+	if tx == nil || source.ID == uuid.Nil || source.Status != IdentitySourceStatusDraft || source.Version != 1 ||
+		source.ConfigurationVersion != 1 || source.VerifiedConfigurationVersion != 0 || source.RequiredMappingsComplete {
 		return ErrIAMConfiguration
 	}
 	_, err := tx.Exec(ctx, `
-INSERT INTO identity_sources (id, name, source_kind, status, secret_reference, required_mappings_complete, verified_at, previewed_at, fault_code, version, created_at, updated_at)
-VALUES ($1, $2, $3, 'draft', $4, $5, NULL, NULL, '', 1, $6, $7)`, source.ID, source.Name, source.Kind, source.SecretReference, source.RequiredMappingsComplete, source.CreatedAt.UTC(), source.UpdatedAt.UTC())
+INSERT INTO identity_sources (id, name, source_kind, status, secret_reference, required_mappings_complete, configuration_version, verified_configuration_version, verified_at, previewed_at, fault_code, version, created_at, updated_at)
+VALUES ($1, $2, $3, 'draft', $4, FALSE, 1, NULL, NULL, NULL, '', 1, $5, $6)`, source.ID, source.Name, source.Kind, source.SecretReference, source.CreatedAt.UTC(), source.UpdatedAt.UTC())
 	if err != nil {
 		var postgresError *pgconn.PgError
 		if errors.As(err, &postgresError) && postgresError.Code == "23505" {
@@ -837,8 +842,13 @@ func (repository *PostgresRepository) UpdateIdentitySourceDraft(ctx context.Cont
 		return ErrIAMConfiguration
 	}
 	result, err := tx.Exec(ctx, `
-UPDATE identity_sources SET name = $2, secret_reference = $3, required_mappings_complete = $4, version = $5, updated_at = $6
-WHERE id = $1 AND status = 'draft' AND version = $7`, source.ID, source.Name, source.SecretReference, source.RequiredMappingsComplete, source.Version, source.UpdatedAt.UTC(), expectedVersion)
+UPDATE identity_sources
+SET name = $2, secret_reference = $3, required_mappings_complete = $4,
+	configuration_version = $5, verified_configuration_version = $6, verified_at = $7,
+	version = $8, updated_at = $9
+WHERE id = $1 AND status = 'draft' AND version = $10`, source.ID, source.Name, source.SecretReference,
+		source.RequiredMappingsComplete, source.ConfigurationVersion, nullablePositiveInt64(source.VerifiedConfigurationVersion),
+		nullableTime(source.VerifiedAt), source.Version, source.UpdatedAt.UTC(), expectedVersion)
 	if err != nil {
 		return fmt.Errorf("update identity source draft: %w", err)
 	}
@@ -867,7 +877,8 @@ const roleBindingSelect = `SELECT id, subject_type, subject_id, role_name, scope
 FROM role_bindings`
 
 const identitySourceSelect = `SELECT id, name, source_kind, status, secret_reference, required_mappings_complete,
-       verified_at, previewed_at, fault_code, version, created_at, updated_at
+	   configuration_version, COALESCE(verified_configuration_version, 0),
+	   verified_at, previewed_at, fault_code, version, created_at, updated_at
 FROM identity_sources`
 
 type iamQueryer interface {
@@ -938,7 +949,9 @@ func scanRoleBinding(row pgx.Row) (RoleBinding, error) {
 func scanIdentitySource(row pgx.Row) (IdentitySource, error) {
 	var source IdentitySource
 	var verifiedAt, previewedAt *time.Time
-	err := row.Scan(&source.ID, &source.Name, &source.Kind, &source.Status, &source.SecretReference, &source.RequiredMappingsComplete, &verifiedAt, &previewedAt, &source.FaultCode, &source.Version, &source.CreatedAt, &source.UpdatedAt)
+	err := row.Scan(&source.ID, &source.Name, &source.Kind, &source.Status, &source.SecretReference, &source.RequiredMappingsComplete,
+		&source.ConfigurationVersion, &source.VerifiedConfigurationVersion, &verifiedAt, &previewedAt,
+		&source.FaultCode, &source.Version, &source.CreatedAt, &source.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return IdentitySource{}, ErrIdentitySourceNotFound
 	}
@@ -993,6 +1006,13 @@ func nullableTime(value time.Time) any {
 		return nil
 	}
 	return value.UTC()
+}
+
+func nullablePositiveInt64(value int64) any {
+	if value < 1 {
+		return nil
+	}
+	return value
 }
 
 func nullableUUID(value uuid.UUID) any {

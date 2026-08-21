@@ -442,7 +442,7 @@ func seedDirectoryConflictResolutionFixture(t *testing.T, ctx context.Context, p
 	sourceID, jobID, conflictID := uuid.New(), uuid.New(), uuid.New()
 	if _, err := pool.Exec(ctx, `INSERT INTO identity_sources (
 		id, name, source_kind, status, secret_reference, required_mappings_complete, verified_at, version, created_at, updated_at
-	) VALUES ($1,$2,'scim','verified','secret://iam/conflict',TRUE,$3,3,$3,$3)`, sourceID, "Conflict SCIM "+sourceID.String(), now); err != nil {
+	) VALUES ($1,$2,'scim','verified','secret://iam/conflict',FALSE,$3,3,$3,$3)`, sourceID, "Conflict SCIM "+sourceID.String(), now); err != nil {
 		t.Fatal(err)
 	}
 	completedAt := any(nil)

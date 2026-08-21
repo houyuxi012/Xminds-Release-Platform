@@ -133,18 +133,20 @@ type LoginState struct {
 }
 
 type IdentitySource struct {
-	ID                       uuid.UUID            `json:"id"`
-	Name                     string               `json:"name"`
-	Kind                     IdentitySourceKind   `json:"kind"`
-	Status                   IdentitySourceStatus `json:"status"`
-	SecretReference          string               `json:"-"`
-	RequiredMappingsComplete bool                 `json:"required_mappings_complete"`
-	VerifiedAt               time.Time            `json:"verified_at,omitempty"`
-	PreviewedAt              time.Time            `json:"previewed_at,omitempty"`
-	FaultCode                string               `json:"fault_code,omitempty"`
-	Version                  int64                `json:"version"`
-	CreatedAt                time.Time            `json:"created_at"`
-	UpdatedAt                time.Time            `json:"updated_at"`
+	ID                           uuid.UUID            `json:"id"`
+	Name                         string               `json:"name"`
+	Kind                         IdentitySourceKind   `json:"kind"`
+	Status                       IdentitySourceStatus `json:"status"`
+	SecretReference              string               `json:"-"`
+	RequiredMappingsComplete     bool                 `json:"required_mappings_complete"`
+	ConfigurationVersion         int64                `json:"configuration_version"`
+	VerifiedConfigurationVersion int64                `json:"verified_configuration_version,omitempty"`
+	VerifiedAt                   time.Time            `json:"verified_at,omitempty"`
+	PreviewedAt                  time.Time            `json:"previewed_at,omitempty"`
+	FaultCode                    string               `json:"fault_code,omitempty"`
+	Version                      int64                `json:"version"`
+	CreatedAt                    time.Time            `json:"created_at"`
+	UpdatedAt                    time.Time            `json:"updated_at"`
 }
 
 type UserPrincipal struct {
@@ -387,15 +389,13 @@ type CreateRoleBindingCommand struct {
 }
 
 type CreateIdentitySourceCommand struct {
-	Name                     string
-	Kind                     IdentitySourceKind
-	SecretReference          string
-	RequiredMappingsComplete bool
+	Name            string
+	Kind            IdentitySourceKind
+	SecretReference string
 }
 
 type PatchIdentitySourceCommand struct {
-	Name                     *string
-	SecretReference          *string
-	RequiredMappingsComplete *bool
-	Version                  int64
+	Name            *string
+	SecretReference *string
+	Version         int64
 }
