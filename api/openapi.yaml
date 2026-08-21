@@ -1450,7 +1450,12 @@ paths:
           application/json:
             schema: {$ref: '#/components/schemas/DeleteOrganizationMembershipRequest'}
       responses:
-        '204': {description: 平台成员关系已软移除，会话已撤销并完成不可变审计。}
+        '204':
+          description: 平台成员关系已软移除，会话已撤销并完成不可变审计。
+          headers:
+            Cache-Control:
+              description: 高风险操作响应不得缓存。
+              schema: {type: string, const: no-store}
         '400': {$ref: '#/components/responses/UnprocessableEntity'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}

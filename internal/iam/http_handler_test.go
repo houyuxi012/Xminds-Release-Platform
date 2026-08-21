@@ -231,7 +231,7 @@ func TestHTTPHandlerExposesOrganizationDetailChildrenAndMembershipLifecycle(t *t
 	deleteRequest.Header.Set("Content-Type", "application/json")
 	deleteResponse := httptest.NewRecorder()
 	handler.ServeHTTP(deleteResponse, deleteRequest)
-	if deleteResponse.Code != http.StatusNoContent || application.membershipDeleteCommand.MembershipVersion != 1 {
+	if deleteResponse.Code != http.StatusNoContent || deleteResponse.Header().Get("Cache-Control") != "no-store" || application.membershipDeleteCommand.MembershipVersion != 1 {
 		t.Fatalf("DELETE membership status=%d command=%+v body=%s", deleteResponse.Code, application.membershipDeleteCommand, deleteResponse.Body)
 	}
 }

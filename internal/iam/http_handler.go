@@ -580,6 +580,7 @@ func deleteOrganizationMembershipHandler(application IAMApplication) http.Handle
 			writeIAMApplicationError(writer, request, err)
 			return
 		}
+		writer.Header().Set("Cache-Control", "no-store")
 		writer.WriteHeader(http.StatusNoContent)
 	}
 }

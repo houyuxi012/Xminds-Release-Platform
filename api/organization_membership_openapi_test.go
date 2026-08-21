@@ -45,6 +45,10 @@ func TestOpenAPIDefinesStrictOrganizationMembershipGovernanceContracts(t *testin
 			}
 		}
 	}
+	deleteOperation := document.Paths.Find("/api/v1/organizations/{organization_id}/memberships/{user_id}").Delete
+	if deleteOperation.Responses.Value("204").Value.Headers["Cache-Control"] == nil {
+		t.Fatal("delete organization membership 204 response is missing Cache-Control")
+	}
 
 	createRequest := document.Components.Schemas["CreateOrganizationMembershipRequest"]
 	assertStrictRequiredSchema(t, "CreateOrganizationMembershipRequest", createRequest, []string{"organization_version", "user_id", "user_version", "reason", "reauthentication"})
