@@ -247,6 +247,9 @@ func (service *Service) DeleteOrganizationMembership(ctx context.Context, actor 
 	if organization.Version != command.OrganizationVersion || user.Version != command.UserVersion {
 		return ErrIAMConflict
 	}
+	if organization.Status != OrganizationStatusActive || user.Status != UserStatusActive {
+		return ErrOrganizationMembershipInvalid
+	}
 	if !exists || membership.Status != OrganizationMembershipStatusActive {
 		return ErrOrganizationMembershipNotFound
 	}
@@ -268,6 +271,9 @@ func (service *Service) DeleteOrganizationMembership(ctx context.Context, actor 
 		}
 		if lockedOrganization.Version != command.OrganizationVersion || lockedUser.Version != command.UserVersion {
 			return ErrIAMConflict
+		}
+		if lockedOrganization.Status != OrganizationStatusActive || lockedUser.Status != UserStatusActive {
+			return ErrOrganizationMembershipInvalid
 		}
 		if !lockedExists || lockedMembership.Status != OrganizationMembershipStatusActive {
 			return ErrOrganizationMembershipNotFound

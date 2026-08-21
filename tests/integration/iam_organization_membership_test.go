@@ -480,6 +480,71 @@ INSERT INTO local_sessions (
 	if strings.Contains(auditMetadata, reason) || !strings.Contains(auditMetadata, `"reason_digest"`) || auditTokenID != "" {
 		t.Fatalf("membership audit leaked secret context metadata=%s token_id=%q", auditMetadata, auditTokenID)
 	}
+
+	if _, err := pool.Exec(ctx, `
+INSERT INTO local_sessions (
+    id,token_digest,subject_id,authentication_method,mfa_level,authenticated_at,last_used_at,
+    absolute_expires_at,idle_expires_at,version
+) VALUES ($1,$2,$3,'local_password',0,$4,$4,$5,$5,1)`, uuid.New(), integrationSHA256Hex("membership-delete-audit-session"), userID, now.Add(-time.Minute), now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	deleteReason := "remove audit rollback supplemental access"
+	deleteProof, deleteRequest := completeIntegrationReauthenticationProof(t, ctx, reauthentication, creator, actor, iam.ReauthenticationOperationOrganizationMembershipDelete)
+	if deleteErr := failingService.DeleteOrganizationMembership(ctx, actor, organizationID, userID, iam.DeleteOrganizationMembershipCommand{
+		OrganizationVersion: 2, UserVersion: 1, MembershipVersion: 1, Reason: deleteReason,
+	}, deleteProof, deleteRequest); !errors.Is(deleteErr, errIntegrationAuditFailure) {
+		t.Fatalf("DeleteOrganizationMembership(audit failure) error=%v", deleteErr)
+	}
+	deleteChallengeID, err := uuid.Parse(deleteProof.ChallengeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var membershipStatus string
+	var membershipVersion int
+	if err := pool.QueryRow(ctx, `SELECT status,version FROM organization_memberships WHERE organization_id=$1 AND user_id=$2 AND source_owned=FALSE`, organizationID, userID).Scan(&membershipStatus, &membershipVersion); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT version FROM organization_units WHERE id=$1`, organizationID).Scan(&organizationVersion); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM local_sessions WHERE subject_id=$1 AND revoked_at IS NULL`, userID).Scan(&activeSessions); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT status FROM iam_reauthentication_challenges WHERE id=$1`, deleteChallengeID).Scan(&challengeStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM audit_events WHERE request_id=$1 AND action='identity.organization_membership.delete'`, deleteRequest.RequestID).Scan(&businessAudits); err != nil {
+		t.Fatal(err)
+	}
+	if membershipStatus != "active" || membershipVersion != 1 || organizationVersion != 2 || activeSessions != 1 || challengeStatus != "consumed" || businessAudits != 0 {
+		t.Fatalf("delete audit rollback membership=%s/%d org_version=%d sessions=%d challenge=%s audits=%d", membershipStatus, membershipVersion, organizationVersion, activeSessions, challengeStatus, businessAudits)
+	}
+	if err := realService.DeleteOrganizationMembership(ctx, actor, organizationID, userID, iam.DeleteOrganizationMembershipCommand{
+		OrganizationVersion: 2, UserVersion: 1, MembershipVersion: 1, Reason: deleteReason,
+	}, deleteProof, iam.RequestContext{RequestID: uuid.NewString(), SourceIP: "192.0.2.112"}); !errors.Is(err, iam.ErrHighRiskConfirmationRequired) {
+		t.Fatalf("consumed delete proof replay error=%v", err)
+	}
+	freshDeleteProof, freshDeleteRequest := completeIntegrationReauthenticationProof(t, ctx, reauthentication, creator, actor, iam.ReauthenticationOperationOrganizationMembershipDelete)
+	if err := realService.DeleteOrganizationMembership(ctx, actor, organizationID, userID, iam.DeleteOrganizationMembershipCommand{
+		OrganizationVersion: 2, UserVersion: 1, MembershipVersion: 1, Reason: deleteReason,
+	}, freshDeleteProof, freshDeleteRequest); err != nil {
+		t.Fatalf("fresh delete proof membership recovery error=%v", err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT status,version FROM organization_memberships WHERE organization_id=$1 AND user_id=$2 AND source_owned=FALSE`, organizationID, userID).Scan(&membershipStatus, &membershipVersion); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT version FROM organization_units WHERE id=$1`, organizationID).Scan(&organizationVersion); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM local_sessions WHERE subject_id=$1 AND revoked_at IS NULL`, userID).Scan(&activeSessions); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM audit_events WHERE request_id=$1 AND action='identity.organization_membership.delete'`, freshDeleteRequest.RequestID).Scan(&businessAudits); err != nil {
+		t.Fatal(err)
+	}
+	if membershipStatus != "removed" || membershipVersion != 2 || organizationVersion != 3 || activeSessions != 0 || businessAudits != 1 {
+		t.Fatalf("fresh delete membership=%s/%d org_version=%d sessions=%d audits=%d", membershipStatus, membershipVersion, organizationVersion, activeSessions, businessAudits)
+	}
 }
 
 // Mutation caught: checking break-glass before the tentative edge change lets

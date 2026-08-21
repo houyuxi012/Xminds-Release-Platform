@@ -236,9 +236,14 @@ func resolveDirectorySyncConflictHandler(application DirectorySyncApplication) h
 			writeIAMProblem(writer, request, http.StatusBadRequest, "REQUEST_BODY_INVALID", "Request body is invalid", ErrIdentitySourceInputInvalid)
 			return
 		}
+		proof, err := validateReauthenticationProofInput(body.Reauthentication)
+		if err != nil {
+			writeIAMApplicationError(writer, request, err)
+			return
+		}
 		result, err := application.ResolveDirectorySyncConflict(request.Context(), principal, sourceID, conflictID, ResolveDirectorySyncConflictCommand{
 			Version: body.Version, Decision: body.Decision, Reason: body.Reason,
-		}, body.Reauthentication.proof(), iamRequestContext(request))
+		}, proof, iamRequestContext(request))
 		if err != nil {
 			writeIAMApplicationError(writer, request, err)
 			return
@@ -266,7 +271,7 @@ func parseDirectoryConflictPage(request *http.Request) (DirectorySyncConflictSta
 		page.Limit = limit
 	}
 	if cursor := request.URL.Query().Get("cursor"); cursor != "" {
-		if strings.TrimSpace(cursor) != cursor || len(cursor) > 512 {
+		if strings.TrimSpace(cursor) != cursor || len(cursor) > maximumIAMCursorLength {
 			return "", Page{}, ErrPageInvalid
 		}
 		page.Cursor = cursor
@@ -289,8 +294,25 @@ type reauthenticationProofInput struct {
 	Confirmed   bool   `json:"confirmed"`
 }
 
-func (input reauthenticationProofInput) proof() HighRiskProof {
-	return HighRiskProof{ChallengeID: input.ChallengeID, Evidence: input.Evidence, Confirmed: input.Confirmed}
+func validateReauthenticationProofInput(input reauthenticationProofInput) (HighRiskProof, error) {
+	challengeID, err := uuid.Parse(input.ChallengeID)
+	if err != nil || challengeID == uuid.Nil || challengeID.String() != input.ChallengeID || !input.Confirmed || !validReauthenticationEvidenceInput(input.Evidence) {
+		return HighRiskProof{}, ErrHighRiskProofInputInvalid
+	}
+	return HighRiskProof{ChallengeID: input.ChallengeID, Evidence: input.Evidence, Confirmed: true}, nil
+}
+
+func validReauthenticationEvidenceInput(evidence string) bool {
+	if len(evidence) != len(reauthenticationEvidencePrefix)+43 || !strings.HasPrefix(evidence, reauthenticationEvidencePrefix) {
+		return false
+	}
+	for _, character := range evidence[len(reauthenticationEvidencePrefix):] {
+		if (character < 'A' || character > 'Z') && (character < 'a' || character > 'z') &&
+			(character < '0' || character > '9') && character != '_' && character != '-' {
+			return false
+		}
+	}
+	return true
 }
 
 func createLocalUserHandler(application IAMApplication) http.HandlerFunc {
@@ -527,13 +549,18 @@ func createOrganizationMembershipHandler(application IAMApplication) http.Handle
 			writeIAMProblem(writer, request, http.StatusBadRequest, "REQUEST_BODY_INVALID", "Request body is invalid", err)
 			return
 		}
+		proof, err := validateReauthenticationProofInput(body.Reauthentication)
+		if err != nil {
+			writeIAMApplicationError(writer, request, err)
+			return
+		}
 		if _, valid := canonicalOrganizationMembershipReason(body.Reason); !valid {
 			writeIAMApplicationError(writer, request, ErrOrganizationMembershipInvalid)
 			return
 		}
 		membership, err := application.CreateOrganizationMembership(request.Context(), principal, organizationID, CreateOrganizationMembershipCommand{
 			OrganizationVersion: body.OrganizationVersion, UserID: body.UserID, UserVersion: body.UserVersion, Reason: body.Reason,
-		}, body.Reauthentication.proof(), iamRequestContext(request))
+		}, proof, iamRequestContext(request))
 		if err != nil {
 			writeIAMApplicationError(writer, request, err)
 			return
@@ -569,13 +596,18 @@ func deleteOrganizationMembershipHandler(application IAMApplication) http.Handle
 			writeIAMProblem(writer, request, http.StatusBadRequest, "REQUEST_BODY_INVALID", "Request body is invalid", err)
 			return
 		}
+		proof, err := validateReauthenticationProofInput(body.Reauthentication)
+		if err != nil {
+			writeIAMApplicationError(writer, request, err)
+			return
+		}
 		if _, valid := canonicalOrganizationMembershipReason(body.Reason); !valid {
 			writeIAMApplicationError(writer, request, ErrOrganizationMembershipInvalid)
 			return
 		}
-		err := application.DeleteOrganizationMembership(request.Context(), principal, organizationID, userID, DeleteOrganizationMembershipCommand{
+		err = application.DeleteOrganizationMembership(request.Context(), principal, organizationID, userID, DeleteOrganizationMembershipCommand{
 			OrganizationVersion: body.OrganizationVersion, UserVersion: body.UserVersion, MembershipVersion: body.MembershipVersion, Reason: body.Reason,
-		}, body.Reauthentication.proof(), iamRequestContext(request))
+		}, proof, iamRequestContext(request))
 		if err != nil {
 			writeIAMApplicationError(writer, request, err)
 			return
@@ -603,7 +635,7 @@ func parseOrganizationMembershipPage(request *http.Request) (Page, error) {
 		}
 		page.Limit = limit
 	}
-	if cursor := strings.TrimSpace(request.URL.Query().Get("cursor")); cursor != "" {
+	if cursor := request.URL.Query().Get("cursor"); cursor != "" {
 		createdAt, userID, sourceOwned, err := decodeOrganizationMembershipCursor(cursor)
 		if err != nil {
 			return Page{}, err
@@ -661,11 +693,16 @@ func createRoleBindingHandler(application IAMApplication) http.HandlerFunc {
 			writeIAMProblem(writer, request, http.StatusBadRequest, "REQUEST_BODY_INVALID", "Request body is invalid", err)
 			return
 		}
+		proof, err := validateReauthenticationProofInput(body.Reauthentication)
+		if err != nil {
+			writeIAMApplicationError(writer, request, err)
+			return
+		}
 		binding, err := application.CreateRoleBinding(request.Context(), principal, CreateRoleBindingCommand{
 			SubjectType: body.SubjectType, SubjectID: body.SubjectID, SubjectVersion: body.SubjectVersion, Role: body.Role,
 			ScopeType: body.ScopeType, ProductID: body.ProductID, ChannelName: body.ChannelName, Effect: body.Effect,
 			ValidFrom: body.ValidFrom, ValidUntil: body.ValidUntil,
-		}, body.Reauthentication.proof(), iamRequestContext(request))
+		}, proof, iamRequestContext(request))
 		if err != nil {
 			writeIAMApplicationError(writer, request, err)
 			return
@@ -695,7 +732,12 @@ func deleteRoleBindingHandler(application IAMApplication) http.HandlerFunc {
 			writeIAMProblem(writer, request, http.StatusBadRequest, "REQUEST_BODY_INVALID", "Request body is invalid", err)
 			return
 		}
-		if err := application.DeleteRoleBinding(request.Context(), principal, bindingID, body.Version, body.Reauthentication.proof(), iamRequestContext(request)); err != nil {
+		proof, err := validateReauthenticationProofInput(body.Reauthentication)
+		if err != nil {
+			writeIAMApplicationError(writer, request, err)
+			return
+		}
+		if err := application.DeleteRoleBinding(request.Context(), principal, bindingID, body.Version, proof, iamRequestContext(request)); err != nil {
 			writeIAMApplicationError(writer, request, err)
 			return
 		}
@@ -724,7 +766,12 @@ func userLifecycleHandler(application IAMApplication, action string) http.Handle
 			writeIAMProblem(writer, request, http.StatusBadRequest, "REQUEST_BODY_INVALID", "Request body is invalid", err)
 			return
 		}
-		proof, requestContext := body.Reauthentication.proof(), iamRequestContext(request)
+		proof, err := validateReauthenticationProofInput(body.Reauthentication)
+		if err != nil {
+			writeIAMApplicationError(writer, request, err)
+			return
+		}
+		requestContext := iamRequestContext(request)
 		switch action {
 		case "disable":
 			err = application.DisableUser(request.Context(), principal, userID, body.Version, body.Reason, proof, requestContext)
@@ -763,10 +810,15 @@ func identitySourceLifecycleHandler(application IAMApplication, enable bool) htt
 			writeIAMProblem(writer, request, http.StatusBadRequest, "REQUEST_BODY_INVALID", "Request body is invalid", err)
 			return
 		}
+		proof, err := validateReauthenticationProofInput(body.Reauthentication)
+		if err != nil {
+			writeIAMApplicationError(writer, request, err)
+			return
+		}
 		if enable {
-			err = application.EnableSSO(request.Context(), principal, sourceID, body.Version, body.Reauthentication.proof(), iamRequestContext(request))
+			err = application.EnableSSO(request.Context(), principal, sourceID, body.Version, proof, iamRequestContext(request))
 		} else {
-			err = application.DisableSSO(request.Context(), principal, sourceID, body.Version, body.Reauthentication.proof(), iamRequestContext(request))
+			err = application.DisableSSO(request.Context(), principal, sourceID, body.Version, proof, iamRequestContext(request))
 		}
 		if err != nil {
 			writeIAMApplicationError(writer, request, err)
@@ -867,7 +919,7 @@ func parseIAMPage(request *http.Request) (Page, error) {
 		}
 		page.Limit = limit
 	}
-	if cursor := strings.TrimSpace(request.URL.Query().Get("cursor")); cursor != "" {
+	if cursor := request.URL.Query().Get("cursor"); cursor != "" {
 		createdAt, id, err := decodeIAMCursor(cursor)
 		if err != nil {
 			return Page{}, err
@@ -906,7 +958,7 @@ func iamRequestContext(request *http.Request) RequestContext {
 
 func writeIAMApplicationError(writer http.ResponseWriter, request *http.Request, err error) {
 	switch {
-	case errors.Is(err, ErrUserInputInvalid), errors.Is(err, ErrPageInvalid), errors.Is(err, ErrRoleBindingInvalid), errors.Is(err, ErrIdentitySourceInputInvalid),
+	case errors.Is(err, ErrUserInputInvalid), errors.Is(err, ErrPageInvalid), errors.Is(err, ErrRoleBindingInvalid), errors.Is(err, ErrIdentitySourceInputInvalid), errors.Is(err, ErrHighRiskProofInputInvalid),
 		errors.Is(err, ErrOrganizationMembershipInvalid), errors.Is(err, ErrDisableReasonRequired), errors.Is(err, ErrEnableReasonRequired), errors.Is(err, ErrRevokeReasonRequired):
 		writeIAMProblem(writer, request, http.StatusBadRequest, "IAM_INPUT_INVALID", "Identity request is invalid", err)
 	case errors.Is(err, identity.ErrActionDenied):

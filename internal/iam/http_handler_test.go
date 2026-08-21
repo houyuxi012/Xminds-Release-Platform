@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"testing"
@@ -215,7 +216,7 @@ func TestHTTPHandlerExposesOrganizationDetailChildrenAndMembershipLifecycle(t *t
 		}
 	}
 
-	postBody := `{"organization_version":4,"user_id":"` + userID.String() + `","user_version":3,"reason":"approved supplemental access","reauthentication":{"challenge_id":"challenge","evidence":"evidence","confirmed":true}}`
+	postBody := `{"organization_version":4,"user_id":"` + userID.String() + `","user_version":3,"reason":"approved supplemental access","reauthentication":{"challenge_id":"018f835d-7e4b-7abc-9f42-67a2f5f48e74","evidence":"xmr_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ","confirmed":true}}`
 	postRequest := httptest.NewRequest(http.MethodPost, "/api/v1/organizations/"+organizationID.String()+"/memberships", strings.NewReader(postBody))
 	postRequest.Header.Set("Authorization", "Bearer token")
 	postRequest.Header.Set("Content-Type", "application/json")
@@ -225,7 +226,7 @@ func TestHTTPHandlerExposesOrganizationDetailChildrenAndMembershipLifecycle(t *t
 		t.Fatalf("POST membership status=%d location=%q command=%+v body=%s", postResponse.Code, postResponse.Header().Get("Location"), application.membershipCreateCommand, postResponse.Body)
 	}
 
-	deleteBody := `{"organization_version":5,"user_version":3,"membership_version":1,"reason":"remove obsolete supplemental access","reauthentication":{"challenge_id":"challenge","evidence":"evidence","confirmed":true}}`
+	deleteBody := `{"organization_version":5,"user_version":3,"membership_version":1,"reason":"remove obsolete supplemental access","reauthentication":{"challenge_id":"018f835d-7e4b-7abc-9f42-67a2f5f48e74","evidence":"xmr_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ","confirmed":true}}`
 	deleteRequest := httptest.NewRequest(http.MethodDelete, "/api/v1/organizations/"+organizationID.String()+"/memberships/"+userID.String(), strings.NewReader(deleteBody))
 	deleteRequest.Header.Set("Authorization", "Bearer token")
 	deleteRequest.Header.Set("Content-Type", "application/json")
@@ -241,7 +242,7 @@ func TestOrganizationMembershipHTTPRejectsUnknownFieldsAndTemplatesProblemInstan
 	organizationID, userID := uuid.New(), uuid.New()
 	application := &stubIAMApplication{membershipError: ErrOrganizationMembershipNotFound}
 	handler := authenticatedIAMHandler(application)
-	request := httptest.NewRequest(http.MethodPost, "/api/v1/organizations/"+organizationID.String()+"/memberships", strings.NewReader(`{"organization_version":1,"user_id":"`+userID.String()+`","user_version":1,"reason":"approved supplemental access","reauthentication":{"challenge_id":"challenge","evidence":"evidence","confirmed":true},"unexpected":true}`))
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/organizations/"+organizationID.String()+"/memberships", strings.NewReader(`{"organization_version":1,"user_id":"`+userID.String()+`","user_version":1,"reason":"approved supplemental access","reauthentication":{"challenge_id":"018f835d-7e4b-7abc-9f42-67a2f5f48e74","evidence":"xmr_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ","confirmed":true},"unexpected":true}`))
 	request.Header.Set("Authorization", "Bearer token")
 	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
@@ -249,7 +250,7 @@ func TestOrganizationMembershipHTTPRejectsUnknownFieldsAndTemplatesProblemInstan
 	if response.Code != http.StatusBadRequest || application.membershipCreateCalls != 0 {
 		t.Fatalf("unknown field status=%d calls=%d body=%s", response.Code, application.membershipCreateCalls, response.Body)
 	}
-	whitespaceRequest := httptest.NewRequest(http.MethodPost, "/api/v1/organizations/"+organizationID.String()+"/memberships", strings.NewReader(`{"organization_version":1,"user_id":"`+userID.String()+`","user_version":1,"reason":" approved supplemental access ","reauthentication":{"challenge_id":"challenge","evidence":"evidence","confirmed":true}}`))
+	whitespaceRequest := httptest.NewRequest(http.MethodPost, "/api/v1/organizations/"+organizationID.String()+"/memberships", strings.NewReader(`{"organization_version":1,"user_id":"`+userID.String()+`","user_version":1,"reason":" approved supplemental access ","reauthentication":{"challenge_id":"018f835d-7e4b-7abc-9f42-67a2f5f48e74","evidence":"xmr_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ","confirmed":true}}`))
 	whitespaceRequest.Header.Set("Authorization", "Bearer token")
 	whitespaceRequest.Header.Set("Content-Type", "application/json")
 	whitespaceResponse := httptest.NewRecorder()
@@ -258,7 +259,7 @@ func TestOrganizationMembershipHTTPRejectsUnknownFieldsAndTemplatesProblemInstan
 		t.Fatalf("non-canonical reason status=%d calls=%d body=%s", whitespaceResponse.Code, application.membershipCreateCalls, whitespaceResponse.Body)
 	}
 
-	deleteRequest := httptest.NewRequest(http.MethodDelete, "/api/v1/organizations/"+organizationID.String()+"/memberships/"+userID.String(), strings.NewReader(`{"organization_version":1,"user_version":1,"membership_version":1,"reason":"remove obsolete supplemental access","reauthentication":{"challenge_id":"challenge","evidence":"evidence","confirmed":true}}`))
+	deleteRequest := httptest.NewRequest(http.MethodDelete, "/api/v1/organizations/"+organizationID.String()+"/memberships/"+userID.String(), strings.NewReader(`{"organization_version":1,"user_version":1,"membership_version":1,"reason":"remove obsolete supplemental access","reauthentication":{"challenge_id":"018f835d-7e4b-7abc-9f42-67a2f5f48e74","evidence":"xmr_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ","confirmed":true}}`))
 	deleteRequest.Header.Set("Authorization", "Bearer token")
 	deleteRequest.Header.Set("Content-Type", "application/json")
 	deleteResponse := httptest.NewRecorder()
@@ -280,6 +281,28 @@ func TestOrganizationMembershipHTTPParsesOwnershipAwareCursor(t *testing.T) {
 	handler.ServeHTTP(response, request)
 	if response.Code != http.StatusOK || application.membershipPageRequest.BeforeSourceOwned == nil || !*application.membershipPageRequest.BeforeSourceOwned || application.membershipPageRequest.BeforeID != userID || !application.membershipPageRequest.BeforeTime.Equal(createdAt) {
 		t.Fatalf("ownership cursor status=%d page=%+v body=%s", response.Code, application.membershipPageRequest, response.Body)
+	}
+}
+
+// Mutation caught: trimming or decoding before validating the public cursor
+// envelope lets oversized/non-canonical values reach the application.
+func TestOrganizationMembershipHTTPRejectsOversizedAndNonCanonicalCursorBeforeApplication(t *testing.T) {
+	organizationID := uuid.New()
+	for _, cursor := range []string{
+		canonicalOrganizationMembershipCursor + strings.Repeat(" ", 513-len(canonicalOrganizationMembershipCursor)),
+		canonicalOrganizationMembershipCursor + strings.Repeat(" ", 4096-len(canonicalOrganizationMembershipCursor)),
+		canonicalOrganizationMembershipCursor[:len(canonicalOrganizationMembershipCursor)-1] + "R",
+	} {
+		application := &stubIAMApplication{}
+		request := httptest.NewRequest(http.MethodGet, "/api/v1/organizations/"+organizationID.String()+"/memberships?cursor="+url.QueryEscape(cursor), nil)
+		request.Header.Set("Authorization", "Bearer token")
+		response := httptest.NewRecorder()
+
+		authenticatedIAMHandler(application).ServeHTTP(response, request)
+
+		if response.Code != http.StatusBadRequest || application.membershipListCalls != 0 {
+			t.Fatalf("cursor_length=%d status=%d application_calls=%d body=%s", len(cursor), response.Code, application.membershipListCalls, response.Body)
+		}
 	}
 }
 
@@ -368,7 +391,7 @@ func TestHTTPHandlerCreatesOrganizationAndMountsGovernedRoleBindingWrites(t *tes
 	writeRequest := httptest.NewRequest(http.MethodPost, "/api/v1/role-bindings", bytes.NewBufferString(`{
         "subject_type":"user","subject_id":"018f835d-7e4b-7abc-9f42-67a2f5f48e73","subject_version":4,
         "role":"auditor","scope_type":"platform","effect":"allow",
-        "reauth":{"challenge_id":"018f835d-7e4b-7abc-9f42-67a2f5f48e74","evidence":"opaque-once","confirmed":true}
+        "reauth":{"challenge_id":"018f835d-7e4b-7abc-9f42-67a2f5f48e74","evidence":"xmr_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ","confirmed":true}
     }`))
 	writeRequest.Header.Set("Authorization", "Bearer token")
 	writeRequest.Header.Set("Content-Type", "application/json")
@@ -386,12 +409,12 @@ func TestHTTPHandlerMountsAllGovernedIAMWritesWithStrictVersionsAndProofs(t *tes
 		name, method, path, body, action string
 		status                           int
 	}{
-		{name: "delete binding", method: http.MethodDelete, path: "/api/v1/role-bindings/018f835d-7e4b-7abc-9f42-67a2f5f48e75", body: `{"version":7,"reauth":{"challenge_id":"018f835d-7e4b-7abc-9f42-67a2f5f48e74","evidence":"opaque-once","confirmed":true}}`, action: "role_binding.delete", status: http.StatusNoContent},
-		{name: "disable user", method: http.MethodPost, path: "/api/v1/users/018f835d-7e4b-7abc-9f42-67a2f5f48e76/disable", body: `{"version":8,"reason":"incident","reauth":{"challenge_id":"018f835d-7e4b-7abc-9f42-67a2f5f48e74","evidence":"opaque-once","confirmed":true}}`, action: "user.disable", status: http.StatusNoContent},
-		{name: "enable user", method: http.MethodPost, path: "/api/v1/users/018f835d-7e4b-7abc-9f42-67a2f5f48e76/enable", body: `{"version":9,"reason":"incident closed","reauth":{"challenge_id":"018f835d-7e4b-7abc-9f42-67a2f5f48e74","evidence":"opaque-once","confirmed":true}}`, action: "user.enable", status: http.StatusNoContent},
-		{name: "revoke sessions", method: http.MethodPost, path: "/api/v1/users/018f835d-7e4b-7abc-9f42-67a2f5f48e76/revoke-sessions", body: `{"version":10,"reason":"rotation","reauth":{"challenge_id":"018f835d-7e4b-7abc-9f42-67a2f5f48e74","evidence":"opaque-once","confirmed":true}}`, action: "user.revoke_sessions", status: http.StatusNoContent},
-		{name: "enable sso", method: http.MethodPost, path: "/api/v1/identity-sources/018f835d-7e4b-7abc-9f42-67a2f5f48e77/enable", body: `{"version":11,"reauth":{"challenge_id":"018f835d-7e4b-7abc-9f42-67a2f5f48e74","evidence":"opaque-once","confirmed":true}}`, action: "sso.enable", status: http.StatusNoContent},
-		{name: "disable sso", method: http.MethodPost, path: "/api/v1/identity-sources/018f835d-7e4b-7abc-9f42-67a2f5f48e77/disable", body: `{"version":12,"reauth":{"challenge_id":"018f835d-7e4b-7abc-9f42-67a2f5f48e74","evidence":"opaque-once","confirmed":true}}`, action: "sso.disable", status: http.StatusNoContent},
+		{name: "delete binding", method: http.MethodDelete, path: "/api/v1/role-bindings/018f835d-7e4b-7abc-9f42-67a2f5f48e75", body: `{"version":7,"reauth":{"challenge_id":"018f835d-7e4b-7abc-9f42-67a2f5f48e74","evidence":"xmr_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ","confirmed":true}}`, action: "role_binding.delete", status: http.StatusNoContent},
+		{name: "disable user", method: http.MethodPost, path: "/api/v1/users/018f835d-7e4b-7abc-9f42-67a2f5f48e76/disable", body: `{"version":8,"reason":"incident","reauth":{"challenge_id":"018f835d-7e4b-7abc-9f42-67a2f5f48e74","evidence":"xmr_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ","confirmed":true}}`, action: "user.disable", status: http.StatusNoContent},
+		{name: "enable user", method: http.MethodPost, path: "/api/v1/users/018f835d-7e4b-7abc-9f42-67a2f5f48e76/enable", body: `{"version":9,"reason":"incident closed","reauth":{"challenge_id":"018f835d-7e4b-7abc-9f42-67a2f5f48e74","evidence":"xmr_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ","confirmed":true}}`, action: "user.enable", status: http.StatusNoContent},
+		{name: "revoke sessions", method: http.MethodPost, path: "/api/v1/users/018f835d-7e4b-7abc-9f42-67a2f5f48e76/revoke-sessions", body: `{"version":10,"reason":"rotation","reauth":{"challenge_id":"018f835d-7e4b-7abc-9f42-67a2f5f48e74","evidence":"xmr_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ","confirmed":true}}`, action: "user.revoke_sessions", status: http.StatusNoContent},
+		{name: "enable sso", method: http.MethodPost, path: "/api/v1/identity-sources/018f835d-7e4b-7abc-9f42-67a2f5f48e77/enable", body: `{"version":11,"reauth":{"challenge_id":"018f835d-7e4b-7abc-9f42-67a2f5f48e74","evidence":"xmr_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ","confirmed":true}}`, action: "sso.enable", status: http.StatusNoContent},
+		{name: "disable sso", method: http.MethodPost, path: "/api/v1/identity-sources/018f835d-7e4b-7abc-9f42-67a2f5f48e77/disable", body: `{"version":12,"reauth":{"challenge_id":"018f835d-7e4b-7abc-9f42-67a2f5f48e74","evidence":"xmr_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ","confirmed":true}}`, action: "sso.disable", status: http.StatusNoContent},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			application.highRiskAction = ""
@@ -405,6 +428,58 @@ func TestHTTPHandlerMountsAllGovernedIAMWritesWithStrictVersionsAndProofs(t *tes
 			}
 		})
 	}
+}
+
+// Mutation caught: forwarding a malformed proof to any high-risk IAM
+// application method would let transport-invalid input reach resource and
+// version lookups before returning a stable 400 response.
+func TestIAMHighRiskHTTPRejectsMalformedProofBeforeApplication(t *testing.T) {
+	organizationID, userID := uuid.New(), uuid.New()
+	validEvidence := "xmr_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ"
+	for _, endpoint := range []struct {
+		name, method, path, body string
+		calls                    func(*stubIAMApplication) int
+	}{
+		{name: "create membership", method: http.MethodPost, path: "/api/v1/organizations/" + organizationID.String() + "/memberships", body: `{"organization_version":1,"user_id":"` + userID.String() + `","user_version":1,"reason":"approved supplemental access","reauthentication":PROOF}`, calls: func(application *stubIAMApplication) int { return application.membershipCreateCalls }},
+		{name: "delete membership", method: http.MethodDelete, path: "/api/v1/organizations/" + organizationID.String() + "/memberships/" + userID.String(), body: `{"organization_version":1,"user_version":1,"membership_version":1,"reason":"remove obsolete supplemental access","reauthentication":PROOF}`, calls: func(application *stubIAMApplication) int { return application.membershipDeleteCalls }},
+		{name: "create role binding", method: http.MethodPost, path: "/api/v1/role-bindings", body: `{"subject_type":"user","subject_id":"` + userID.String() + `","subject_version":1,"role":"viewer","scope_type":"platform","effect":"allow","reauth":PROOF}`, calls: func(application *stubIAMApplication) int { return boolCount(application.highRiskAction != "") }},
+		{name: "delete role binding", method: http.MethodDelete, path: "/api/v1/role-bindings/" + uuid.NewString(), body: `{"version":1,"reauth":PROOF}`, calls: func(application *stubIAMApplication) int { return boolCount(application.highRiskAction != "") }},
+		{name: "disable user", method: http.MethodPost, path: "/api/v1/users/" + userID.String() + "/disable", body: `{"version":1,"reason":"incident response","reauth":PROOF}`, calls: func(application *stubIAMApplication) int { return boolCount(application.highRiskAction != "") }},
+		{name: "enable user", method: http.MethodPost, path: "/api/v1/users/" + userID.String() + "/enable", body: `{"version":1,"reason":"incident resolved","reauth":PROOF}`, calls: func(application *stubIAMApplication) int { return boolCount(application.highRiskAction != "") }},
+		{name: "revoke sessions", method: http.MethodPost, path: "/api/v1/users/" + userID.String() + "/revoke-sessions", body: `{"version":1,"reason":"credential rotation","reauth":PROOF}`, calls: func(application *stubIAMApplication) int { return boolCount(application.highRiskAction != "") }},
+		{name: "enable sso", method: http.MethodPost, path: "/api/v1/identity-sources/" + uuid.NewString() + "/enable", body: `{"version":1,"reauth":PROOF}`, calls: func(application *stubIAMApplication) int { return boolCount(application.highRiskAction != "") }},
+		{name: "disable sso", method: http.MethodPost, path: "/api/v1/identity-sources/" + uuid.NewString() + "/disable", body: `{"version":1,"reauth":PROOF}`, calls: func(application *stubIAMApplication) int { return boolCount(application.highRiskAction != "") }},
+	} {
+		for _, proof := range []struct {
+			name, json string
+		}{
+			{name: "missing", json: `{}`},
+			{name: "invalid challenge", json: `{"challenge_id":"not-a-uuid","evidence":"` + validEvidence + `","confirmed":true}`},
+			{name: "invalid evidence", json: `{"challenge_id":"` + uuid.NewString() + `","evidence":"xmr_too-short","confirmed":true}`},
+			{name: "unconfirmed", json: `{"challenge_id":"` + uuid.NewString() + `","evidence":"` + validEvidence + `","confirmed":false}`},
+		} {
+			t.Run(endpoint.name+"/"+proof.name, func(t *testing.T) {
+				application := &stubIAMApplication{}
+				request := httptest.NewRequest(endpoint.method, endpoint.path, strings.NewReader(strings.Replace(endpoint.body, "PROOF", proof.json, 1)))
+				request.Header.Set("Authorization", "Bearer token")
+				request.Header.Set("Content-Type", "application/json")
+				response := httptest.NewRecorder()
+
+				authenticatedIAMHandler(application).ServeHTTP(response, request)
+
+				if response.Code != http.StatusBadRequest || endpoint.calls(application) != 0 {
+					t.Fatalf("status=%d application_calls=%d body=%s", response.Code, endpoint.calls(application), response.Body)
+				}
+			})
+		}
+	}
+}
+
+func boolCount(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 func TestReauthenticationHTTPReturnsEvidenceOnlyFromSuccessfulCompletion(t *testing.T) {
@@ -536,7 +611,9 @@ type stubIAMApplication struct {
 	membershipCreateCommand    CreateOrganizationMembershipCommand
 	membershipDeleteCommand    DeleteOrganizationMembershipCommand
 	membershipPageRequest      Page
+	membershipListCalls        int
 	membershipCreateCalls      int
+	membershipDeleteCalls      int
 	membershipError            error
 	organizationCommand        CreateOrganizationCommand
 	identitySource             IdentitySource
@@ -556,6 +633,7 @@ func (application *stubIAMApplication) ListOrganizationChildren(context.Context,
 }
 
 func (application *stubIAMApplication) ListOrganizationMemberships(_ context.Context, _ identity.Principal, _ uuid.UUID, page Page) (OrganizationMembershipPage, error) {
+	application.membershipListCalls++
 	application.membershipPageRequest = page
 	return application.organizationMembershipPage, application.membershipError
 }
@@ -567,6 +645,7 @@ func (application *stubIAMApplication) CreateOrganizationMembership(_ context.Co
 }
 
 func (application *stubIAMApplication) DeleteOrganizationMembership(_ context.Context, _ identity.Principal, _, _ uuid.UUID, command DeleteOrganizationMembershipCommand, _ HighRiskProof, _ RequestContext) error {
+	application.membershipDeleteCalls++
 	application.membershipDeleteCommand = command
 	return application.membershipError
 }

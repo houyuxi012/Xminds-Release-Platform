@@ -175,6 +175,36 @@ func TestDirectoryConflictResolutionHTTPIsStrictNoStoreAndDoesNotEchoSensitiveIn
 	}
 }
 
+// Mutation caught: resolving a directory conflict with a malformed proof must
+// not enter conflict ownership/version validation in the application layer.
+func TestDirectoryConflictResolutionHTTPRejectsMalformedProofBeforeApplication(t *testing.T) {
+	sourceID, conflictID := uuid.New(), uuid.New()
+	validEvidence := "xmr_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ"
+	for _, proof := range []struct {
+		name, json string
+	}{
+		{name: "missing", json: `{}`},
+		{name: "invalid challenge", json: `{"challenge_id":"not-a-uuid","evidence":"` + validEvidence + `","confirmed":true}`},
+		{name: "invalid evidence", json: `{"challenge_id":"` + uuid.NewString() + `","evidence":"xmr_too-short","confirmed":true}`},
+		{name: "unconfirmed", json: `{"challenge_id":"` + uuid.NewString() + `","evidence":"` + validEvidence + `","confirmed":false}`},
+	} {
+		t.Run(proof.name, func(t *testing.T) {
+			application := &directoryHTTPApplication{stubIAMApplication: &stubIAMApplication{}}
+			body := `{"version":1,"decision":"keep_last_safe","reason":"confirmed upstream collision","reauthentication":` + proof.json + `}`
+			request := httptest.NewRequest(http.MethodPost, "/api/v1/identity-sources/"+sourceID.String()+"/sync-conflicts/"+conflictID.String()+"/resolve", strings.NewReader(body))
+			request.Header.Set("Authorization", "Bearer token")
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+
+			authenticatedIAMHandler(application).ServeHTTP(response, request)
+
+			if response.Code != http.StatusBadRequest || application.resolveCommand.Version != 0 {
+				t.Fatalf("status=%d command=%#v body=%s", response.Code, application.resolveCommand, response.Body)
+			}
+		})
+	}
+}
+
 func TestDirectoryConflictResolutionHTTPAbsentAndCrossSourceResponsesAreExactlyEquivalent(t *testing.T) {
 	sourceID, conflictID := uuid.New(), uuid.New()
 	path := "/api/v1/identity-sources/" + sourceID.String() + "/sync-conflicts/" + conflictID.String() + "/resolve"

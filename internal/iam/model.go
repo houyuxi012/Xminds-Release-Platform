@@ -97,6 +97,7 @@ var (
 	ErrLocalLoginDisabled             = errors.New("regular local login is disabled")
 	ErrLastEmergencyAdministrator     = errors.New("last usable emergency administrator cannot be disabled")
 	ErrHighRiskConfirmationRequired   = errors.New("fresh reauthentication and explicit confirmation are required")
+	ErrHighRiskProofInputInvalid      = errors.New("reauthentication proof input is invalid")
 	ErrIdentitySourceNotFound         = errors.New("identity source was not found")
 	ErrUserNotFound                   = errors.New("user was not found")
 	ErrUserAlreadyDisabled            = errors.New("user is already disabled")
