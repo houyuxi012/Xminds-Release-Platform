@@ -175,6 +175,41 @@ func TestDirectoryConflictResolutionHTTPIsStrictNoStoreAndDoesNotEchoSensitiveIn
 	}
 }
 
+func TestDirectoryConflictResolutionHTTPAbsentAndCrossSourceResponsesAreExactlyEquivalent(t *testing.T) {
+	sourceID, conflictID := uuid.New(), uuid.New()
+	path := "/api/v1/identity-sources/" + sourceID.String() + "/sync-conflicts/" + conflictID.String() + "/resolve"
+	body := `{"version":1,"decision":"keep_last_safe","reason":"confirmed upstream collision","reauthentication":{"challenge_id":"` + uuid.NewString() + `","evidence":"xmr_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ","confirmed":true}}`
+	var canonical string
+	for _, testCase := range []struct {
+		name string
+		err  error
+	}{
+		{name: "source absent", err: ErrIdentitySourceNotFound},
+		{name: "conflict absent", err: ErrDirectoryConflictNotFound},
+		{name: "cross source", err: ErrDirectoryConflictNotFound},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			application := &directoryHTTPApplication{stubIAMApplication: &stubIAMApplication{}, resolveError: testCase.err}
+			handler := authenticatedIAMHandler(application)
+			request := httptest.NewRequest(http.MethodPost, path, bytes.NewBufferString(body))
+			request.Header.Set("Authorization", "Bearer token")
+			request.Header.Set("Content-Type", "application/json")
+			request = request.WithContext(httpx.WithRequestID(request.Context(), "018f835d-7e4b-7abc-9f42-67a2f5f49999"))
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != http.StatusNotFound {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body)
+			}
+			if canonical == "" {
+				canonical = response.Body.String()
+			}
+			if response.Body.String() != canonical {
+				t.Fatalf("response differs from invisible canonical\ncanonical=%s\nactual=%s", canonical, response.Body)
+			}
+		})
+	}
+}
+
 func TestIAMProblemInstanceTemplatesDirectorySourceJobAndConflictIdentifiers(t *testing.T) {
 	sourceID, jobID, conflictID := uuid.NewString(), uuid.NewString(), uuid.NewString()
 	for raw, want := range map[string]string{
@@ -208,6 +243,7 @@ type directoryHTTPApplication struct {
 	resolvedConflict DirectorySyncConflict
 	resolveCommand   ResolveDirectorySyncConflictCommand
 	resolveProof     HighRiskProof
+	resolveError     error
 }
 
 func (application *directoryHTTPApplication) VerifyIdentitySourceVersioned(_ context.Context, _ identity.Principal, sourceID uuid.UUID, version int64, _ RequestContext) (CapabilityReport, error) {
@@ -232,5 +268,5 @@ func (application *directoryHTTPApplication) ListDirectorySyncConflicts(_ contex
 
 func (application *directoryHTTPApplication) ResolveDirectorySyncConflict(_ context.Context, _ identity.Principal, _, _ uuid.UUID, command ResolveDirectorySyncConflictCommand, proof HighRiskProof, _ RequestContext) (DirectorySyncConflict, error) {
 	application.resolveCommand, application.resolveProof = command, proof
-	return application.resolvedConflict, nil
+	return application.resolvedConflict, application.resolveError
 }

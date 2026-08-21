@@ -21,9 +21,12 @@ ALTER TABLE directory_sync_conflicts
         OR
         (
             status = 'resolved'
+            AND resolution_decision IS NOT NULL
             AND resolution_decision = 'keep_last_safe'
+            AND resolution_reason IS NOT NULL
             AND char_length(resolution_reason) BETWEEN 8 AND 512
             AND resolution_reason = btrim(resolution_reason)
+            AND resolved_by IS NOT NULL
             AND resolved_by ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
             AND resolved_at IS NOT NULL
         )

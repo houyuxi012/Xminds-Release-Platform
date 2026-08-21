@@ -354,13 +354,17 @@ func TestOpenAPIDefinesDirectoryConflictResolutionAndStatusBoundPagination(t *te
 		}
 	}
 	request := document.Components.Schemas["ResolveDirectorySyncConflictRequest"]
-	if request == nil || request.Value == nil || request.Value.AdditionalProperties.Has != nil && *request.Value.AdditionalProperties.Has {
+	if request == nil || request.Value == nil || request.Value.AdditionalProperties.Has == nil || *request.Value.AdditionalProperties.Has {
 		t.Fatal("strict directory conflict resolution request schema is missing")
 	}
 	for _, field := range []string{"version", "decision", "reason", "reauthentication"} {
 		if _, found := request.Value.Properties[field]; !found {
 			t.Fatalf("ResolveDirectorySyncConflictRequest.%s is missing", field)
 		}
+	}
+	reauthentication := request.Value.Properties["reauthentication"]
+	if reauthentication == nil || reauthentication.Value == nil || reauthentication.Value.AdditionalProperties.Has == nil || *reauthentication.Value.AdditionalProperties.Has {
+		t.Fatal("strict nested reauthentication schema is missing explicit additionalProperties: false")
 	}
 	conflict := document.Components.Schemas["DirectorySyncConflict"]
 	if conflict == nil || conflict.Value == nil {

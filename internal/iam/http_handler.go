@@ -719,6 +719,8 @@ func writeIAMApplicationError(writer http.ResponseWriter, request *http.Request,
 		writeIAMProblem(writer, request, http.StatusNotFound, "ORGANIZATION_NOT_FOUND", "Organization was not found", err)
 	case errors.Is(err, ErrRoleBindingNotFound):
 		writeIAMProblem(writer, request, http.StatusNotFound, "ROLE_BINDING_NOT_FOUND", "Role binding was not found", err)
+	case errors.Is(err, ErrIdentitySourceNotFound) && iamProblemInstance(request.URL.Path) == "/api/v1/identity-sources/{source_id}/sync-conflicts/{conflict_id}/resolve":
+		writeIAMProblem(writer, request, http.StatusNotFound, "DIRECTORY_SYNC_CONFLICT_NOT_FOUND", "Directory synchronization conflict was not found", ErrDirectoryConflictNotFound)
 	case errors.Is(err, ErrIdentitySourceNotFound):
 		writeIAMProblem(writer, request, http.StatusNotFound, "IDENTITY_SOURCE_NOT_FOUND", "Identity source was not found", err)
 	case errors.Is(err, ErrDirectoryConflictNotFound):

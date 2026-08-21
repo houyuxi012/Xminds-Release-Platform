@@ -316,6 +316,9 @@ func (service *DirectorySyncService) ResolveConflict(ctx context.Context, actor 
 		return DirectorySyncConflict{}, identity.ErrActionDenied
 	}
 	if _, err := service.store.GetIdentitySource(ctx, nil, sourceID); err != nil {
+		if errors.Is(err, ErrIdentitySourceNotFound) {
+			return DirectorySyncConflict{}, ErrDirectoryConflictNotFound
+		}
 		return DirectorySyncConflict{}, err
 	}
 	preflight, jobStatus, err := service.store.GetDirectorySyncConflict(ctx, sourceID, conflictID)

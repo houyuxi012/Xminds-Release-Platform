@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io/fs"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"xminds-release-platform/internal/audit"
@@ -92,6 +94,31 @@ func TestDirectoryConflictResolutionMigrationV16UpgradeRollbackAndReapply(t *tes
 		'confirmed migration reason',$4,$5,2,$5)`, resolvedConflictID, jobID, sourceID, uuid.NewString(), now); err != nil {
 		t.Fatalf("insert resolved v17 conflict: %v", err)
 	}
+	for _, testCase := range []struct {
+		name                         string
+		decision, reason, resolvedBy any
+	}{
+		{name: "null decision", decision: nil, reason: "confirmed migration reason", resolvedBy: uuid.NewString()},
+		{name: "null reason", decision: "keep_last_safe", reason: nil, resolvedBy: uuid.NewString()},
+		{name: "null resolved by", decision: "keep_last_safe", reason: "confirmed migration reason", resolvedBy: nil},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			tx, err := pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, insertErr := tx.Exec(ctx, `INSERT INTO directory_sync_conflicts (
+				id, sync_job_id, identity_source_id, object_type, external_id, conflict_code, details, status,
+				resolution_decision, resolution_reason, resolved_by, resolved_at, version, created_at
+			) VALUES ($1,$2,$3,'user',$7,'AMBIGUOUS_EMAIL','{}','resolved',$4,$5,$6,$8,2,$8)`,
+				uuid.New(), jobID, sourceID, testCase.decision, testCase.reason, testCase.resolvedBy, uuid.NewString(), now)
+			_ = tx.Rollback(ctx)
+			var postgresError *pgconn.PgError
+			if !errors.As(insertErr, &postgresError) || postgresError.Code != "23514" || postgresError.ConstraintName != "directory_sync_conflicts_resolution_state_check" {
+				t.Fatalf("resolved row with %s error=%v, want SQLSTATE 23514 constraint directory_sync_conflicts_resolution_state_check", testCase.name, insertErr)
+			}
+		})
+	}
 
 	downSQL, err := fs.ReadFile(migrations.FS, "000017_directory_conflict_resolution.down.sql")
 	if err != nil {
@@ -141,7 +168,7 @@ func TestDirectoryConflictResolutionPostgresConcurrencyAndAuditRollback(t *testi
 	if err := database.ApplyMigrations(ctx, pool, migrations.FS); err != nil {
 		t.Fatal(err)
 	}
-	now := time.Date(2026, 8, 21, 16, 30, 0, 0, time.UTC)
+	now := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Microsecond)
 	var serverVersion string
 	if err := pool.QueryRow(ctx, `SHOW server_version`).Scan(&serverVersion); err != nil || !strings.HasPrefix(serverVersion, "17.10") {
 		t.Fatalf("PostgreSQL server_version=%q error=%v, require 17.10", serverVersion, err)
@@ -172,6 +199,48 @@ func TestDirectoryConflictResolutionPostgresConcurrencyAndAuditRollback(t *testi
 		return iam.HighRiskProof{ChallengeID: challenge.ID.String(), Evidence: evidence.Evidence, Confirmed: true}, request
 	}
 	sourceID, _, conflictID := seedDirectoryConflictResolutionFixture(t, ctx, pool, now, "completed", "open")
+	representativeUserID, representativeOrganizationID, representativeRoleBindingID := uuid.New(), uuid.New(), uuid.New()
+	if _, err := pool.Exec(ctx, `INSERT INTO user_principals (
+		id,identity_source_id,external_subject,username,display_name,email,user_kind,status,mfa_enrolled,version,created_at,updated_at
+	) VALUES ($1,$2,'external-1','last.safe.user','Last Safe User','last.safe@example.com','external','active',FALSE,7,$3,$3)`, representativeUserID, sourceID, now.Add(-time.Hour)); err != nil {
+		t.Fatalf("seed representative user: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO organization_units (
+		id,identity_source_id,external_id,name,source_owned,status,version,created_at,updated_at
+	) VALUES ($1,$2,'last-safe-org','Last Safe Organization',TRUE,'active',5,$3,$3)`, representativeOrganizationID, sourceID, now.Add(-time.Hour)); err != nil {
+		t.Fatalf("seed representative organization: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO organization_memberships (organization_id,user_id,source_owned,created_at)
+		VALUES ($1,$2,TRUE,$3)`, representativeOrganizationID, representativeUserID, now.Add(-time.Hour)); err != nil {
+		t.Fatalf("seed representative membership: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO role_bindings (
+		id,subject_type,subject_id,role_name,scope_type,effect,valid_from,created_by,version,created_at,updated_at
+	) VALUES ($1,'user',$2,'viewer','platform','allow',$3,'test:last-safe',3,$3,$3)`, representativeRoleBindingID, representativeUserID, now.Add(-time.Hour)); err != nil {
+		t.Fatalf("seed representative role binding: %v", err)
+	}
+	snapshotBusinessRows := func() map[string]string {
+		t.Helper()
+		queries := map[string]struct {
+			query string
+			args  []any
+		}{
+			"user_principals":          {query: `SELECT to_jsonb(row_data)::text FROM (SELECT * FROM user_principals WHERE id=$1) row_data`, args: []any{representativeUserID}},
+			"organization_units":       {query: `SELECT to_jsonb(row_data)::text FROM (SELECT * FROM organization_units WHERE id=$1) row_data`, args: []any{representativeOrganizationID}},
+			"organization_memberships": {query: `SELECT to_jsonb(row_data)::text FROM (SELECT * FROM organization_memberships WHERE organization_id=$1 AND user_id=$2) row_data`, args: []any{representativeOrganizationID, representativeUserID}},
+			"role_bindings":            {query: `SELECT to_jsonb(row_data)::text FROM (SELECT * FROM role_bindings WHERE id=$1) row_data`, args: []any{representativeRoleBindingID}},
+		}
+		snapshot := make(map[string]string, len(queries))
+		for table, query := range queries {
+			var row string
+			if err := pool.QueryRow(ctx, query.query, query.args...).Scan(&row); err != nil {
+				t.Fatalf("snapshot %s: %v", table, err)
+			}
+			snapshot[table] = row
+		}
+		return snapshot
+	}
+	lastSafeSnapshot := snapshotBusinessRows()
 	proofOne, requestOne := proofFor()
 	proofTwo, requestTwo := proofFor()
 	ready, release := make(chan struct{}, 2), make(chan struct{})
@@ -234,35 +303,58 @@ func TestDirectoryConflictResolutionPostgresConcurrencyAndAuditRollback(t *testi
 	if resolutionAuditCount != 1 || resolvedRows != 1 || consumedProofs != 2 {
 		t.Fatalf("concurrent durable state audit=%d resolved=%d consumed_proofs=%d", resolutionAuditCount, resolvedRows, consumedProofs)
 	}
-	for _, table := range []string{"user_principals", "organization_units", "organization_memberships", "role_bindings"} {
-		var count int
-		if err := pool.QueryRow(ctx, `SELECT count(*) FROM `+table).Scan(&count); err != nil || count != 0 {
-			t.Fatalf("resolution changed %s count=%d error=%v", table, count, err)
-		}
+	if afterResolution := snapshotBusinessRows(); !reflect.DeepEqual(afterResolution, lastSafeSnapshot) {
+		t.Fatalf("keep_last_safe changed representative business rows\nbefore=%v\nafter=%v", lastSafeSnapshot, afterResolution)
 	}
-	newJobID := uuid.New()
-	if _, err := pool.Exec(ctx, `INSERT INTO directory_sync_jobs (
-		id,identity_source_id,source_version,run_marker,mode,status,phase,requested_by,request_id,created_at,updated_at,completed_at
-	) VALUES ($1,$2,3,$3,'apply','completed','finalize','test:admin',$4,$5,$5,$5)`, newJobID, sourceID, uuid.New(), uuid.New(), now.Add(time.Minute)); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := pool.Exec(ctx, `INSERT INTO directory_sync_conflicts (id,sync_job_id,identity_source_id,object_type,external_id,conflict_code,details,status,created_at)
-		VALUES ($1,$2,$3,'user','external-1','AMBIGUOUS_EMAIL','{}','open',$4)`, uuid.New(), newJobID, sourceID, now.Add(time.Minute)); err != nil {
-		t.Fatalf("subsequent job could not create a new open conflict: %v", err)
-	}
+	syncNow := now.Add(time.Hour)
 	listService, err := iam.NewDirectorySyncService(iam.DirectorySyncServiceConfig{
 		Store: repository, Jobs: jobs.NewPostgresRepository(pool), Auditor: auditor, HighRisk: reauthentication,
-		Clock: func() time.Time { return now }, ConflictCursors: directoryIntegrationCursorCodec(t, now),
+		Clock: func() time.Time { return syncNow }, ConflictCursors: directoryIntegrationCursorCodec(t, syncNow),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	executor, err := iam.NewPostgresDirectorySyncExecutor(iam.PostgresDirectorySyncExecutorConfig{Pool: pool, Auditor: auditor, Sessions: repository, Clock: func() time.Time { return syncNow }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := &directoryIntegrationAdapter{pages: map[string]iam.SyncPage{"": {
+		Users: []iam.DirectoryUser{
+			{ExternalSubject: "external-1", Username: "unsafe.first", DisplayName: "Unsafe First", Email: "unsafe.first@example.com", Enabled: true},
+			{ExternalSubject: "external-1", Username: "unsafe.second", DisplayName: "Unsafe Second", Email: "unsafe.second@example.com", Enabled: false},
+		},
+		Complete: true,
+	}}}
+	handler, err := iam.NewDirectorySyncHandler(iam.DirectorySyncHandlerConfig{Executor: executor, Directory: adapter})
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, err := jobs.NewWorker(jobs.WorkerConfig{
+		Owner: "directory-conflict-resolution-worker", Repository: jobs.NewPostgresRepository(pool),
+		Handlers:      jobs.NewHandlerRegistry(map[string]jobs.Handler{iam.JobKindDirectorySync: handler}),
+		LeaseDuration: time.Minute, RenewInterval: 10 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	newJob, err := listService.Start(ctx, directorySyncIntegrationAdmin(), sourceID, iam.DirectorySyncModeApply, 3, iam.RequestContext{RequestID: uuid.NewString(), SourceIP: "192.0.2.82"})
+	if err != nil {
+		t.Fatalf("start subsequent production directory sync: %v", err)
+	}
+	processed, err := worker.RunOnce(ctx)
+	if err != nil || processed != 1 {
+		t.Fatalf("run subsequent production directory worker processed=%d error=%v", processed, err)
+	}
+	completedJob, err := listService.GetJob(ctx, directorySyncIntegrationAdmin(), sourceID, newJob.ID)
+	if err != nil || completedJob.Status != iam.DirectorySyncStatusCompleted || completedJob.ConflictCount != 1 {
+		t.Fatalf("subsequent production directory job=%#v error=%v", completedJob, err)
+	}
 	openPage, err := listService.ListConflicts(ctx, actor, sourceID, iam.DirectorySyncConflictStatusOpen, iam.Page{Limit: 10})
-	if err != nil || len(openPage.Items) != 1 || openPage.Items[0].Status != "open" || openPage.Items[0].Version != 1 {
+	if err != nil || len(openPage.Items) != 1 || openPage.Items[0].Status != "open" || openPage.Items[0].Version != 1 || openPage.Items[0].SyncJobID != newJob.ID || openPage.Items[0].ExternalID != "external-1" || openPage.Items[0].Code != "DUPLICATE_STABLE_SUBJECT" {
 		t.Fatalf("open conflict page=%#v error=%v", openPage, err)
 	}
 	resolvedPage, err := listService.ListConflicts(ctx, actor, sourceID, iam.DirectorySyncConflictStatusResolved, iam.Page{Limit: 10})
-	if err != nil || len(resolvedPage.Items) != 1 || resolvedPage.Items[0].ID != conflictID || resolvedPage.Items[0].ResolutionDecision != iam.DirectoryConflictResolutionKeepLastSafe || resolvedPage.Items[0].ResolvedAt == nil {
+	if err != nil || len(resolvedPage.Items) != 1 || resolvedPage.Items[0].ID != conflictID || resolvedPage.Items[0].ExternalID != openPage.Items[0].ExternalID || resolvedPage.Items[0].Code != openPage.Items[0].Code || resolvedPage.Items[0].ResolutionDecision != iam.DirectoryConflictResolutionKeepLastSafe || resolvedPage.Items[0].ResolvedAt == nil {
 		t.Fatalf("resolved conflict page=%#v error=%v", resolvedPage, err)
 	}
 	allFirst, err := listService.ListConflicts(ctx, actor, sourceID, iam.DirectorySyncConflictStatusAll, iam.Page{Limit: 1})
@@ -368,7 +460,7 @@ func seedDirectoryConflictResolutionFixture(t *testing.T, ctx context.Context, p
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO directory_sync_conflicts (
 		id,sync_job_id,identity_source_id,object_type,external_id,conflict_code,details,status,resolved_by,resolved_at,created_at
-	) VALUES ($1,$2,$3,'user','external-1','AMBIGUOUS_EMAIL','{}',$4,$5,$6,$7)`, conflictID, jobID, sourceID, conflictStatus, resolvedBy, resolvedAt, now); err != nil {
+	) VALUES ($1,$2,$3,'user','external-1','DUPLICATE_STABLE_SUBJECT','{}',$4,$5,$6,$7)`, conflictID, jobID, sourceID, conflictStatus, resolvedBy, resolvedAt, now); err != nil {
 		t.Fatal(err)
 	}
 	return sourceID, jobID, conflictID

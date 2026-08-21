@@ -221,7 +221,7 @@ func TestDirectoryConflictResolutionPreflightFailuresDoNotConsumeProof(t *testin
 		want      error
 	}{
 		{name: "unauthorized", actor: identity.Principal{Subject: "viewer", Kind: identity.PrincipalKindHuman, Roles: []identity.Role{identity.RoleViewer}, Governed: true, GovernedUserID: uuid.NewString()}, sourceID: source.ID, conflict: baseConflict, jobStatus: DirectorySyncStatusCompleted, command: validDirectoryResolutionCommand(4), want: identity.ErrActionDenied},
-		{name: "unknown source", actor: governedDirectorySyncAdmin(), sourceID: uuid.New(), conflict: baseConflict, jobStatus: DirectorySyncStatusCompleted, command: validDirectoryResolutionCommand(4), want: ErrIdentitySourceNotFound},
+		{name: "unknown source", actor: governedDirectorySyncAdmin(), sourceID: uuid.New(), conflict: baseConflict, jobStatus: DirectorySyncStatusCompleted, command: validDirectoryResolutionCommand(4), want: ErrDirectoryConflictNotFound},
 		{name: "cross source conflict", actor: governedDirectorySyncAdmin(), sourceID: source.ID, conflict: DirectorySyncConflict{}, jobStatus: DirectorySyncStatusCompleted, command: validDirectoryResolutionCommand(4), want: ErrDirectoryConflictNotFound},
 		{name: "stale version", actor: governedDirectorySyncAdmin(), sourceID: source.ID, conflict: baseConflict, jobStatus: DirectorySyncStatusCompleted, command: validDirectoryResolutionCommand(3), want: ErrIAMConflict},
 		{name: "already resolved", actor: governedDirectorySyncAdmin(), sourceID: source.ID, conflict: func() DirectorySyncConflict { value := baseConflict; value.Status = "resolved"; return value }(), jobStatus: DirectorySyncStatusCompleted, command: validDirectoryResolutionCommand(4), want: ErrIAMConflict},
@@ -246,6 +246,39 @@ func TestDirectoryConflictResolutionPreflightFailuresDoNotConsumeProof(t *testin
 			}
 			if len(highRisk.operations) != 0 {
 				t.Fatalf("proof consumed for preflight failure: %v", highRisk.operations)
+			}
+		})
+	}
+}
+
+func TestDirectoryConflictResolutionAbsentAndCrossSourceAreExactlyEquivalentBeforeProof(t *testing.T) {
+	now := time.Date(2026, 8, 21, 14, 35, 0, 0, time.UTC)
+	source := IdentitySource{ID: uuid.New(), Kind: IdentitySourceSCIM, Status: IdentitySourceStatusVerified, VerifiedAt: now, Version: 2}
+	conflict := DirectorySyncConflict{ID: uuid.New(), SyncJobID: uuid.New(), IdentitySourceID: source.ID, ObjectType: "user", Code: "AMBIGUOUS_EMAIL", Status: "open", Version: 1, CreatedAt: now}
+	tests := []struct {
+		name       string
+		sourceID   uuid.UUID
+		conflictID uuid.UUID
+		stored     DirectorySyncConflict
+	}{
+		{name: "source absent", sourceID: uuid.New(), conflictID: conflict.ID, stored: conflict},
+		{name: "conflict absent", sourceID: source.ID, conflictID: uuid.New(), stored: conflict},
+		{name: "cross source", sourceID: source.ID, conflictID: conflict.ID, stored: DirectorySyncConflict{ID: conflict.ID, IdentitySourceID: uuid.New()}},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			store := &directorySyncStoreFake{source: source, conflict: testCase.stored, conflictJobStatus: DirectorySyncStatusCompleted}
+			highRisk := &directoryConflictHighRiskFake{}
+			service, err := NewDirectorySyncService(DirectorySyncServiceConfig{Store: store, Jobs: &directorySyncJobQueueFake{}, Auditor: &directorySyncAuditFake{}, HighRisk: highRisk, Clock: func() time.Time { return now }, ConflictCursors: newDirectoryTestConflictCursorCodec(t, func() time.Time { return now })})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, resolveErr := service.ResolveConflict(context.Background(), governedDirectorySyncAdmin(), testCase.sourceID, testCase.conflictID, validDirectoryResolutionCommand(1), HighRiskProof{Confirmed: true}, RequestContext{RequestID: uuid.NewString()})
+			if resolveErr != ErrDirectoryConflictNotFound {
+				t.Fatalf("ResolveConflict() error=%v, want exact invisible error=%v", resolveErr, ErrDirectoryConflictNotFound)
+			}
+			if len(highRisk.operations) != 0 {
+				t.Fatalf("invisible resolution consumed proof: %v", highRisk.operations)
 			}
 		})
 	}
