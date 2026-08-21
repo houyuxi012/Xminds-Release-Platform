@@ -475,6 +475,25 @@ func TestIAMHighRiskHTTPRejectsMalformedProofBeforeApplication(t *testing.T) {
 	}
 }
 
+// Mutation caught: treating OpenAPI format:uuid as lowercase-only rejects a
+// standards-compliant uppercase UUID before the application can consume it.
+func TestIAMHighRiskHTTPAcceptsUppercaseUUIDAndCanonicalizesProof(t *testing.T) {
+	organizationID, userID := uuid.New(), uuid.New()
+	challengeID := uuid.MustParse("018f835d-7e4b-7abc-9f42-67a2f5f48e74")
+	body := `{"organization_version":1,"user_id":"` + userID.String() + `","user_version":1,"reason":"approved supplemental access","reauthentication":{"challenge_id":"` + strings.ToUpper(challengeID.String()) + `","evidence":"xmr_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ","confirmed":true}}`
+	application := &stubIAMApplication{}
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/organizations/"+organizationID.String()+"/memberships", strings.NewReader(body))
+	request.Header.Set("Authorization", "Bearer token")
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+
+	authenticatedIAMHandler(application).ServeHTTP(response, request)
+
+	if response.Code != http.StatusCreated || application.membershipCreateCalls != 1 || application.highRiskProof.ChallengeID != challengeID.String() {
+		t.Fatalf("status=%d calls=%d proof=%+v body=%s", response.Code, application.membershipCreateCalls, application.highRiskProof, response.Body)
+	}
+}
+
 func boolCount(value bool) int {
 	if value {
 		return 1
@@ -638,15 +657,17 @@ func (application *stubIAMApplication) ListOrganizationMemberships(_ context.Con
 	return application.organizationMembershipPage, application.membershipError
 }
 
-func (application *stubIAMApplication) CreateOrganizationMembership(_ context.Context, _ identity.Principal, _ uuid.UUID, command CreateOrganizationMembershipCommand, _ HighRiskProof, _ RequestContext) (OrganizationMembership, error) {
+func (application *stubIAMApplication) CreateOrganizationMembership(_ context.Context, _ identity.Principal, _ uuid.UUID, command CreateOrganizationMembershipCommand, proof HighRiskProof, _ RequestContext) (OrganizationMembership, error) {
 	application.membershipCreateCalls++
 	application.membershipCreateCommand = command
+	application.highRiskProof = proof
 	return application.organizationMembership, application.membershipError
 }
 
-func (application *stubIAMApplication) DeleteOrganizationMembership(_ context.Context, _ identity.Principal, _, _ uuid.UUID, command DeleteOrganizationMembershipCommand, _ HighRiskProof, _ RequestContext) error {
+func (application *stubIAMApplication) DeleteOrganizationMembership(_ context.Context, _ identity.Principal, _, _ uuid.UUID, command DeleteOrganizationMembershipCommand, proof HighRiskProof, _ RequestContext) error {
 	application.membershipDeleteCalls++
 	application.membershipDeleteCommand = command
+	application.highRiskProof = proof
 	return application.membershipError
 }
 

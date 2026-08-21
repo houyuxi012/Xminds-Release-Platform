@@ -214,7 +214,7 @@ func TestOrganizationMembershipPostgresConcurrentCreateCommitsOnce(t *testing.T)
 	organizationID, userID, emergencyID := uuid.New(), uuid.New(), uuid.New()
 	seedOrganizationMembershipPrincipalAndOrganization(t, ctx, pool, organizationID, userID, now)
 	seedOrganizationMembershipEmergencyAdministrator(t, ctx, pool, emergencyID, now)
-	requestIDs := []string{uuid.NewString(), uuid.NewString()}
+	requestIDs := make([]string, 2)
 	if _, err := pool.Exec(ctx, `
 INSERT INTO local_sessions (
     id,token_digest,subject_id,authentication_method,mfa_level,authenticated_at,last_used_at,
@@ -223,8 +223,17 @@ INSERT INTO local_sessions (
 		t.Fatal(err)
 	}
 	repository := iam.NewPostgresRepository(pool)
-	service := newOrganizationMembershipIntegrationService(t, repository, audit.NewService(audit.NewPostgresRepository(pool)), integrationHighRiskAuthorizer{}, now)
+	realAuditor := audit.NewService(audit.NewPostgresRepository(pool))
 	actor := organizationMembershipIntegrationActor(emergencyID, now)
+	reauthentication := newOrganizationMembershipReauthenticationService(t, repository, realAuditor, now)
+	proofs := make([]iam.HighRiskProof, 2)
+	requests := make([]iam.RequestContext, 2)
+	for index := range proofs {
+		proofs[index], requests[index] = completeIntegrationReauthenticationProof(t, ctx, reauthentication, actor, actor, iam.ReauthenticationOperationOrganizationMembershipCreate)
+		requestIDs[index] = requests[index].RequestID
+	}
+	rendezvous := newProductionProofRendezvous(reauthentication, 2)
+	service := newOrganizationMembershipIntegrationService(t, repository, realAuditor, rendezvous, now)
 
 	start := make(chan struct{})
 	results := make(chan error, 2)
@@ -237,11 +246,12 @@ INSERT INTO local_sessions (
 			<-start
 			_, createErr := service.CreateOrganizationMembership(ctx, actor, organizationID, iam.CreateOrganizationMembershipCommand{
 				OrganizationVersion: 1, UserID: userID, UserVersion: 1, Reason: "approved concurrent supplemental access",
-			}, iam.HighRiskProof{Confirmed: true}, iam.RequestContext{RequestID: requestIDs[index], SourceIP: "192.0.2.110"})
+			}, proofs[index], requests[index])
 			results <- createErr
 		}()
 	}
 	close(start)
+	rendezvous.releaseWhenAllConsumed(t, ctx)
 	group.Wait()
 	close(results)
 	successes, conflicts := 0, 0
@@ -271,6 +281,9 @@ INSERT INTO local_sessions (
 	if successes != 1 || conflicts != 1 || activeEdges != 1 || organizationVersion != 2 || auditEvents != 1 || activeSessions != 0 {
 		t.Fatalf("concurrent create success=%d conflict=%d edges=%d org_version=%d audits=%d sessions=%d", successes, conflicts, activeEdges, organizationVersion, auditEvents, activeSessions)
 	}
+	for _, proof := range proofs {
+		requireIntegrationProofConsumedAndUnreplayable(t, ctx, pool, reauthentication, actor, iam.ReauthenticationOperationOrganizationMembershipCreate, proof)
+	}
 }
 
 // Mutation caught: hard-delete/reinsert semantics or a missing optimistic edge
@@ -288,7 +301,7 @@ func TestOrganizationMembershipPostgresConcurrentDeleteAndCreateDeleteRaceCommit
 		t.Fatal(err)
 	}
 
-	runFixture := func(t *testing.T) (*iam.Service, identity.Principal, uuid.UUID, uuid.UUID, []string) {
+	runFixture := func(t *testing.T) (*iam.PostgresRepository, iam.AuditAppender, identity.Principal, uuid.UUID, uuid.UUID, time.Time) {
 		t.Helper()
 		resetOrganizationMembershipIntegrationTables(t, ctx, pool)
 		now := time.Date(2026, 8, 21, 19, 20, 0, 0, time.UTC)
@@ -301,12 +314,22 @@ VALUES ($1,$2,FALSE,'active',1,$3,$3)`, organizationID, userID, now); err != nil
 			t.Fatal(err)
 		}
 		repository := iam.NewPostgresRepository(pool)
-		service := newOrganizationMembershipIntegrationService(t, repository, audit.NewService(audit.NewPostgresRepository(pool)), integrationHighRiskAuthorizer{}, now)
-		return service, organizationMembershipIntegrationActor(emergencyID, now), organizationID, userID, []string{uuid.NewString(), uuid.NewString()}
+		realAuditor := audit.NewService(audit.NewPostgresRepository(pool))
+		return repository, realAuditor, organizationMembershipIntegrationActor(emergencyID, now), organizationID, userID, now
 	}
 
 	t.Run("double delete", func(t *testing.T) {
-		service, actor, organizationID, userID, requestIDs := runFixture(t)
+		repository, realAuditor, actor, organizationID, userID, now := runFixture(t)
+		reauthentication := newOrganizationMembershipReauthenticationService(t, repository, realAuditor, now)
+		proofs := make([]iam.HighRiskProof, 2)
+		requests := make([]iam.RequestContext, 2)
+		requestIDs := make([]string, 2)
+		for index := range proofs {
+			proofs[index], requests[index] = completeIntegrationReauthenticationProof(t, ctx, reauthentication, actor, actor, iam.ReauthenticationOperationOrganizationMembershipDelete)
+			requestIDs[index] = requests[index].RequestID
+		}
+		rendezvous := newProductionProofRendezvous(reauthentication, 2)
+		service := newOrganizationMembershipIntegrationService(t, repository, realAuditor, rendezvous, now)
 		start := make(chan struct{})
 		results := make(chan error, 2)
 		for index := 0; index < 2; index++ {
@@ -315,10 +338,11 @@ VALUES ($1,$2,FALSE,'active',1,$3,$3)`, organizationID, userID, now); err != nil
 				<-start
 				results <- service.DeleteOrganizationMembership(ctx, actor, organizationID, userID, iam.DeleteOrganizationMembershipCommand{
 					OrganizationVersion: 1, UserVersion: 1, MembershipVersion: 1, Reason: "remove stale concurrent supplemental access",
-				}, iam.HighRiskProof{Confirmed: true}, iam.RequestContext{RequestID: requestIDs[index], SourceIP: "192.0.2.112"})
+				}, proofs[index], requests[index])
 			}()
 		}
 		close(start)
+		rendezvous.releaseWhenAllConsumed(t, ctx)
 		successes, rejected := 0, 0
 		for index := 0; index < 2; index++ {
 			switch result := <-results; {
@@ -344,26 +368,38 @@ VALUES ($1,$2,FALSE,'active',1,$3,$3)`, organizationID, userID, now); err != nil
 		if successes != 1 || rejected != 1 || status != "removed" || membershipVersion != 2 || organizationVersion != 2 || auditEvents != 1 {
 			t.Fatalf("double delete success=%d rejected=%d status=%s membership_version=%d org_version=%d audits=%d", successes, rejected, status, membershipVersion, organizationVersion, auditEvents)
 		}
+		for _, proof := range proofs {
+			requireIntegrationProofConsumedAndUnreplayable(t, ctx, pool, reauthentication, actor, iam.ReauthenticationOperationOrganizationMembershipDelete, proof)
+		}
 	})
 
-	t.Run("create delete against one generation", func(t *testing.T) {
-		service, actor, organizationID, userID, requestIDs := runFixture(t)
+	t.Run("create delete against one organization generation", func(t *testing.T) {
+		repository, realAuditor, actor, organizationID, deleteUserID, now := runFixture(t)
+		createUserID := uuid.New()
+		seedOrganizationMembershipPrincipal(t, ctx, pool, createUserID, now)
+		reauthentication := newOrganizationMembershipReauthenticationService(t, repository, realAuditor, now)
+		createProof, createRequest := completeIntegrationReauthenticationProof(t, ctx, reauthentication, actor, actor, iam.ReauthenticationOperationOrganizationMembershipCreate)
+		deleteProof, deleteRequest := completeIntegrationReauthenticationProof(t, ctx, reauthentication, actor, actor, iam.ReauthenticationOperationOrganizationMembershipDelete)
+		requestIDs := []string{createRequest.RequestID, deleteRequest.RequestID}
+		rendezvous := newProductionProofRendezvous(reauthentication, 2)
+		service := newOrganizationMembershipIntegrationService(t, repository, realAuditor, rendezvous, now)
 		start := make(chan struct{})
 		results := make(chan error, 2)
 		go func() {
 			<-start
 			_, createErr := service.CreateOrganizationMembership(ctx, actor, organizationID, iam.CreateOrganizationMembershipCommand{
-				OrganizationVersion: 1, UserID: userID, UserVersion: 1, Reason: "recreate concurrent supplemental access",
-			}, iam.HighRiskProof{Confirmed: true}, iam.RequestContext{RequestID: requestIDs[0], SourceIP: "192.0.2.113"})
+				OrganizationVersion: 1, UserID: createUserID, UserVersion: 1, Reason: "create concurrent supplemental access",
+			}, createProof, createRequest)
 			results <- createErr
 		}()
 		go func() {
 			<-start
-			results <- service.DeleteOrganizationMembership(ctx, actor, organizationID, userID, iam.DeleteOrganizationMembershipCommand{
+			results <- service.DeleteOrganizationMembership(ctx, actor, organizationID, deleteUserID, iam.DeleteOrganizationMembershipCommand{
 				OrganizationVersion: 1, UserVersion: 1, MembershipVersion: 1, Reason: "remove concurrent supplemental access",
-			}, iam.HighRiskProof{Confirmed: true}, iam.RequestContext{RequestID: requestIDs[1], SourceIP: "192.0.2.114"})
+			}, deleteProof, deleteRequest)
 		}()
 		close(start)
+		rendezvous.releaseWhenAllConsumed(t, ctx)
 		successes, rejected := 0, 0
 		for index := 0; index < 2; index++ {
 			switch result := <-results; {
@@ -375,17 +411,27 @@ VALUES ($1,$2,FALSE,'active',1,$3,$3)`, organizationID, userID, now); err != nil
 				t.Fatalf("create/delete membership race error=%v", result)
 			}
 		}
-		var membershipVersion, auditEvents int
-		var status string
-		if err := pool.QueryRow(ctx, `SELECT status,version FROM organization_memberships WHERE organization_id=$1 AND user_id=$2 AND source_owned=FALSE`, organizationID, userID).Scan(&status, &membershipVersion); err != nil {
+		var createEdges, deleteMembershipVersion, organizationVersion, auditEvents int
+		var deleteStatus string
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM organization_memberships WHERE organization_id=$1 AND user_id=$2 AND source_owned=FALSE AND status='active'`, organizationID, createUserID).Scan(&createEdges); err != nil {
+			t.Fatal(err)
+		}
+		if err := pool.QueryRow(ctx, `SELECT status,version FROM organization_memberships WHERE organization_id=$1 AND user_id=$2 AND source_owned=FALSE`, organizationID, deleteUserID).Scan(&deleteStatus, &deleteMembershipVersion); err != nil {
+			t.Fatal(err)
+		}
+		if err := pool.QueryRow(ctx, `SELECT version FROM organization_units WHERE id=$1`, organizationID).Scan(&organizationVersion); err != nil {
 			t.Fatal(err)
 		}
 		if err := pool.QueryRow(ctx, `SELECT count(*) FROM audit_events WHERE request_id=ANY($1::uuid[]) AND action LIKE 'identity.organization_membership.%'`, requestIDs).Scan(&auditEvents); err != nil {
 			t.Fatal(err)
 		}
-		if successes != 1 || rejected != 1 || status != "removed" || membershipVersion != 2 || auditEvents != 1 {
-			t.Fatalf("create/delete success=%d rejected=%d status=%s membership_version=%d audits=%d", successes, rejected, status, membershipVersion, auditEvents)
+		createWon := createEdges == 1 && deleteStatus == "active" && deleteMembershipVersion == 1
+		deleteWon := createEdges == 0 && deleteStatus == "removed" && deleteMembershipVersion == 2
+		if successes != 1 || rejected != 1 || organizationVersion != 2 || auditEvents != 1 || (!createWon && !deleteWon) {
+			t.Fatalf("create/delete success=%d rejected=%d create_edges=%d delete=%s/%d org_version=%d audits=%d", successes, rejected, createEdges, deleteStatus, deleteMembershipVersion, organizationVersion, auditEvents)
 		}
+		requireIntegrationProofConsumedAndUnreplayable(t, ctx, pool, reauthentication, actor, iam.ReauthenticationOperationOrganizationMembershipCreate, createProof)
+		requireIntegrationProofConsumedAndUnreplayable(t, ctx, pool, reauthentication, actor, iam.ReauthenticationOperationOrganizationMembershipDelete, deleteProof)
 	})
 }
 
@@ -579,16 +625,28 @@ VALUES ($1,'organization',$2,'admin','platform','deny',$3,'test:bootstrap',1,$3,
 			t.Fatal(err)
 		}
 		repository := iam.NewPostgresRepository(pool)
-		service := newOrganizationMembershipIntegrationService(t, repository, audit.NewService(audit.NewPostgresRepository(pool)), integrationHighRiskAuthorizer{}, now)
+		realAuditor := audit.NewService(audit.NewPostgresRepository(pool))
 		actor := organizationMembershipIntegrationActor(emergencyID, now)
-		requestID := uuid.NewString()
+		reauthentication := newOrganizationMembershipReauthenticationService(t, repository, realAuditor, now)
+		proof, request := completeIntegrationReauthenticationProof(t, ctx, reauthentication, actor, actor, iam.ReauthenticationOperationOrganizationMembershipCreate)
+		service := newOrganizationMembershipIntegrationService(t, repository, realAuditor, reauthentication, now)
 		_, createErr := service.CreateOrganizationMembership(ctx, actor, organizationID, iam.CreateOrganizationMembershipCommand{
 			OrganizationVersion: 1, UserID: emergencyID, UserVersion: 1, Reason: "deny would remove emergency authority",
-		}, iam.HighRiskProof{Confirmed: true}, iam.RequestContext{RequestID: requestID, SourceIP: "192.0.2.115"})
+		}, proof, request)
 		if !errors.Is(createErr, iam.ErrLastEmergencyAdministrator) {
 			t.Fatalf("create deny membership error=%v", createErr)
 		}
-		assertOrganizationMembershipInvariantRollback(t, ctx, pool, organizationID, emergencyID, false, "", 0, requestID)
+		assertOrganizationMembershipInvariantRollback(t, ctx, pool, organizationID, emergencyID, false, "", 0, request.RequestID)
+		requireIntegrationProofConsumedAndUnreplayable(t, ctx, pool, reauthentication, actor, iam.ReauthenticationOperationOrganizationMembershipCreate, proof)
+
+		freshProof, freshRequest := completeIntegrationReauthenticationProof(t, ctx, reauthentication, actor, actor, iam.ReauthenticationOperationOrganizationMembershipCreate)
+		if _, err := service.CreateOrganizationMembership(ctx, actor, organizationID, iam.CreateOrganizationMembershipCommand{
+			OrganizationVersion: 1, UserID: emergencyID, UserVersion: 1, Reason: "deny would remove emergency authority",
+		}, freshProof, freshRequest); !errors.Is(err, iam.ErrLastEmergencyAdministrator) {
+			t.Fatalf("fresh proof create deny membership error=%v", err)
+		}
+		assertOrganizationMembershipInvariantRollback(t, ctx, pool, organizationID, emergencyID, false, "", 0, freshRequest.RequestID)
+		requireIntegrationProofConsumedAndUnreplayable(t, ctx, pool, reauthentication, actor, iam.ReauthenticationOperationOrganizationMembershipCreate, freshProof)
 	})
 
 	t.Run("delete organization allow", func(t *testing.T) {
@@ -611,16 +669,28 @@ VALUES ($1,'organization',$2,'admin','platform','allow',$3,'test:bootstrap',1,$3
 			t.Fatal(err)
 		}
 		repository := iam.NewPostgresRepository(pool)
-		service := newOrganizationMembershipIntegrationService(t, repository, audit.NewService(audit.NewPostgresRepository(pool)), integrationHighRiskAuthorizer{}, now)
+		realAuditor := audit.NewService(audit.NewPostgresRepository(pool))
 		actor := organizationMembershipIntegrationActor(emergencyID, now)
-		requestID := uuid.NewString()
+		reauthentication := newOrganizationMembershipReauthenticationService(t, repository, realAuditor, now)
+		proof, request := completeIntegrationReauthenticationProof(t, ctx, reauthentication, actor, actor, iam.ReauthenticationOperationOrganizationMembershipDelete)
+		service := newOrganizationMembershipIntegrationService(t, repository, realAuditor, reauthentication, now)
 		deleteErr := service.DeleteOrganizationMembership(ctx, actor, organizationID, emergencyID, iam.DeleteOrganizationMembershipCommand{
 			OrganizationVersion: 1, UserVersion: 1, MembershipVersion: 1, Reason: "allow removal would remove emergency authority",
-		}, iam.HighRiskProof{Confirmed: true}, iam.RequestContext{RequestID: requestID, SourceIP: "192.0.2.116"})
+		}, proof, request)
 		if !errors.Is(deleteErr, iam.ErrLastEmergencyAdministrator) {
 			t.Fatalf("delete allow membership error=%v", deleteErr)
 		}
-		assertOrganizationMembershipInvariantRollback(t, ctx, pool, organizationID, emergencyID, true, "active", 1, requestID)
+		assertOrganizationMembershipInvariantRollback(t, ctx, pool, organizationID, emergencyID, true, "active", 1, request.RequestID)
+		requireIntegrationProofConsumedAndUnreplayable(t, ctx, pool, reauthentication, actor, iam.ReauthenticationOperationOrganizationMembershipDelete, proof)
+
+		freshProof, freshRequest := completeIntegrationReauthenticationProof(t, ctx, reauthentication, actor, actor, iam.ReauthenticationOperationOrganizationMembershipDelete)
+		if err := service.DeleteOrganizationMembership(ctx, actor, organizationID, emergencyID, iam.DeleteOrganizationMembershipCommand{
+			OrganizationVersion: 1, UserVersion: 1, MembershipVersion: 1, Reason: "allow removal would remove emergency authority",
+		}, freshProof, freshRequest); !errors.Is(err, iam.ErrLastEmergencyAdministrator) {
+			t.Fatalf("fresh proof delete allow membership error=%v", err)
+		}
+		assertOrganizationMembershipInvariantRollback(t, ctx, pool, organizationID, emergencyID, true, "active", 1, freshRequest.RequestID)
+		requireIntegrationProofConsumedAndUnreplayable(t, ctx, pool, reauthentication, actor, iam.ReauthenticationOperationOrganizationMembershipDelete, freshProof)
 	})
 }
 
@@ -779,15 +849,20 @@ VALUES (TRUE,'local',1,'test:bootstrap',clock_timestamp())`); err != nil {
 
 func seedOrganizationMembershipPrincipalAndOrganization(t *testing.T, ctx context.Context, pool *pgxpool.Pool, organizationID, userID uuid.UUID, now time.Time) {
 	t.Helper()
-	if _, err := pool.Exec(ctx, `
-INSERT INTO user_principals (id,username,display_name,user_kind,status,version,created_at,updated_at)
-VALUES ($1,$2,'Membership Target','local','active',1,$3,$3)`, userID, "membership."+userID.String(), now); err != nil {
-		t.Fatalf("seed membership principal: %v", err)
-	}
+	seedOrganizationMembershipPrincipal(t, ctx, pool, userID, now)
 	if _, err := pool.Exec(ctx, `
 INSERT INTO organization_units (id,name,source_owned,status,version,created_at,updated_at)
 VALUES ($1,'Membership Organization',FALSE,'active',1,$2,$2)`, organizationID, now); err != nil {
 		t.Fatalf("seed membership organization: %v", err)
+	}
+}
+
+func seedOrganizationMembershipPrincipal(t *testing.T, ctx context.Context, pool *pgxpool.Pool, userID uuid.UUID, now time.Time) {
+	t.Helper()
+	if _, err := pool.Exec(ctx, `
+INSERT INTO user_principals (id,username,display_name,user_kind,status,version,created_at,updated_at)
+VALUES ($1,$2,'Membership Target','local','active',1,$3,$3)`, userID, "membership."+userID.String(), now); err != nil {
+		t.Fatalf("seed membership principal: %v", err)
 	}
 }
 
@@ -861,6 +936,62 @@ func newOrganizationMembershipIntegrationService(t *testing.T, repository *iam.P
 		t.Fatal(err)
 	}
 	return service
+}
+
+func newOrganizationMembershipReauthenticationService(t *testing.T, repository *iam.PostgresRepository, auditor iam.AuditAppender, now time.Time) *iam.ReauthenticationService {
+	t.Helper()
+	service, err := iam.NewReauthenticationService(iam.ReauthenticationConfig{
+		Repository: repository,
+		Auditor:    auditor,
+		Local:      integrationLocalReauthenticator{},
+		Clock:      func() time.Time { return now },
+		Policy:     iam.DefaultReauthenticationPolicy(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return service
+}
+
+type productionProofRendezvous struct {
+	delegate iam.HighRiskAuthorizer
+	expected int
+	mu       sync.Mutex
+	reached  int
+	ready    chan struct{}
+	release  chan struct{}
+}
+
+func newProductionProofRendezvous(delegate iam.HighRiskAuthorizer, expected int) *productionProofRendezvous {
+	return &productionProofRendezvous{delegate: delegate, expected: expected, ready: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (rendezvous *productionProofRendezvous) Authorize(ctx context.Context, actor identity.Principal, operation string, proof iam.HighRiskProof, request iam.RequestContext) error {
+	if err := rendezvous.delegate.Authorize(ctx, actor, operation, proof, request); err != nil {
+		return err
+	}
+	rendezvous.mu.Lock()
+	rendezvous.reached++
+	if rendezvous.reached == rendezvous.expected {
+		close(rendezvous.ready)
+	}
+	rendezvous.mu.Unlock()
+	select {
+	case <-rendezvous.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (rendezvous *productionProofRendezvous) releaseWhenAllConsumed(t *testing.T, ctx context.Context) {
+	t.Helper()
+	select {
+	case <-rendezvous.ready:
+		close(rendezvous.release)
+	case <-ctx.Done():
+		t.Fatalf("wait for production proof consumption: %v", ctx.Err())
+	}
 }
 
 func organizationMembershipIntegrationActor(emergencyID uuid.UUID, now time.Time) identity.Principal {

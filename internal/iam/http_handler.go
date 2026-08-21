@@ -296,10 +296,10 @@ type reauthenticationProofInput struct {
 
 func validateReauthenticationProofInput(input reauthenticationProofInput) (HighRiskProof, error) {
 	challengeID, err := uuid.Parse(input.ChallengeID)
-	if err != nil || challengeID == uuid.Nil || challengeID.String() != input.ChallengeID || !input.Confirmed || !validReauthenticationEvidenceInput(input.Evidence) {
+	if err != nil || challengeID == uuid.Nil || !strings.EqualFold(challengeID.String(), input.ChallengeID) || !input.Confirmed || !validReauthenticationEvidenceInput(input.Evidence) {
 		return HighRiskProof{}, ErrHighRiskProofInputInvalid
 	}
-	return HighRiskProof{ChallengeID: input.ChallengeID, Evidence: input.Evidence, Confirmed: true}, nil
+	return HighRiskProof{ChallengeID: challengeID.String(), Evidence: input.Evidence, Confirmed: true}, nil
 }
 
 func validReauthenticationEvidenceInput(evidence string) bool {
