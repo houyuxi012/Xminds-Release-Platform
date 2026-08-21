@@ -1400,6 +1400,72 @@ paths:
         '404': {$ref: '#/components/responses/NotFound'}
         '409': {$ref: '#/components/responses/Conflict'}
         '500': {$ref: '#/components/responses/InternalError'}
+  /api/v1/local-users:
+    post:
+      operationId: createLocalUser
+      summary: 创建本地用户
+      description: 创建本地用户并一次性返回激活秘密；该秘密仅在本次响应可见，后续无法查询。
+      tags: [Identity Governance]
+      x-required-action: identity.manage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreateLocalUserRequest'}
+      responses:
+        '201':
+          description: 本地用户已创建，并一次性返回激活秘密。
+          headers:
+            Location:
+              description: 新用户 URI，格式为 /api/v1/users/{id}。
+              schema: {type: string, format: uri-reference}
+            Cache-Control:
+              description: 一次性激活秘密不得缓存。
+              schema: {type: string, const: no-store}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/LocalUserProvisioning'}
+        '400': {$ref: '#/components/responses/UnprocessableEntity'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /api/v1/users:
+    get:
+      operationId: listUsers
+      summary: 查询用户列表
+      description: 按稳定顺序查询用户；cursor 为服务端返回的不透明分页游标。
+      tags: [Identity Governance]
+      x-required-action: identity.manage
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: 用户分页结果；不包含一次性激活秘密。
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/UserPage'}
+        '400': {$ref: '#/components/responses/UnprocessableEntity'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /api/v1/users/{user_id}:
+    get:
+      operationId: getUser
+      summary: 查询单个用户
+      description: 查询用户当前治理状态；不包含一次性激活秘密。
+      tags: [Identity Governance]
+      x-required-action: identity.manage
+      parameters: [{$ref: '#/components/parameters/UserIDPath'}]
+      responses:
+        '200':
+          description: 用户详情；不包含一次性激活秘密。
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/User'}
+        '400': {$ref: '#/components/responses/UnprocessableEntity'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/InternalError'}
   /api/v1/users/{user_id}/disable:
     post:
       operationId: disableUser
@@ -3127,6 +3193,67 @@ components:
           maxLength: 512
           description: 管理员处置理由；服务端去除首尾空白后校验并仅在业务表保存原文，审计仅保存 SHA-256 摘要和字符数。
         reauthentication: {$ref: '#/components/schemas/HighRiskProof'}
+    CreateLocalUserRequest:
+      type: object
+      additionalProperties: false
+      required: [username, display_name]
+      properties:
+        username:
+          type: string
+          minLength: 3
+          maxLength: 128
+          pattern: '^[a-z0-9][a-z0-9._-]{2,127}$'
+        display_name:
+          type: string
+          minLength: 1
+          maxLength: 256
+        email:
+          type: string
+          format: email
+          maxLength: 320
+    User:
+      type: object
+      additionalProperties: false
+      required: [id, username, display_name, kind, status, mfa_enrolled, version, created_at, updated_at]
+      properties:
+        id: {type: string, format: uuid}
+        identity_source_id: {type: string, format: uuid}
+        external_subject: {type: string}
+        username: {type: string}
+        display_name: {type: string}
+        email: {type: string, format: email}
+        kind: {type: string, enum: [external, local, emergency]}
+        status: {type: string, enum: [pending, active, disabled, locked]}
+        mfa_enrolled: {type: boolean}
+        credential_rotated_at: {type: string, format: date-time}
+        version: {type: integer, minimum: 1}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+        disabled_at: {type: string, format: date-time}
+        disabled_reason: {type: string}
+    UserPage:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          maxItems: 200
+          items: {$ref: '#/components/schemas/User'}
+        next_cursor: {type: string, maxLength: 512}
+    LocalUserProvisioning:
+      type: object
+      additionalProperties: false
+      required: [user, activation_token, activation_expires_at]
+      properties:
+        user: {$ref: '#/components/schemas/User'}
+        activation_token:
+          type: string
+          minLength: 32
+          maxLength: 1024
+          readOnly: true
+          description: 仅在创建成功响应中返回一次的激活秘密；后续无法查询。
+        activation_expires_at: {type: string, format: date-time}
     ActivateLocalAccountRequest:
       type: object
       additionalProperties: false

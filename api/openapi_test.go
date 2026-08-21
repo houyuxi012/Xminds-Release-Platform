@@ -2,10 +2,232 @@ package api_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/getkin/kin-openapi/openapi3"
 )
+
+func TestOpenAPIDefinesStrictLocalUserProvisioningAndReadContracts(t *testing.T) {
+	t.Parallel()
+
+	loader := openapi3.NewLoader()
+	document, err := loader.LoadFromFile("openapi.yaml")
+	if err != nil {
+		t.Fatalf("load OpenAPI contract: %v", err)
+	}
+	if err := document.Validate(context.Background()); err != nil {
+		t.Fatalf("validate OpenAPI contract: %v", err)
+	}
+
+	operations := []struct {
+		method, path, operationID string
+		responses                 []string
+	}{
+		{method: "POST", path: "/api/v1/local-users", operationID: "createLocalUser", responses: []string{"201", "400", "403", "409", "500"}},
+		{method: "GET", path: "/api/v1/users", operationID: "listUsers", responses: []string{"200", "400", "403", "500"}},
+		{method: "GET", path: "/api/v1/users/{user_id}", operationID: "getUser", responses: []string{"200", "400", "403", "404", "500"}},
+	}
+	for _, testCase := range operations {
+		pathItem := document.Paths.Find(testCase.path)
+		if pathItem == nil {
+			t.Fatalf("missing %s path", testCase.path)
+		}
+		operation := pathItem.GetOperation(testCase.method)
+		if operation == nil {
+			t.Fatalf("missing %s %s operation", testCase.method, testCase.path)
+		}
+		if operation.OperationID != testCase.operationID {
+			t.Errorf("%s %s operationId = %q, want %q", testCase.method, testCase.path, operation.OperationID, testCase.operationID)
+		}
+		if operation.Extensions["x-required-action"] != "identity.manage" {
+			t.Errorf("%s %s action = %#v", testCase.method, testCase.path, operation.Extensions["x-required-action"])
+		}
+		if !strings.Contains(operation.Summary, "用户") {
+			t.Errorf("%s %s summary must be simplified Chinese user-facing text: %q", testCase.method, testCase.path, operation.Summary)
+		}
+		for _, status := range testCase.responses {
+			if operation.Responses.Value(status) == nil {
+				t.Errorf("%s %s response %s is missing", testCase.method, testCase.path, status)
+			}
+		}
+		for _, status := range testCase.responses[1:] {
+			assertProblemResponse(t, testCase.operationID, status, operation.Responses.Value(status))
+		}
+	}
+
+	create := document.Paths.Find("/api/v1/local-users").Post
+	if !strings.Contains(create.Description, "一次性") || !strings.Contains(create.Description, "后续无法查询") {
+		t.Errorf("local user creation description must explain one-time secret visibility: %q", create.Description)
+	}
+	request := create.RequestBody.Value.Content["application/json"].Schema
+	assertStrictRequiredSchema(t, "CreateLocalUserRequest", request, []string{"username", "display_name"})
+	assertExactProperties(t, "CreateLocalUserRequest", request.Value.Properties, []string{"username", "display_name", "email"})
+	assertStringBounds(t, "CreateLocalUserRequest.username", request.Value.Properties["username"], 3, 128, "^[a-z0-9][a-z0-9._-]{2,127}$", "")
+	assertStringBounds(t, "CreateLocalUserRequest.display_name", request.Value.Properties["display_name"], 1, 256, "", "")
+	assertStringBounds(t, "CreateLocalUserRequest.email", request.Value.Properties["email"], 0, 320, "", "email")
+
+	created := create.Responses.Value("201")
+	location := created.Value.Headers["Location"]
+	if location == nil || location.Value == nil || !strings.Contains(location.Value.Description, "/api/v1/users/{id}") {
+		t.Errorf("local user creation response must document Location as /api/v1/users/{id}")
+	}
+	noStore := created.Value.Headers["Cache-Control"]
+	if noStore == nil || noStore.Value == nil || noStore.Value.Schema == nil || noStore.Value.Schema.Value == nil || noStore.Value.Schema.Value.Const != "no-store" {
+		t.Errorf("local user creation response must document Cache-Control: no-store")
+	}
+	if schema := created.Value.Content["application/json"].Schema; schema == nil || schema.Ref != "#/components/schemas/LocalUserProvisioning" {
+		t.Errorf("local user creation response schema = %#v, want LocalUserProvisioning", schema)
+	}
+
+	user := document.Components.Schemas["User"]
+	assertStrictRequiredSchema(t, "User", user, []string{"id", "username", "display_name", "kind", "status", "mfa_enrolled", "version", "created_at", "updated_at"})
+	assertExactProperties(t, "User", user.Value.Properties, []string{"id", "identity_source_id", "external_subject", "username", "display_name", "email", "kind", "status", "mfa_enrolled", "credential_rotated_at", "version", "created_at", "updated_at", "disabled_at", "disabled_reason"})
+	assertEnum(t, "User.kind", user.Value.Properties["kind"], []any{"external", "local", "emergency"})
+	assertEnum(t, "User.status", user.Value.Properties["status"], []any{"pending", "active", "disabled", "locked"})
+	if version := user.Value.Properties["version"]; version == nil || version.Value == nil || version.Value.Min == nil || *version.Value.Min != 1 {
+		t.Errorf("User.version must have minimum 1")
+	}
+
+	page := document.Components.Schemas["UserPage"]
+	assertStrictRequiredSchema(t, "UserPage", page, []string{"items"})
+	assertExactProperties(t, "UserPage", page.Value.Properties, []string{"items", "next_cursor"})
+	if items := page.Value.Properties["items"]; items == nil || items.Value == nil || items.Value.MaxItems == nil || *items.Value.MaxItems != 200 {
+		t.Errorf("UserPage.items must have maxItems 200")
+	}
+	provisioning := document.Components.Schemas["LocalUserProvisioning"]
+	assertStrictRequiredSchema(t, "LocalUserProvisioning", provisioning, []string{"user", "activation_token", "activation_expires_at"})
+	assertExactProperties(t, "LocalUserProvisioning", provisioning.Value.Properties, []string{"user", "activation_token", "activation_expires_at"})
+	if user := provisioning.Value.Properties["user"]; user == nil || user.Ref != "#/components/schemas/User" {
+		t.Errorf("LocalUserProvisioning.user must use User")
+	}
+	assertStringBounds(t, "LocalUserProvisioning.activation_token", provisioning.Value.Properties["activation_token"], 32, 1024, "", "")
+	activationToken := provisioning.Value.Properties["activation_token"].Value
+	if !activationToken.ReadOnly || activationToken.WriteOnly {
+		t.Errorf("LocalUserProvisioning.activation_token must be readOnly and not writeOnly")
+	}
+	if expiresAt := provisioning.Value.Properties["activation_expires_at"]; expiresAt == nil || expiresAt.Value == nil || expiresAt.Value.Format != "date-time" {
+		t.Errorf("LocalUserProvisioning.activation_expires_at must be a date-time")
+	}
+
+	list := document.Paths.Find("/api/v1/users").Get
+	assertParameters(t, "listUsers", list, []string{"limit", "cursor"})
+	assertResponseSchema(t, "listUsers", list.Responses.Value("200"), "#/components/schemas/UserPage")
+	detail := document.Paths.Find("/api/v1/users/{user_id}").Get
+	assertParameters(t, "getUser", detail, []string{"user_id"})
+	assertResponseSchema(t, "getUser", detail.Responses.Value("200"), "#/components/schemas/User")
+	for _, schema := range []*openapi3.SchemaRef{user, page, document.Components.Schemas["ProblemDetails"]} {
+		if schema != nil && schema.Value != nil {
+			if _, exposed := schema.Value.Properties["activation_token"]; exposed {
+				t.Errorf("%s must not expose activation_token", schema.Ref)
+			}
+		}
+	}
+}
+
+func assertStrictRequiredSchema(t *testing.T, name string, schema *openapi3.SchemaRef, required []string) {
+	t.Helper()
+	if schema == nil || schema.Value == nil {
+		t.Fatalf("%s schema is missing", name)
+	}
+	if schema.Value.AdditionalProperties.Has == nil || *schema.Value.AdditionalProperties.Has {
+		t.Errorf("%s must set additionalProperties to false", name)
+	}
+	if !sameStringSet(schema.Value.Required, required) {
+		t.Errorf("%s required = %#v, want %#v", name, schema.Value.Required, required)
+	}
+}
+
+func assertExactProperties(t *testing.T, name string, properties openapi3.Schemas, expected []string) {
+	t.Helper()
+	if len(properties) != len(expected) {
+		t.Errorf("%s has %d properties, want exactly %d", name, len(properties), len(expected))
+	}
+	for _, property := range expected {
+		if _, found := properties[property]; !found {
+			t.Errorf("%s.%s is missing", name, property)
+		}
+	}
+}
+
+func assertStringBounds(t *testing.T, name string, schema *openapi3.SchemaRef, minimum, maximum uint64, pattern, format string) {
+	t.Helper()
+	if schema == nil || schema.Value == nil {
+		t.Errorf("%s schema is missing", name)
+		return
+	}
+	if schema.Value.MinLength != minimum || schema.Value.MaxLength == nil || *schema.Value.MaxLength != maximum || schema.Value.Pattern != pattern || schema.Value.Format != format {
+		t.Errorf("%s = min=%d max=%v pattern=%q format=%q", name, schema.Value.MinLength, schema.Value.MaxLength, schema.Value.Pattern, schema.Value.Format)
+	}
+}
+
+func assertEnum(t *testing.T, name string, schema *openapi3.SchemaRef, expected []any) {
+	t.Helper()
+	if schema == nil || schema.Value == nil || !sameStringSet(stringsFromValues(schema.Value.Enum), stringsFromValues(expected)) {
+		t.Errorf("%s enum = %#v, want %#v", name, schema.Value.Enum, expected)
+	}
+}
+
+func assertParameters(t *testing.T, operationName string, operation *openapi3.Operation, expected []string) {
+	t.Helper()
+	if operation == nil {
+		t.Fatalf("%s operation is missing", operationName)
+	}
+	actual := make([]string, 0, len(operation.Parameters))
+	for _, parameter := range operation.Parameters {
+		if parameter != nil && parameter.Value != nil {
+			actual = append(actual, parameter.Value.Name)
+		}
+	}
+	if !sameStringSet(actual, expected) {
+		t.Errorf("%s parameters = %#v, want %#v", operationName, actual, expected)
+	}
+}
+
+func assertResponseSchema(t *testing.T, operationName string, response *openapi3.ResponseRef, expectedRef string) {
+	t.Helper()
+	if response == nil || response.Value == nil || response.Value.Content["application/json"] == nil || response.Value.Content["application/json"].Schema == nil || response.Value.Content["application/json"].Schema.Ref != expectedRef {
+		t.Errorf("%s success response must use %s", operationName, expectedRef)
+	}
+}
+
+func assertProblemResponse(t *testing.T, operationName, status string, response *openapi3.ResponseRef) {
+	t.Helper()
+	if response == nil || response.Value == nil || response.Value.Content["application/problem+json"] == nil || response.Value.Content["application/problem+json"].Schema == nil || response.Value.Content["application/problem+json"].Schema.Ref != "#/components/schemas/ProblemDetails" {
+		t.Errorf("%s response %s must use the RFC 9457 ProblemDetails contract", operationName, status)
+	}
+}
+
+func sameStringSet(actual, expected []string) bool {
+	if len(actual) != len(expected) {
+		return false
+	}
+	values := make(map[string]struct{}, len(actual))
+	for _, value := range actual {
+		values[value] = struct{}{}
+	}
+	if len(values) != len(expected) {
+		return false
+	}
+	for _, value := range expected {
+		if _, found := values[value]; !found {
+			return false
+		}
+	}
+	return true
+}
+
+func stringsFromValues(values []any) []string {
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		text, ok := value.(string)
+		if !ok {
+			return nil
+		}
+		result = append(result, text)
+	}
+	return result
+}
 
 func TestOpenAPIContractIsValid(t *testing.T) {
 	t.Parallel()

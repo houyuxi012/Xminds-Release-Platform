@@ -53,8 +53,63 @@ func TestHTTPHandlerCreatesLocalUserWithoutPersistingSecretInRequestState(t *tes
 	if response.Header().Get("Location") != "/api/v1/users/"+userID.String() {
 		t.Fatalf("Location = %q", response.Header().Get("Location"))
 	}
+	if response.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("Cache-Control = %q, want no-store", response.Header().Get("Cache-Control"))
+	}
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode creation response: %v", err)
+	}
+	var activationToken string
+	if err := json.Unmarshal(body["activation_token"], &activationToken); err != nil || activationToken != "returned-once" {
+		t.Fatalf("activation_token = %q, %v", activationToken, err)
+	}
 	if application.createCommand.Username != "release.operator" || application.createRequest.RequestID == "" {
 		t.Fatalf("create call = %+v, %+v", application.createCommand, application.createRequest)
+	}
+}
+
+func TestHTTPHandlerNeverReturnsProvisioningSecretFromUserReads(t *testing.T) {
+	t.Parallel()
+
+	userID := uuid.MustParse("018f835d-7e4b-7abc-9f42-67a2f5f48e54")
+	secret := "activation-token-that-is-returned-once-and-never-through-user-read-routes"
+	user := UserPrincipal{ID: userID, Username: "release.reader", DisplayName: "Release Reader", Kind: UserKindLocal, Status: UserStatusPending, Version: 1, CreatedAt: time.Date(2026, 8, 21, 9, 0, 0, 0, time.UTC), UpdatedAt: time.Date(2026, 8, 21, 9, 0, 0, 0, time.UTC)}
+	application := &stubIAMApplication{
+		provisioning: LocalUserProvisioning{User: user, ActivationToken: secret, ActivationExpires: time.Date(2026, 8, 21, 10, 0, 0, 0, time.UTC)},
+		page:         UserPage{Items: []UserPrincipal{user}},
+		user:         user,
+	}
+	handler := authenticatedIAMHandler(application)
+
+	createRequest := httptest.NewRequest(http.MethodPost, "/api/v1/local-users", bytes.NewBufferString(`{"username":"release.reader","display_name":"Release Reader"}`))
+	createRequest.Header.Set("Authorization", "Bearer token")
+	createRequest.Header.Set("Content-Type", "application/json")
+	createResponse := httptest.NewRecorder()
+	handler.ServeHTTP(createResponse, createRequest)
+	if createResponse.Code != http.StatusCreated || !bytes.Contains(createResponse.Body.Bytes(), []byte(secret)) {
+		t.Fatalf("creation response must be the sole secret delivery: status=%d body=%s", createResponse.Code, createResponse.Body)
+	}
+
+	for _, testCase := range []struct {
+		name string
+		path string
+	}{
+		{name: "list", path: "/api/v1/users"},
+		{name: "detail", path: "/api/v1/users/" + userID.String()},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodGet, testCase.path, nil)
+			request.Header.Set("Authorization", "Bearer token")
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", response.Code, response.Body)
+			}
+			if bytes.Contains(response.Body.Bytes(), []byte(secret)) || bytes.Contains(response.Body.Bytes(), []byte(`"activation_token"`)) {
+				t.Fatalf("user read leaked activation secret: %s", response.Body)
+			}
+		})
 	}
 }
 
@@ -301,6 +356,7 @@ type stubIAMApplication struct {
 	createCommand         CreateLocalUserCommand
 	createRequest         RequestContext
 	page                  UserPage
+	user                  UserPrincipal
 	listPage              Page
 	organization          OrganizationUnit
 	organizationCommand   CreateOrganizationCommand
@@ -319,6 +375,9 @@ func (application *stubIAMApplication) CreateLocalUser(_ context.Context, _ iden
 }
 
 func (application *stubIAMApplication) GetUser(context.Context, identity.Principal, uuid.UUID) (UserPrincipal, error) {
+	if application.user.ID != uuid.Nil {
+		return application.user, nil
+	}
 	return UserPrincipal{}, errors.New("unexpected GetUser call")
 }
 
