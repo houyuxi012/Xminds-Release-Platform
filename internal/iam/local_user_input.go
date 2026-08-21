@@ -6,7 +6,7 @@ import (
 	"strings"
 )
 
-var createLocalUserUsernamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{2,63}$`)
+var createLocalUserUsernamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{2,127}$`)
 
 // validateCreateLocalUserCommand accepts only canonical management input. It
 // deliberately does not normalize user-supplied values so HTTP and internal

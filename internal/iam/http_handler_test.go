@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -113,6 +114,31 @@ func TestHTTPHandlerAndServiceShareStrictLocalUserInputContract(t *testing.T) {
 			}
 			if application.createCalls != 0 {
 				t.Fatalf("invalid HTTP input invoked application %d times", application.createCalls)
+			}
+		})
+	}
+}
+
+func TestHTTPHandlerAcceptsCanonicalUsernamesThrough128Characters(t *testing.T) {
+	t.Parallel()
+
+	for _, username := range []string{strings.Repeat("a", 65), strings.Repeat("a", 128)} {
+		t.Run(strconv.Itoa(len(username)), func(t *testing.T) {
+			application := &stubIAMApplication{provisioning: LocalUserProvisioning{User: UserPrincipal{ID: uuid.New()}}}
+			body, err := json.Marshal(map[string]string{"username": username, "display_name": "Release Operator", "email": "operator@example.com"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := httptest.NewRequest(http.MethodPost, "/api/v1/local-users", bytes.NewReader(body))
+			request.Header.Set("Authorization", "Bearer token")
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			authenticatedIAMHandler(application).ServeHTTP(response, request)
+			if response.Code != http.StatusCreated {
+				t.Fatalf("HTTP status = %d, body = %s", response.Code, response.Body)
+			}
+			if application.createCalls != 1 || application.createCommand.Username != username {
+				t.Fatalf("application calls = %d, command = %+v", application.createCalls, application.createCommand)
 			}
 		})
 	}

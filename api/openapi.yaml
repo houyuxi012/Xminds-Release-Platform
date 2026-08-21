@@ -3201,8 +3201,8 @@ components:
         username:
           type: string
           minLength: 3
-          maxLength: 64
-          pattern: '^[a-z0-9][a-z0-9._-]{2,63}$'
+          maxLength: 128
+          pattern: '^[a-z0-9][a-z0-9._-]{2,127}$'
           description: 必须已去除首尾空白并为小写 canonical 值；服务端不会规范化用户提交值。
         display_name:
           type: string

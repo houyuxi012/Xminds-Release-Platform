@@ -63,7 +63,7 @@ func TestOpenAPIDefinesStrictLocalUserProvisioningAndReadContracts(t *testing.T)
 	request := create.RequestBody.Value.Content["application/json"].Schema
 	assertStrictRequiredSchema(t, "CreateLocalUserRequest", request, []string{"username", "display_name"})
 	assertExactProperties(t, "CreateLocalUserRequest", request.Value.Properties, []string{"username", "display_name", "email"})
-	assertStringBounds(t, "CreateLocalUserRequest.username", request.Value.Properties["username"], 3, 64, "^[a-z0-9][a-z0-9._-]{2,63}$", "")
+	assertStringBounds(t, "CreateLocalUserRequest.username", request.Value.Properties["username"], 3, 128, "^[a-z0-9][a-z0-9._-]{2,127}$", "")
 	assertStringBounds(t, "CreateLocalUserRequest.display_name", request.Value.Properties["display_name"], 1, 256, "", "")
 	assertStringBounds(t, "CreateLocalUserRequest.email", request.Value.Properties["email"], 0, 320, "", "email")
 	if username := request.Value.Properties["username"]; username == nil || username.Value == nil || !strings.Contains(username.Value.Description, "首尾空白") || !strings.Contains(username.Value.Description, "小写") {

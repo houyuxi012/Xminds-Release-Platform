@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -197,7 +198,7 @@ func TestCreateLocalUserUsesUnicodeCharacterLimits(t *testing.T) {
 
 	validEmail := strings.Repeat("é", 308) + "@example.com"
 	validDisplayName := strings.Repeat("界", 256)
-	validUsername := strings.Repeat("a", 64)
+	validUsername := strings.Repeat("a", 128)
 	harness := newIAMHarness(t)
 	provisioning, err := harness.service.CreateLocalUser(context.Background(), harness.admin, CreateLocalUserCommand{
 		Username: validUsername, DisplayName: validDisplayName, Email: validEmail,
@@ -213,7 +214,7 @@ func TestCreateLocalUserUsesUnicodeCharacterLimits(t *testing.T) {
 		name    string
 		command CreateLocalUserCommand
 	}{
-		{name: "username 65 characters", command: CreateLocalUserCommand{Username: strings.Repeat("a", 65), DisplayName: "Release Operator", Email: "operator@example.com"}},
+		{name: "username 129 characters", command: CreateLocalUserCommand{Username: strings.Repeat("a", 129), DisplayName: "Release Operator", Email: "operator@example.com"}},
 		{name: "display 257 characters", command: CreateLocalUserCommand{Username: "release.operator", DisplayName: strings.Repeat("界", 257), Email: "operator@example.com"}},
 		{name: "email 321 characters", command: CreateLocalUserCommand{Username: "release.operator", DisplayName: "Release Operator", Email: strings.Repeat("é", 309) + "@example.com"}},
 	} {
@@ -224,6 +225,25 @@ func TestCreateLocalUserUsesUnicodeCharacterLimits(t *testing.T) {
 			}
 			if invalid.repository.withinTransactionCalls != 0 {
 				t.Fatalf("over-limit input reached repository transaction %d times", invalid.repository.withinTransactionCalls)
+			}
+		})
+	}
+}
+
+func TestCreateLocalUserAcceptsCanonicalUsernamesThrough128Characters(t *testing.T) {
+	t.Parallel()
+
+	for _, username := range []string{strings.Repeat("a", 65), strings.Repeat("a", 128)} {
+		t.Run(strconv.Itoa(len(username)), func(t *testing.T) {
+			harness := newIAMHarness(t)
+			provisioning, err := harness.service.CreateLocalUser(context.Background(), harness.admin, CreateLocalUserCommand{
+				Username: username, DisplayName: "Release Operator", Email: "operator@example.com",
+			}, harness.request)
+			if err != nil {
+				t.Fatalf("CreateLocalUser() error = %v", err)
+			}
+			if provisioning.User.Username != username {
+				t.Fatalf("username = %q, want %q", provisioning.User.Username, username)
 			}
 		})
 	}
