@@ -72,10 +72,15 @@ func (worker *MFASecretGCWorker) RunOnce(ctx context.Context) (int, error) {
 			runErrors = append(runErrors, ErrIAMConfiguration)
 			continue
 		}
+		leaseNow := worker.clock().UTC().Truncate(time.Microsecond)
+		if leaseNow.IsZero() {
+			runErrors = append(runErrors, ErrIAMConfiguration)
+			continue
+		}
 		leased := false
 		err := worker.repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
 			var leaseErr error
-			leased, leaseErr = worker.repository.LeaseDueMFASecretGC(ctx, tx, item.SecretReference, now, leaseToken, now.Add(mfaSecretGCLeaseDuration))
+			leased, leaseErr = worker.repository.LeaseDueMFASecretGC(ctx, tx, item.SecretReference, leaseNow, leaseToken, leaseNow.Add(mfaSecretGCLeaseDuration))
 			return leaseErr
 		})
 		if err != nil {
@@ -86,9 +91,14 @@ func (worker *MFASecretGCWorker) RunOnce(ctx context.Context) (int, error) {
 			continue
 		}
 		if deleteErr := worker.secrets.Delete(ctx, item.SecretReference); deleteErr != nil {
-			retryAt := now.Add(mfaSecretGCRetryDelay(item.Attempts))
+			failedAt := worker.clock().UTC().Truncate(time.Microsecond)
+			if failedAt.IsZero() {
+				runErrors = append(runErrors, errors.Join(deleteErr, ErrIAMConfiguration))
+				continue
+			}
+			retryAt := failedAt.Add(mfaSecretGCRetryDelay(item.Attempts))
 			persistErr := worker.repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
-				return worker.repository.FailMFASecretGC(ctx, tx, item.SecretReference, leaseToken, retryAt, mfaSecretGCFailureCode, now)
+				return worker.repository.FailMFASecretGC(ctx, tx, item.SecretReference, leaseToken, retryAt, mfaSecretGCFailureCode, failedAt)
 			})
 			runErrors = append(runErrors, errors.Join(deleteErr, persistErr))
 			continue

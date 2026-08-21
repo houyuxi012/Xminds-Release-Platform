@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io/fs"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -352,6 +353,250 @@ WHERE u.id=$1`, created.User.ID).Scan(&kind, &status, &mfaEnrolled, &version, &a
 	}
 }
 
+func TestIAMMFAProductionActivationLifecycleAuditRollbackAndOrphanConcurrency(t *testing.T) {
+	databaseURL := integrationDatabaseURL(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	adminPool, pool, databaseName := isolatedIntegrationDatabase(t, ctx, databaseURL, "iam_mfa_activation_lifecycle_")
+	t.Cleanup(func() {
+		pool.Close()
+		_, _ = adminPool.Exec(context.Background(), `DROP DATABASE `+databaseName)
+		adminPool.Close()
+	})
+	if err := database.ApplyMigrations(ctx, pool, migrations.FS); err != nil {
+		t.Fatal(err)
+	}
+	repository := iam.NewPostgresRepository(pool)
+	clock := &integrationAdvancingClock{now: time.Date(2026, 8, 21, 21, 0, 0, 0, time.UTC)}
+	store := &integrationMFASecretStore{clock: clock.Now}
+	realAuditor := audit.NewService(audit.NewPostgresRepository(pool))
+	passwords, err := iam.NewPasswordManager(iam.PasswordPolicyConfig{
+		MinimumLength: 16, MemoryKiB: 19 * 1024, Iterations: 1, Parallelism: 1, SaltBytes: 16, DerivedKeyBytes: 32,
+	}, integrationBreachChecker{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dummyPassword, err := iam.NewDummyPasswordDigest(ctx, passwords)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifier := &integrationMFAVerifier{}
+	newEnrollmentService := func(auditor iam.AuditAppender) *iam.MFAService {
+		t.Helper()
+		service, serviceErr := iam.NewMFAService(iam.MFAServiceConfig{
+			Repository: repository, Auditor: auditor, Secrets: store, Policy: iam.DefaultLocalAuthPolicy(),
+			EnrollmentTTL: 10 * time.Minute, Issuer: "Xminds Release Platform", Clock: clock.Now,
+		})
+		if serviceErr != nil {
+			t.Fatal(serviceErr)
+		}
+		return service
+	}
+	newLocalAuth := func(auditor iam.AuditAppender) *iam.LocalAuthService {
+		t.Helper()
+		service, serviceErr := iam.NewLocalAuthService(iam.LocalAuthConfig{
+			Repository: repository, Auditor: auditor, Passwords: passwords, DummyPassword: dummyPassword,
+			MFA: verifier, Policy: iam.DefaultLocalAuthPolicy(), Clock: clock.Now,
+		})
+		if serviceErr != nil {
+			t.Fatal(serviceErr)
+		}
+		return service
+	}
+	seedPending := func(username, token string) uuid.UUID {
+		t.Helper()
+		userID := uuid.New()
+		if _, seedErr := pool.Exec(ctx, `INSERT INTO user_principals (id,username,display_name,user_kind,status,version,created_at,updated_at) VALUES ($1,$2,$2,'local','pending',1,$3,$3)`, userID, username, clock.Now().Add(-time.Hour)); seedErr != nil {
+			t.Fatal(seedErr)
+		}
+		if _, seedErr := pool.Exec(ctx, `INSERT INTO local_credentials (user_id,failed_attempts,activation_digest,activation_expires_at) VALUES ($1,0,$2,$3)`, userID, integrationSHA256Hex(token), clock.Now().Add(time.Hour)); seedErr != nil {
+			t.Fatal(seedErr)
+		}
+		return userID
+	}
+	request := func() iam.RequestContext {
+		return iam.RequestContext{RequestID: uuid.NewString(), SourceIP: "192.0.2.80"}
+	}
+
+	t.Run("begin audit failure removes unreferenced file and rolls back database state", func(t *testing.T) {
+		token := "activation-begin-audit-failure-token-with-entropy"
+		userID := seedPending("mfa.begin.audit", token)
+		if _, err := newEnrollmentService(failingIAMAuditAppender{}).BeginActivationEnrollment(ctx, token, request()); !errors.Is(err, errIntegrationAuditFailure) {
+			t.Fatalf("BeginActivationEnrollment error=%v", err)
+		}
+		var enrollmentRows, gcRows int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM iam_mfa_enrollments WHERE user_id=$1`, userID).Scan(&enrollmentRows); err != nil {
+			t.Fatal(err)
+		}
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM iam_mfa_secret_gc`).Scan(&gcRows); err != nil {
+			t.Fatal(err)
+		}
+		if enrollmentRows != 0 || gcRows != 0 || store.valueCount() != 0 {
+			t.Fatalf("begin rollback enrollments=%d gc=%d files=%d", enrollmentRows, gcRows, store.valueCount())
+		}
+	})
+
+	t.Run("confirm audit failure preserves pending state and successful retry confirms once", func(t *testing.T) {
+		token := "activation-confirm-audit-failure-token-with-entropy"
+		userID := seedPending("mfa.confirm.audit", token)
+		started, err := newEnrollmentService(realAuditor).BeginActivationEnrollment(ctx, token, request())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !store.contains("secret://iam-mfa/mfa-" + started.ID.String() + ".totp") {
+			t.Fatal("begin did not persist the referenced secret")
+		}
+		activation := iam.ActivateLocalAccountCommand{
+			ActivationToken: token, NewPassword: "Lifecycle-Activation-Password-2026!",
+			MFAEnrollmentID: started.ID, MFAProof: "123456",
+		}
+		if result, err := newLocalAuth(failingIAMAuditAppender{}).ActivateWithResult(ctx, activation, request()); !errors.Is(err, errIntegrationAuditFailure) || len(result.RecoveryCodes) != 0 {
+			t.Fatalf("activation audit failure result=%+v error=%v", result, err)
+		}
+		var status, enrollmentStatus, credentialReference string
+		var recoveryRows, gcRows int
+		if err := pool.QueryRow(ctx, `SELECT status FROM user_principals WHERE id=$1`, userID).Scan(&status); err != nil {
+			t.Fatal(err)
+		}
+		if err := pool.QueryRow(ctx, `SELECT status FROM iam_mfa_enrollments WHERE id=$1`, started.ID).Scan(&enrollmentStatus); err != nil {
+			t.Fatal(err)
+		}
+		if err := pool.QueryRow(ctx, `SELECT mfa_secret_reference FROM local_credentials WHERE user_id=$1`, userID).Scan(&credentialReference); err != nil {
+			t.Fatal(err)
+		}
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM iam_mfa_recovery_codes WHERE user_id=$1`, userID).Scan(&recoveryRows); err != nil {
+			t.Fatal(err)
+		}
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM iam_mfa_secret_gc WHERE secret_reference=$1`, "secret://iam-mfa/mfa-"+started.ID.String()+".totp").Scan(&gcRows); err != nil {
+			t.Fatal(err)
+		}
+		if status != "pending" || enrollmentStatus != "pending" || credentialReference != "" || recoveryRows != 0 || gcRows != 0 {
+			t.Fatalf("confirm rollback user=%s enrollment=%s credential=%q recovery=%d gc=%d", status, enrollmentStatus, credentialReference, recoveryRows, gcRows)
+		}
+		result, err := newLocalAuth(realAuditor).ActivateWithResult(ctx, activation, request())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(result.RecoveryCodes) != 10 {
+			t.Fatalf("recovery code count=%d, want 10", len(result.RecoveryCodes))
+		}
+		var mfaEnrolled bool
+		if err := pool.QueryRow(ctx, `SELECT status,mfa_enrolled FROM user_principals WHERE id=$1`, userID).Scan(&status, &mfaEnrolled); err != nil {
+			t.Fatal(err)
+		}
+		if err := pool.QueryRow(ctx, `SELECT status FROM iam_mfa_enrollments WHERE id=$1`, started.ID).Scan(&enrollmentStatus); err != nil {
+			t.Fatal(err)
+		}
+		if err := pool.QueryRow(ctx, `SELECT mfa_secret_reference FROM local_credentials WHERE user_id=$1`, userID).Scan(&credentialReference); err != nil {
+			t.Fatal(err)
+		}
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM iam_mfa_recovery_codes WHERE user_id=$1`, userID).Scan(&recoveryRows); err != nil {
+			t.Fatal(err)
+		}
+		if status != "active" || !mfaEnrolled || enrollmentStatus != "confirmed" || credentialReference != "secret://iam-mfa/mfa-"+started.ID.String()+".totp" || recoveryRows != 10 {
+			t.Fatalf("confirmed user=%s mfa=%t enrollment=%s credential=%q recovery=%d", status, mfaEnrolled, enrollmentStatus, credentialReference, recoveryRows)
+		}
+	})
+
+	t.Run("superseding begin expires old enrollment and audit failure rolls it back", func(t *testing.T) {
+		token := "activation-expire-audit-failure-token-with-entropy"
+		userID := seedPending("mfa.expire.audit", token)
+		first, err := newEnrollmentService(realAuditor).BeginActivationEnrollment(ctx, token, request())
+		if err != nil {
+			t.Fatal(err)
+		}
+		fileCount := store.valueCount()
+		if _, err := newEnrollmentService(failingIAMAuditAppender{}).BeginActivationEnrollment(ctx, token, request()); !errors.Is(err, errIntegrationAuditFailure) {
+			t.Fatalf("superseding audit failure error=%v", err)
+		}
+		var firstStatus string
+		var gcRows int
+		if err := pool.QueryRow(ctx, `SELECT status FROM iam_mfa_enrollments WHERE id=$1`, first.ID).Scan(&firstStatus); err != nil {
+			t.Fatal(err)
+		}
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM iam_mfa_secret_gc WHERE secret_reference=$1`, "secret://iam-mfa/mfa-"+first.ID.String()+".totp").Scan(&gcRows); err != nil {
+			t.Fatal(err)
+		}
+		if firstStatus != "pending" || gcRows != 0 || store.valueCount() != fileCount {
+			t.Fatalf("supersede rollback old=%s gc=%d files=%d want=%d", firstStatus, gcRows, store.valueCount(), fileCount)
+		}
+		second, err := newEnrollmentService(realAuditor).BeginActivationEnrollment(ctx, token, request())
+		if err != nil {
+			t.Fatal(err)
+		}
+		var secondStatus string
+		if err := pool.QueryRow(ctx, `SELECT status FROM iam_mfa_enrollments WHERE id=$1`, first.ID).Scan(&firstStatus); err != nil {
+			t.Fatal(err)
+		}
+		if err := pool.QueryRow(ctx, `SELECT status FROM iam_mfa_enrollments WHERE id=$1`, second.ID).Scan(&secondStatus); err != nil {
+			t.Fatal(err)
+		}
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM iam_mfa_secret_gc WHERE secret_reference=$1`, "secret://iam-mfa/mfa-"+first.ID.String()+".totp").Scan(&gcRows); err != nil {
+			t.Fatal(err)
+		}
+		if firstStatus != "expired" || secondStatus != "pending" || gcRows != 1 || !store.contains("secret://iam-mfa/mfa-"+first.ID.String()+".totp") || !store.contains("secret://iam-mfa/mfa-"+second.ID.String()+".totp") {
+			t.Fatalf("supersede old=%s new=%s gc=%d old_file=%t new_file=%t user=%s", firstStatus, secondStatus, gcRows, store.contains("secret://iam-mfa/mfa-"+first.ID.String()+".totp"), store.contains("secret://iam-mfa/mfa-"+second.ID.String()+".totp"), userID)
+		}
+	})
+
+	t.Run("orphan reconciliation concurrent with begin never deletes the fresh reference", func(t *testing.T) {
+		token := "activation-orphan-concurrency-token-with-entropy"
+		userID := seedPending("mfa.orphan.concurrent", token)
+		orphanID, _ := uuid.NewV7()
+		orphanReference := "secret://iam-mfa/mfa-" + orphanID.String() + ".totp"
+		store.put(orphanReference, "ORPHAN-SEED", clock.Now().Add(-2*time.Hour))
+		created := make(chan string, 1)
+		createRelease := make(chan struct{})
+		store.mutex.Lock()
+		store.createHook = func(reference string) {
+			created <- reference
+			select {
+			case <-createRelease:
+			case <-ctx.Done():
+			}
+		}
+		store.mutex.Unlock()
+		beginResult := make(chan iam.MFAEnrollmentStart, 1)
+		beginError := make(chan error, 1)
+		go func() {
+			result, beginErr := newEnrollmentService(realAuditor).BeginActivationEnrollment(ctx, token, request())
+			beginResult <- result
+			beginError <- beginErr
+		}()
+		var freshReference string
+		select {
+		case freshReference = <-created:
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+		worker, err := iam.NewMFASecretGCWorker(iam.MFASecretGCWorkerConfig{Repository: repository, Secrets: store, Clock: clock.Now})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := worker.RunOnce(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if !store.contains(freshReference) || store.contains(orphanReference) {
+			t.Fatalf("during begin fresh_present=%t old_orphan_present=%t", store.contains(freshReference), store.contains(orphanReference))
+		}
+		close(createRelease)
+		if err := <-beginError; err != nil {
+			t.Fatal(err)
+		}
+		started := <-beginResult
+		if freshReference != "secret://iam-mfa/mfa-"+started.ID.String()+".totp" || !store.contains(freshReference) {
+			t.Fatalf("begin reference=%q started=%s present=%t user=%s", freshReference, started.ID, store.contains(freshReference), userID)
+		}
+		var status string
+		if err := pool.QueryRow(ctx, `SELECT status FROM iam_mfa_enrollments WHERE id=$1 AND user_id=$2`, started.ID, userID).Scan(&status); err != nil || status != "pending" {
+			t.Fatalf("fresh enrollment status=%q error=%v", status, err)
+		}
+		store.mutex.Lock()
+		store.createHook = nil
+		store.mutex.Unlock()
+	})
+}
+
 // Mutation caught: separating the tombstone check from reference insertion,
 // or consuming recovery codes with a read-then-write sequence, permits secret
 // resurrection and one-time factor replay under concurrency.
@@ -618,11 +863,292 @@ func TestIAMMFASecretGCWorkerSerializesDeleteCancelsLiveAndPersistsFailure(t *te
 	assertMFASecretGCCount(t, ctx, pool, failureReference, 0)
 }
 
+func TestIAMMFASecretGCWorkerStartsLeaseFromLeaseTransactionTime(t *testing.T) {
+	databaseURL := integrationDatabaseURL(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	adminPool, pool, databaseName := isolatedIntegrationDatabase(t, ctx, databaseURL, "iam_mfa_gc_lease_clock_")
+	t.Cleanup(func() {
+		pool.Close()
+		_, _ = adminPool.Exec(context.Background(), `DROP DATABASE `+databaseName)
+		adminPool.Close()
+	})
+	if err := database.ApplyMigrations(ctx, pool, migrations.FS); err != nil {
+		t.Fatal(err)
+	}
+	repository := iam.NewPostgresRepository(pool)
+	clock := &integrationAdvancingClock{now: time.Date(2026, 8, 21, 18, 0, 0, 0, time.UTC)}
+	referenceID, _ := uuid.NewV7()
+	reference := "secret://iam-mfa/mfa-" + referenceID.String() + ".totp"
+	if err := repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
+		return repository.EnqueueMFASecretGC(ctx, tx, reference, clock.Now(), clock.Now())
+	}); err != nil {
+		t.Fatal(err)
+	}
+	deleteStarted := make(chan struct{})
+	deleteRelease := make(chan struct{})
+	store := &integrationMFASecretStore{
+		listHook:      func() { clock.Advance(31 * time.Second) },
+		deleteStarted: deleteStarted,
+		deleteRelease: deleteRelease,
+	}
+	worker, err := iam.NewMFASecretGCWorker(iam.MFASecretGCWorkerConfig{
+		Repository: repository,
+		Secrets:    store,
+		Clock:      clock.Now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workerDone := make(chan error, 1)
+	go func() {
+		_, runErr := worker.RunOnce(ctx)
+		workerDone <- runErr
+	}()
+	select {
+	case <-deleteStarted:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	var leasedUntil time.Time
+	if err := pool.QueryRow(ctx, `SELECT leased_until FROM iam_mfa_secret_gc WHERE secret_reference=$1 AND state='leased'`, reference).Scan(&leasedUntil); err != nil {
+		close(deleteRelease)
+		t.Fatal(err)
+	}
+	if !leasedUntil.After(clock.Now()) {
+		close(deleteRelease)
+		t.Fatalf("lease committed already expired: leased_until=%s current=%s", leasedUntil, clock.Now())
+	}
+	close(deleteRelease)
+	if err := <-workerDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestIAMMFASecretGCWorkerSchedulesRetryFromDeleteFailureTime(t *testing.T) {
+	databaseURL := integrationDatabaseURL(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	adminPool, pool, databaseName := isolatedIntegrationDatabase(t, ctx, databaseURL, "iam_mfa_gc_failure_clock_")
+	t.Cleanup(func() {
+		pool.Close()
+		_, _ = adminPool.Exec(context.Background(), `DROP DATABASE `+databaseName)
+		adminPool.Close()
+	})
+	if err := database.ApplyMigrations(ctx, pool, migrations.FS); err != nil {
+		t.Fatal(err)
+	}
+	repository := iam.NewPostgresRepository(pool)
+	clock := &integrationAdvancingClock{now: time.Date(2026, 8, 21, 19, 0, 0, 0, time.UTC)}
+	referenceID, _ := uuid.NewV7()
+	reference := "secret://iam-mfa/mfa-" + referenceID.String() + ".totp"
+	if err := repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
+		return repository.EnqueueMFASecretGC(ctx, tx, reference, clock.Now(), clock.Now())
+	}); err != nil {
+		t.Fatal(err)
+	}
+	deleteFailure := errors.New("injected delete completion failure")
+	store := &integrationMFASecretStore{
+		clock: clock.Now,
+		deleteHook: func(context.Context, int64, string) error {
+			clock.Advance(45 * time.Second)
+			return deleteFailure
+		},
+	}
+	worker, err := iam.NewMFASecretGCWorker(iam.MFASecretGCWorkerConfig{Repository: repository, Secrets: store, Clock: clock.Now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := worker.RunOnce(ctx); !errors.Is(err, deleteFailure) {
+		t.Fatalf("RunOnce error=%v", err)
+	}
+	var state string
+	var updatedAt, retryAt time.Time
+	if err := pool.QueryRow(ctx, `SELECT state,updated_at,not_before FROM iam_mfa_secret_gc WHERE secret_reference=$1`, reference).Scan(&state, &updatedAt, &retryAt); err != nil {
+		t.Fatal(err)
+	}
+	if state != "pending" || !updatedAt.Equal(clock.Now()) || !retryAt.Equal(clock.Now().Add(time.Minute)) {
+		t.Fatalf("failure state=%s updated_at=%s retry_at=%s current=%s", state, updatedAt, retryAt, clock.Now())
+	}
+}
+
+func TestIAMMFASecretGCWorkerFencesCrashedLeasesAndCompletesIdempotentTakeover(t *testing.T) {
+	databaseURL := integrationDatabaseURL(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	adminPool, pool, databaseName := isolatedIntegrationDatabase(t, ctx, databaseURL, "iam_mfa_gc_crash_matrix_")
+	t.Cleanup(func() {
+		pool.Close()
+		_, _ = adminPool.Exec(context.Background(), `DROP DATABASE `+databaseName)
+		adminPool.Close()
+	})
+	if err := database.ApplyMigrations(ctx, pool, migrations.FS); err != nil {
+		t.Fatal(err)
+	}
+	repository := iam.NewPostgresRepository(pool)
+	clock := &integrationAdvancingClock{now: time.Date(2026, 8, 21, 20, 0, 0, 0, time.UTC)}
+	newWorker := func(workerRepository integrationMFASecretGCRepository, store iam.MFASecretStore) *iam.MFASecretGCWorker {
+		t.Helper()
+		worker, err := iam.NewMFASecretGCWorker(iam.MFASecretGCWorkerConfig{Repository: workerRepository, Secrets: store, Clock: clock.Now})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return worker
+	}
+
+	t.Run("pause after lease rejects writer and expired takeover fences old token", func(t *testing.T) {
+		referenceID, _ := uuid.NewV7()
+		reference := "secret://iam-mfa/mfa-" + referenceID.String() + ".totp"
+		userID := uuid.New()
+		if _, err := pool.Exec(ctx, `INSERT INTO user_principals (id,username,display_name,user_kind,status,version,created_at,updated_at) VALUES ($1,$2,'GC Writer','local','pending',1,$3,$3)`, userID, "gc.writer."+userID.String(), clock.Now()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, `INSERT INTO local_credentials (user_id,failed_attempts,activation_digest,activation_expires_at) VALUES ($1,0,$2,$3)`, userID, integrationSHA256Hex("gc-writer-token"), clock.Now().Add(time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		if err := repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
+			return repository.EnqueueMFASecretGC(ctx, tx, reference, clock.Now(), clock.Now())
+		}); err != nil {
+			t.Fatal(err)
+		}
+		firstStarted, firstRelease := make(chan struct{}), make(chan struct{})
+		secondStarted, secondRelease := make(chan struct{}), make(chan struct{})
+		store := &integrationMFASecretStore{clock: clock.Now}
+		store.put(reference, "FIRST-SEED", clock.Now().Add(-2*time.Hour))
+		store.deleteHook = func(callCtx context.Context, call int64, _ string) error {
+			var started, release chan struct{}
+			switch call {
+			case 1:
+				started, release = firstStarted, firstRelease
+			case 2:
+				started, release = secondStarted, secondRelease
+			default:
+				return errors.New("unexpected delete call")
+			}
+			close(started)
+			select {
+			case <-release:
+				return nil
+			case <-callCtx.Done():
+				return callCtx.Err()
+			}
+		}
+		firstDone := make(chan error, 1)
+		go func() {
+			_, runErr := newWorker(repository, store).RunOnce(ctx)
+			firstDone <- runErr
+		}()
+		select {
+		case <-firstStarted:
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+		var firstToken uuid.UUID
+		var firstLeaseUntil time.Time
+		if err := pool.QueryRow(ctx, `SELECT lease_token,leased_until FROM iam_mfa_secret_gc WHERE secret_reference=$1 AND state='leased'`, reference).Scan(&firstToken, &firstLeaseUntil); err != nil {
+			t.Fatal(err)
+		}
+		writerEnrollment := iam.MFAEnrollment{
+			ID: referenceID, UserID: userID, Purpose: iam.MFAEnrollmentPurposeActivation, Status: iam.MFAEnrollmentStatusPending,
+			SecretReference: reference, ExpectedUserVersion: 1, ExpiresAt: clock.Now().Add(10 * time.Minute),
+			Version: 1, CreatedAt: clock.Now(), UpdatedAt: clock.Now(),
+		}
+		if err := repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
+			return repository.InsertMFAEnrollment(ctx, tx, writerEnrollment)
+		}); !errors.Is(err, iam.ErrIAMConflict) {
+			t.Fatalf("writer reused leased tombstone error=%v", err)
+		}
+		clock.Set(firstLeaseUntil.Add(time.Microsecond))
+		secondDone := make(chan error, 1)
+		go func() {
+			_, runErr := newWorker(repository, store).RunOnce(ctx)
+			secondDone <- runErr
+		}()
+		select {
+		case <-secondStarted:
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+		var secondToken uuid.UUID
+		if err := pool.QueryRow(ctx, `SELECT lease_token FROM iam_mfa_secret_gc WHERE secret_reference=$1 AND state='leased'`, reference).Scan(&secondToken); err != nil {
+			t.Fatal(err)
+		}
+		if secondToken == firstToken {
+			t.Fatal("expired takeover reused the old lease token")
+		}
+		for name, mutation := range map[string]func(context.Context, pgx.Tx) error{
+			"complete": func(callCtx context.Context, tx pgx.Tx) error {
+				return repository.CompleteMFASecretGC(callCtx, tx, reference, firstToken)
+			},
+			"fail": func(callCtx context.Context, tx pgx.Tx) error {
+				return repository.FailMFASecretGC(callCtx, tx, reference, firstToken, clock.Now().Add(time.Minute), "OLD_WORKER_FAILED", clock.Now())
+			},
+		} {
+			if err := repository.WithinTransaction(ctx, func(tx pgx.Tx) error { return mutation(ctx, tx) }); !errors.Is(err, iam.ErrIAMConflict) {
+				t.Errorf("old token %s error=%v", name, err)
+			}
+		}
+		close(secondRelease)
+		if err := <-secondDone; err != nil {
+			t.Fatalf("takeover worker: %v", err)
+		}
+		close(firstRelease)
+		if err := <-firstDone; !errors.Is(err, iam.ErrIAMConflict) {
+			t.Fatalf("stale worker error=%v, want fenced conflict", err)
+		}
+		assertMFASecretGCCount(t, ctx, pool, reference, 0)
+		if store.contains(reference) {
+			t.Fatal("takeover left deleted secret present")
+		}
+	})
+
+	t.Run("unlink before completion crash is recovered after lease expiry", func(t *testing.T) {
+		referenceID, _ := uuid.NewV7()
+		reference := "secret://iam-mfa/mfa-" + referenceID.String() + ".totp"
+		if err := repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
+			return repository.EnqueueMFASecretGC(ctx, tx, reference, clock.Now(), clock.Now())
+		}); err != nil {
+			t.Fatal(err)
+		}
+		store := &integrationMFASecretStore{clock: clock.Now}
+		store.put(reference, "CRASH-SEED", clock.Now().Add(-2*time.Hour))
+		crashingRepository := &integrationFailCompleteRepository{PostgresRepository: repository}
+		crashingRepository.failOnce.Store(true)
+		if _, err := newWorker(crashingRepository, store).RunOnce(ctx); !errors.Is(err, errIntegrationGCCompleteCrash) {
+			t.Fatalf("crash worker error=%v", err)
+		}
+		var state string
+		var firstToken uuid.UUID
+		var leasedUntil time.Time
+		if err := pool.QueryRow(ctx, `SELECT state,lease_token,leased_until FROM iam_mfa_secret_gc WHERE secret_reference=$1`, reference).Scan(&state, &firstToken, &leasedUntil); err != nil {
+			t.Fatal(err)
+		}
+		if state != "leased" || store.contains(reference) {
+			t.Fatalf("post-unlink crash state=%s secret_present=%t", state, store.contains(reference))
+		}
+		clock.Set(leasedUntil.Add(time.Microsecond))
+		if _, err := newWorker(repository, store).RunOnce(ctx); err != nil {
+			t.Fatalf("idempotent takeover: %v", err)
+		}
+		assertMFASecretGCCount(t, ctx, pool, reference, 0)
+		if store.deleteCount.Load() != 2 {
+			t.Fatalf("delete calls=%d, want unlink plus idempotent ENOENT", store.deleteCount.Load())
+		}
+	})
+}
+
 type integrationMFASecretStore struct {
-	deleteCount atomic.Int64
-	failDelete  atomic.Bool
-	mutex       sync.Mutex
-	values      map[string][]byte
+	deleteCount   atomic.Int64
+	failDelete    atomic.Bool
+	mutex         sync.Mutex
+	values        map[string][]byte
+	createdAt     map[string]time.Time
+	clock         func() time.Time
+	listHook      func()
+	createHook    func(string)
+	deleteHook    func(context.Context, int64, string) error
+	deleteStarted chan struct{}
+	deleteRelease chan struct{}
 }
 
 func (store *integrationMFASecretStore) Resolve(_ context.Context, reference string) ([]byte, error) {
@@ -638,25 +1164,149 @@ func (store *integrationMFASecretStore) Resolve(_ context.Context, reference str
 func (store *integrationMFASecretStore) Create(_ context.Context, enrollmentID uuid.UUID, seed string) (string, error) {
 	reference := "secret://iam-mfa/mfa-" + enrollmentID.String() + ".totp"
 	store.mutex.Lock()
+	if store.values == nil {
+		store.values = make(map[string][]byte)
+	}
+	if store.createdAt == nil {
+		store.createdAt = make(map[string]time.Time)
+	}
+	store.values[reference] = []byte(seed)
+	createdAt := time.Now().UTC()
+	if store.clock != nil {
+		createdAt = store.clock().UTC()
+	}
+	store.createdAt[reference] = createdAt
+	createHook := store.createHook
+	store.mutex.Unlock()
+	if createHook != nil {
+		createHook(reference)
+	}
+	return reference, nil
+}
+
+func (store *integrationMFASecretStore) Delete(ctx context.Context, reference string) error {
+	deleteCall := store.deleteCount.Add(1)
+	if store.deleteStarted != nil {
+		close(store.deleteStarted)
+	}
+	if store.deleteRelease != nil {
+		select {
+		case <-store.deleteRelease:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	if store.failDelete.Load() {
+		return errors.New("injected unlink failure")
+	}
+	store.mutex.Lock()
+	deleteHook := store.deleteHook
+	store.mutex.Unlock()
+	if deleteHook != nil {
+		if err := deleteHook(ctx, deleteCall, reference); err != nil {
+			return err
+		}
+	}
+	store.mutex.Lock()
+	delete(store.values, reference)
+	delete(store.createdAt, reference)
+	store.mutex.Unlock()
+	return nil
+}
+
+func (store *integrationMFASecretStore) ListOrphanCandidates(_ context.Context, olderThan time.Time, limit int) ([]string, error) {
+	if store.listHook != nil {
+		store.listHook()
+	}
+	store.mutex.Lock()
+	defer store.mutex.Unlock()
+	candidates := make([]string, 0, limit)
+	for reference, createdAt := range store.createdAt {
+		if createdAt.Before(olderThan) {
+			candidates = append(candidates, reference)
+		}
+	}
+	sort.Strings(candidates)
+	if len(candidates) > limit {
+		candidates = candidates[:limit]
+	}
+	return candidates, nil
+}
+
+func (store *integrationMFASecretStore) put(reference, seed string, createdAt time.Time) {
+	store.mutex.Lock()
 	defer store.mutex.Unlock()
 	if store.values == nil {
 		store.values = make(map[string][]byte)
 	}
-	store.values[reference] = []byte(seed)
-	return reference, nil
-}
-
-func (store *integrationMFASecretStore) Delete(context.Context, string) error {
-	store.deleteCount.Add(1)
-	if store.failDelete.Load() {
-		return errors.New("injected unlink failure")
+	if store.createdAt == nil {
+		store.createdAt = make(map[string]time.Time)
 	}
-	return nil
+	store.values[reference] = []byte(seed)
+	store.createdAt[reference] = createdAt.UTC()
 }
 
-func (*integrationMFASecretStore) ListOrphanCandidates(context.Context, time.Time, int) ([]string, error) {
-	return nil, nil
+func (store *integrationMFASecretStore) contains(reference string) bool {
+	store.mutex.Lock()
+	defer store.mutex.Unlock()
+	_, exists := store.values[reference]
+	return exists
 }
+
+func (store *integrationMFASecretStore) valueCount() int {
+	store.mutex.Lock()
+	defer store.mutex.Unlock()
+	return len(store.values)
+}
+
+type integrationAdvancingClock struct {
+	mutex sync.Mutex
+	now   time.Time
+}
+
+func (clock *integrationAdvancingClock) Now() time.Time {
+	clock.mutex.Lock()
+	defer clock.mutex.Unlock()
+	return clock.now
+}
+
+func (clock *integrationAdvancingClock) Advance(duration time.Duration) {
+	clock.mutex.Lock()
+	defer clock.mutex.Unlock()
+	clock.now = clock.now.Add(duration)
+}
+
+func (clock *integrationAdvancingClock) Set(at time.Time) {
+	clock.mutex.Lock()
+	defer clock.mutex.Unlock()
+	clock.now = at.UTC()
+}
+
+type integrationFailCompleteRepository struct {
+	*iam.PostgresRepository
+	failOnce atomic.Bool
+}
+
+type integrationMFASecretGCRepository interface {
+	WithinTransaction(context.Context, func(pgx.Tx) error) error
+	ListDueMFASecretGC(context.Context, time.Time, int) ([]iam.MFASecretGCItem, error)
+	LeaseDueMFASecretGC(context.Context, pgx.Tx, string, time.Time, uuid.UUID, time.Time) (bool, error)
+	CompleteMFASecretGC(context.Context, pgx.Tx, string, uuid.UUID) error
+	FailMFASecretGC(context.Context, pgx.Tx, string, uuid.UUID, time.Time, string, time.Time) error
+	LockMFASecretReference(context.Context, pgx.Tx, string) error
+	MFASecretReferenceIsLive(context.Context, pgx.Tx, string, time.Time) (bool, error)
+	MFASecretReferenceHasTombstone(context.Context, pgx.Tx, string) (bool, error)
+	EnqueueMFASecretGC(context.Context, pgx.Tx, string, time.Time, time.Time) error
+}
+
+func (repository *integrationFailCompleteRepository) CompleteMFASecretGC(ctx context.Context, tx pgx.Tx, reference string, leaseToken uuid.UUID) error {
+	if repository.failOnce.CompareAndSwap(true, false) {
+		return errIntegrationGCCompleteCrash
+	}
+	return repository.PostgresRepository.CompleteMFASecretGC(ctx, tx, reference, leaseToken)
+}
+
+var errIntegrationGCCompleteCrash = errors.New("integration GC completion crash")
 
 func assertMFASecretGCCount(t *testing.T, ctx context.Context, pool *pgxpool.Pool, reference string, want int) {
 	t.Helper()
