@@ -145,7 +145,7 @@ func TestCreateLocalUserStoresOnlyActivationDigestAndAuditsProvisioning(t *testi
 
 	harness := newIAMHarness(t)
 	provisioning, err := harness.service.CreateLocalUser(context.Background(), harness.admin, CreateLocalUserCommand{
-		Username: "  Release.Operator ", DisplayName: "Release Operator", Email: "OPERATOR@example.com",
+		Username: "release.operator", DisplayName: "Release Operator", Email: "operator@example.com",
 	}, harness.request)
 	if err != nil {
 		t.Fatalf("CreateLocalUser() error = %v", err)
@@ -187,6 +187,43 @@ func TestCreateLocalUserRejectsInvalidIdentityFields(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			if _, err := harness.service.CreateLocalUser(context.Background(), harness.admin, command, harness.request); !errors.Is(err, ErrUserInputInvalid) {
 				t.Fatalf("CreateLocalUser() error = %v", err)
+			}
+		})
+	}
+}
+
+func TestCreateLocalUserUsesUnicodeCharacterLimits(t *testing.T) {
+	t.Parallel()
+
+	validEmail := strings.Repeat("é", 308) + "@example.com"
+	validDisplayName := strings.Repeat("界", 256)
+	validUsername := strings.Repeat("a", 64)
+	harness := newIAMHarness(t)
+	provisioning, err := harness.service.CreateLocalUser(context.Background(), harness.admin, CreateLocalUserCommand{
+		Username: validUsername, DisplayName: validDisplayName, Email: validEmail,
+	}, harness.request)
+	if err != nil {
+		t.Fatalf("CreateLocalUser() error = %v", err)
+	}
+	if provisioning.User.Username != validUsername || provisioning.User.DisplayName != validDisplayName || provisioning.User.Email != validEmail {
+		t.Fatalf("provisioning user = %+v", provisioning.User)
+	}
+
+	for _, testCase := range []struct {
+		name    string
+		command CreateLocalUserCommand
+	}{
+		{name: "username 65 characters", command: CreateLocalUserCommand{Username: strings.Repeat("a", 65), DisplayName: "Release Operator", Email: "operator@example.com"}},
+		{name: "display 257 characters", command: CreateLocalUserCommand{Username: "release.operator", DisplayName: strings.Repeat("界", 257), Email: "operator@example.com"}},
+		{name: "email 321 characters", command: CreateLocalUserCommand{Username: "release.operator", DisplayName: "Release Operator", Email: strings.Repeat("é", 309) + "@example.com"}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			invalid := newIAMHarness(t)
+			if _, err := invalid.service.CreateLocalUser(context.Background(), invalid.admin, testCase.command, invalid.request); !errors.Is(err, ErrUserInputInvalid) {
+				t.Fatalf("CreateLocalUser() error = %v, want ErrUserInputInvalid", err)
+			}
+			if invalid.repository.withinTransactionCalls != 0 {
+				t.Fatalf("over-limit input reached repository transaction %d times", invalid.repository.withinTransactionCalls)
 			}
 		})
 	}
@@ -943,17 +980,19 @@ func (harness *iamHarness) proof() HighRiskProof {
 }
 
 type memoryIAMRepository struct {
-	login         LoginState
-	sources       map[uuid.UUID]IdentitySource
-	users         map[uuid.UUID]UserPrincipal
-	credentials   map[uuid.UUID]LocalCredential
-	organizations map[uuid.UUID]OrganizationUnit
-	roleBindings  map[uuid.UUID]RoleBinding
-	catalogScopes map[string]map[string]bool
-	memberships   map[uuid.UUID][]uuid.UUID
+	withinTransactionCalls int
+	login                  LoginState
+	sources                map[uuid.UUID]IdentitySource
+	users                  map[uuid.UUID]UserPrincipal
+	credentials            map[uuid.UUID]LocalCredential
+	organizations          map[uuid.UUID]OrganizationUnit
+	roleBindings           map[uuid.UUID]RoleBinding
+	catalogScopes          map[string]map[string]bool
+	memberships            map[uuid.UUID][]uuid.UUID
 }
 
 func (repository *memoryIAMRepository) WithinTransaction(_ context.Context, function func(pgx.Tx) error) error {
+	repository.withinTransactionCalls++
 	login := repository.login
 	users := cloneIAMUsers(repository.users)
 	sources := cloneIAMSources(repository.sources)

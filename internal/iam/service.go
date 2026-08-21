@@ -7,7 +7,6 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
-	"net/mail"
 	"regexp"
 	"strings"
 	"time"
@@ -469,10 +468,8 @@ func (service *Service) CreateLocalUser(ctx context.Context, actor identity.Prin
 	if err := service.authorizer.Require(actor, identity.ActionIdentityManage, ""); err != nil {
 		return LocalUserProvisioning{}, err
 	}
-	username := canonicalUsername(command.Username)
-	displayName := strings.TrimSpace(command.DisplayName)
-	emailAddress, err := normalizeEmail(command.Email)
-	if !localUsernamePattern.MatchString(username) || displayName == "" || len([]rune(displayName)) > 256 || err != nil {
+	command, err := validateCreateLocalUserCommand(command)
+	if err != nil {
 		return LocalUserProvisioning{}, ErrUserInputInvalid
 	}
 	activationToken, err := generateActivationToken()
@@ -487,7 +484,7 @@ func (service *Service) CreateLocalUser(ctx context.Context, actor identity.Prin
 		return LocalUserProvisioning{}, fmt.Errorf("generate local user ID: %w", err)
 	}
 	user := UserPrincipal{
-		ID: userID, Username: username, DisplayName: displayName, Email: emailAddress,
+		ID: userID, Username: command.Username, DisplayName: command.DisplayName, Email: command.Email,
 		Kind: UserKindLocal, Status: UserStatusPending, Version: 1, CreatedAt: now, UpdatedAt: now,
 	}
 	credential := LocalCredential{
@@ -534,18 +531,6 @@ func generateActivationToken() (string, error) {
 		return "", fmt.Errorf("generate activation token: %w", err)
 	}
 	return base64.RawURLEncoding.EncodeToString(buffer), nil
-}
-
-func normalizeEmail(raw string) (string, error) {
-	raw = strings.ToLower(strings.TrimSpace(raw))
-	if raw == "" {
-		return "", nil
-	}
-	address, err := mail.ParseAddress(raw)
-	if err != nil || address.Address != raw || len(raw) > 320 {
-		return "", ErrUserInputInvalid
-	}
-	return raw, nil
 }
 
 func NewService(config ServiceConfig) (*Service, error) {

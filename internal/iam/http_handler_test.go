@@ -69,6 +69,55 @@ func TestHTTPHandlerCreatesLocalUserWithoutPersistingSecretInRequestState(t *tes
 	}
 }
 
+func TestHTTPHandlerAndServiceShareStrictLocalUserInputContract(t *testing.T) {
+	t.Parallel()
+
+	for _, testCase := range []struct {
+		name    string
+		command CreateLocalUserCommand
+	}{
+		{name: "username leading whitespace", command: CreateLocalUserCommand{Username: " release.operator", DisplayName: "Release Operator", Email: "operator@example.com"}},
+		{name: "username uppercase", command: CreateLocalUserCommand{Username: "Release.Operator", DisplayName: "Release Operator", Email: "operator@example.com"}},
+		{name: "display whitespace only", command: CreateLocalUserCommand{Username: "release.operator", DisplayName: "  ", Email: "operator@example.com"}},
+		{name: "display leading whitespace", command: CreateLocalUserCommand{Username: "release.operator", DisplayName: " Release Operator", Email: "operator@example.com"}},
+		{name: "display trailing whitespace", command: CreateLocalUserCommand{Username: "release.operator", DisplayName: "Release Operator ", Email: "operator@example.com"}},
+		{name: "email leading whitespace", command: CreateLocalUserCommand{Username: "release.operator", DisplayName: "Release Operator", Email: " operator@example.com"}},
+		{name: "email trailing whitespace", command: CreateLocalUserCommand{Username: "release.operator", DisplayName: "Release Operator", Email: "operator@example.com "}},
+		{name: "email uppercase", command: CreateLocalUserCommand{Username: "release.operator", DisplayName: "Release Operator", Email: "OPERATOR@example.com"}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			serviceHarness := newIAMHarness(t)
+			if _, err := serviceHarness.service.CreateLocalUser(context.Background(), serviceHarness.admin, testCase.command, serviceHarness.request); !errors.Is(err, ErrUserInputInvalid) {
+				t.Fatalf("service CreateLocalUser() error = %v, want ErrUserInputInvalid", err)
+			}
+			if serviceHarness.repository.withinTransactionCalls != 0 {
+				t.Fatalf("invalid service input reached repository transaction %d times", serviceHarness.repository.withinTransactionCalls)
+			}
+
+			application := &stubIAMApplication{}
+			body, err := json.Marshal(map[string]string{
+				"username":     testCase.command.Username,
+				"display_name": testCase.command.DisplayName,
+				"email":        testCase.command.Email,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := httptest.NewRequest(http.MethodPost, "/api/v1/local-users", bytes.NewReader(body))
+			request.Header.Set("Authorization", "Bearer token")
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			authenticatedIAMHandler(application).ServeHTTP(response, request)
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("HTTP status = %d, body = %s", response.Code, response.Body)
+			}
+			if application.createCalls != 0 {
+				t.Fatalf("invalid HTTP input invoked application %d times", application.createCalls)
+			}
+		})
+	}
+}
+
 func TestHTTPHandlerNeverReturnsProvisioningSecretFromUserReads(t *testing.T) {
 	t.Parallel()
 
@@ -353,6 +402,7 @@ func (verifier iamStaticVerifier) Verify(context.Context, string) (identity.Prin
 type stubIAMApplication struct {
 	provisioning          LocalUserProvisioning
 	createError           error
+	createCalls           int
 	createCommand         CreateLocalUserCommand
 	createRequest         RequestContext
 	page                  UserPage
@@ -369,6 +419,7 @@ type stubIAMApplication struct {
 }
 
 func (application *stubIAMApplication) CreateLocalUser(_ context.Context, _ identity.Principal, command CreateLocalUserCommand, request RequestContext) (LocalUserProvisioning, error) {
+	application.createCalls++
 	application.createCommand = command
 	application.createRequest = request
 	return application.provisioning, application.createError

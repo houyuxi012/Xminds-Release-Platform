@@ -299,9 +299,14 @@ func createLocalUserHandler(application IAMApplication) http.HandlerFunc {
 			writeIAMProblem(writer, request, http.StatusBadRequest, "REQUEST_BODY_INVALID", "Request body is invalid", err)
 			return
 		}
-		result, err := application.CreateLocalUser(request.Context(), principal, CreateLocalUserCommand{
+		command, err := validateCreateLocalUserCommand(CreateLocalUserCommand{
 			Username: body.Username, DisplayName: body.DisplayName, Email: body.Email,
-		}, iamRequestContext(request))
+		})
+		if err != nil {
+			writeIAMApplicationError(writer, request, err)
+			return
+		}
+		result, err := application.CreateLocalUser(request.Context(), principal, command, iamRequestContext(request))
 		if err != nil {
 			writeIAMApplicationError(writer, request, err)
 			return
