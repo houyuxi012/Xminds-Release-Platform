@@ -108,7 +108,12 @@ GitHub Actions 在 Pull Request 和 `main` 分支推送时执行三个独立门�
 - `Integration`：通过 `compose.integration.yaml` 启动 PostgreSQL 18 和 MinIO，执行 `make test-integration`，最后无条件回收容器与测试卷；
 - `Console E2E`：安装 Chromium 运行时后执行 `make console-e2e`。
 
-Go 版本由 `go.mod` 的 `toolchain` 声明统一管理，Node.js 版本由根目录 `.node-version` 统一管理。工作流程仅具有仓库内容读权限，所有 GitHub Action 都固定到完整提交 SHA，不使用 Pull Request Secret。Dependabot 每周检查 GitHub Action 更新并创建独立 Pull Request，不自动合并。
+安全工作流提供额外的代码与供应链门禁：
+
+- `CodeQL (go)` 与 `CodeQL (javascript-typescript)`：在 Pull Request、`main` 推送和每周计划任务中使用 `security-extended` 查询套件分析 Go 与 TypeScript/JavaScript；
+- `Dependency Review`：在 Pull Request 中检查运行时和开发依赖，新增高危或严重漏洞依赖时阻断合并，不写入 Pull Request 评论。
+
+Go 版本由 `go.mod` 的 `toolchain` 声明统一管理，Node.js 版本由根目录 `.node-version` 统一管理。常规工作流程仅具有仓库内容读权限；CodeQL 只额外获得上传扫描结果所需的 `security-events: write` 和读取查询包所需的 `packages: read`。所有 GitHub Action 都固定到完整提交 SHA，不使用 Pull Request Secret。Dependabot 每周检查 GitHub Action 更新并创建独立 Pull Request，不自动合并。
 
 ## 管理控制台
 
