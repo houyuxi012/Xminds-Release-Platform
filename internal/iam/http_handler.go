@@ -76,6 +76,7 @@ func NewHTTPHandler(application IAMApplication) http.Handler {
 }
 
 func RegisterRoutes(router chi.Router, application IAMApplication) {
+	router.Get("/api/v1/auth/session", currentSessionHandler())
 	router.Post("/api/v1/local-users", createLocalUserHandler(application))
 	router.Route("/api/v1/users", func(router chi.Router) {
 		router.Get("/", listUsersHandler(application))
@@ -111,6 +112,71 @@ func RegisterRoutes(router chi.Router, application IAMApplication) {
 	}
 	if mfa, ok := application.(MFAManagementApplication); ok {
 		registerMFAManagementRoutes(router, mfa)
+	}
+}
+
+type currentSessionRoleScope struct {
+	Role        identity.Role `json:"role"`
+	Effect      string        `json:"effect"`
+	ScopeType   string        `json:"scope_type"`
+	ProductID   string        `json:"product_id,omitempty"`
+	ChannelName string        `json:"channel_name,omitempty"`
+}
+
+type currentSessionResponse struct {
+	Subject                 string                    `json:"subject"`
+	Kind                    identity.PrincipalKind    `json:"kind"`
+	GovernedUserID          string                    `json:"governed_user_id,omitempty"`
+	Roles                   []identity.Role           `json:"roles"`
+	ProductIDs              []string                  `json:"product_ids"`
+	RoleScopes              []currentSessionRoleScope `json:"role_scopes"`
+	AuthenticationAssurance int                       `json:"authentication_assurance"`
+}
+
+func currentSessionHandler() http.HandlerFunc {
+	return func(writer http.ResponseWriter, request *http.Request) {
+		principal, ok := requireIAMPrincipal(writer, request)
+		if !ok {
+			return
+		}
+		roles := append([]identity.Role{}, principal.Roles...)
+		productIDs := append([]string{}, principal.ProductIDs...)
+		roleScopes := make([]currentSessionRoleScope, 0, len(principal.RoleScopes))
+		seenRoles, seenProducts := make(map[identity.Role]struct{}), make(map[string]struct{})
+		for _, role := range roles {
+			seenRoles[role] = struct{}{}
+		}
+		for _, productID := range productIDs {
+			seenProducts[productID] = struct{}{}
+		}
+		for _, scope := range principal.RoleScopes {
+			scopeType := scope.ScopeType
+			if scopeType == string(ScopeTypeChannel) {
+				scopeType = "product_channel"
+			}
+			roleScopes = append(roleScopes, currentSessionRoleScope{
+				Role: scope.Role, Effect: scope.Effect, ScopeType: scopeType,
+				ProductID: scope.ProductID, ChannelName: scope.ChannelName,
+			})
+			if scope.Effect == string(BindingEffectAllow) {
+				if _, found := seenRoles[scope.Role]; !found {
+					roles = append(roles, scope.Role)
+					seenRoles[scope.Role] = struct{}{}
+				}
+				if scope.ProductID != "" {
+					if _, found := seenProducts[scope.ProductID]; !found {
+						productIDs = append(productIDs, scope.ProductID)
+						seenProducts[scope.ProductID] = struct{}{}
+					}
+				}
+			}
+		}
+		writer.Header().Set("Cache-Control", "no-store")
+		writeIAMJSON(writer, http.StatusOK, currentSessionResponse{
+			Subject: principal.Subject, Kind: principal.Kind, GovernedUserID: principal.GovernedUserID,
+			Roles: roles, ProductIDs: productIDs, RoleScopes: roleScopes,
+			AuthenticationAssurance: principal.AuthenticationAssurance,
+		})
 	}
 }
 

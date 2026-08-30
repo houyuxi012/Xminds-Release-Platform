@@ -81,15 +81,22 @@ func (repository *PostgresRepository) Get(ctx context.Context, productID string)
 	return product, nil
 }
 
-func (repository *PostgresRepository) List(ctx context.Context, productIDs []string, page Page) (ProductPage, error) {
+func (repository *PostgresRepository) List(ctx context.Context, scope ProductListScope, page Page) (ProductPage, error) {
 	if repository == nil || repository.pool == nil {
 		return ProductPage{}, ErrRepositoryRequired
 	}
-	if len(productIDs) == 0 {
+	if !scope.AllProducts && len(scope.IncludedProductIDs) == 0 {
 		return ProductPage{Items: []Product{}}, nil
 	}
-	query := productSelect + ` WHERE id = ANY($1)`
-	arguments := []any{productIDs}
+	query := productSelect
+	arguments := make([]any, 0, 4)
+	if scope.AllProducts {
+		query += ` WHERE NOT (id = ANY($1))`
+		arguments = append(arguments, append([]string{}, scope.ExcludedProductIDs...))
+	} else {
+		query += ` WHERE id = ANY($1)`
+		arguments = append(arguments, append([]string{}, scope.IncludedProductIDs...))
+	}
 	if !page.BeforeTime.IsZero() {
 		query += ` AND (created_at, id) < ($2, $3)`
 		arguments = append(arguments, page.BeforeTime.UTC(), page.BeforeID)

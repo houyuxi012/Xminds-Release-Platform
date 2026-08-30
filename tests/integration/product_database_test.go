@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -101,6 +102,128 @@ func TestProductDatabaseRollsBackWhenAuditAppendFails(t *testing.T) {
 	}
 	if productCount != 0 {
 		t.Fatalf("products after rollback = %d, want 0", productCount)
+	}
+}
+
+func TestProductDatabaseGovernedPlatformListAppliesExplicitDeny(t *testing.T) {
+	databaseURL := integrationDatabaseURL(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	pool, err := database.Open(ctx, databaseURL)
+	if err != nil {
+		t.Fatalf("database.Open() error = %v", err)
+	}
+	defer pool.Close()
+	if err := database.ApplyMigrations(ctx, pool, migrations.FS); err != nil {
+		t.Fatalf("database.ApplyMigrations() error = %v", err)
+	}
+
+	allowedID := "allowed-" + uuid.NewString()
+	deniedID := "denied-" + uuid.NewString()
+	repository := product.NewPostgresRepository(pool)
+	service := product.NewService(repository, product.PoolTransactor{Pool: pool}, audit.NewService(audit.NewPostgresRepository(pool)))
+	for _, productID := range []string{allowedID, deniedID} {
+		registrar := identity.Principal{
+			Subject: "product-admin", Kind: identity.PrincipalKindHuman,
+			Roles: []identity.Role{identity.RoleAdmin}, ProductIDs: []string{productID},
+		}
+		if _, err := service.Register(ctx, registrar, integrationManifest(productID), product.RequestContext{RequestID: uuid.NewString()}); err != nil {
+			t.Fatalf("Register(%q) error = %v", productID, err)
+		}
+	}
+
+	governed := identity.Principal{
+		Subject: "governed-admin", Kind: identity.PrincipalKindLocal, Governed: true,
+		AuthenticationAssurance: 1,
+		RoleScopes: []identity.RoleScope{
+			{Role: identity.RoleAdmin, Effect: "allow", ScopeType: "platform"},
+			{Role: identity.RoleViewer, Effect: "deny", ScopeType: "product", ProductID: deniedID},
+		},
+	}
+	page, err := service.List(ctx, governed, product.Page{Limit: 200})
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	foundAllowed, foundDenied := false, false
+	for _, item := range page.Items {
+		foundAllowed = foundAllowed || item.ID == allowedID
+		foundDenied = foundDenied || item.ID == deniedID
+	}
+	if !foundAllowed || foundDenied {
+		t.Fatalf("governed list allowed=%t denied=%t, want true/false", foundAllowed, foundDenied)
+	}
+}
+
+func TestProductDatabaseGovernedPlatformAdministratorRegistersProduct(t *testing.T) {
+	databaseURL := integrationDatabaseURL(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	pool, err := database.Open(ctx, databaseURL)
+	if err != nil {
+		t.Fatalf("database.Open() error = %v", err)
+	}
+	defer pool.Close()
+	if err := database.ApplyMigrations(ctx, pool, migrations.FS); err != nil {
+		t.Fatalf("database.ApplyMigrations() error = %v", err)
+	}
+
+	productID := "governed-" + uuid.NewString()
+	principal := identity.Principal{
+		Subject: "governed-admin", Kind: identity.PrincipalKindLocal, Governed: true,
+		AuthenticationAssurance: 1,
+		RoleScopes:              []identity.RoleScope{{Role: identity.RoleAdmin, Effect: "allow", ScopeType: "platform"}},
+	}
+	service := product.NewService(
+		product.NewPostgresRepository(pool),
+		product.PoolTransactor{Pool: pool},
+		audit.NewService(audit.NewPostgresRepository(pool)),
+	)
+	created, err := service.Register(ctx, principal, integrationManifest(productID), product.RequestContext{
+		RequestID: uuid.NewString(), SourceIP: "127.0.0.1",
+	})
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	if created.ID != productID {
+		t.Fatalf("created product = %q, want %q", created.ID, productID)
+	}
+}
+
+func TestProductDatabaseRegistersManifestWithEmptyCompatibilityKeys(t *testing.T) {
+	databaseURL := integrationDatabaseURL(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	pool, err := database.Open(ctx, databaseURL)
+	if err != nil {
+		t.Fatalf("database.Open() error = %v", err)
+	}
+	defer pool.Close()
+	if err := database.ApplyMigrations(ctx, pool, migrations.FS); err != nil {
+		t.Fatalf("database.ApplyMigrations() error = %v", err)
+	}
+
+	productID := "empty-keys-" + uuid.NewString()
+	principal := identity.Principal{
+		Subject: "product-admin", Kind: identity.PrincipalKindHuman,
+		Roles: []identity.Role{identity.RoleAdmin}, ProductIDs: []string{productID},
+	}
+	service := product.NewService(
+		product.NewPostgresRepository(pool),
+		product.PoolTransactor{Pool: pool},
+		audit.NewService(audit.NewPostgresRepository(pool)),
+	)
+	manifest := strings.Replace(string(integrationManifest(productID)), `"compatibility_keys":["os","arch"]`, `"compatibility_keys":[]`, 1)
+	created, err := service.Register(ctx, principal, []byte(manifest), product.RequestContext{
+		RequestID: uuid.NewString(), SourceIP: "127.0.0.1",
+	})
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	if created.CompatibilityKeys == nil || len(created.CompatibilityKeys) != 0 {
+		t.Fatalf("compatibility keys = %#v, want non-nil empty collection", created.CompatibilityKeys)
 	}
 }
 

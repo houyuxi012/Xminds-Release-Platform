@@ -23,8 +23,14 @@ var (
 type Repository interface {
 	Create(ctx context.Context, tx pgx.Tx, product Product, channels []Channel) error
 	Get(ctx context.Context, productID string) (Product, error)
-	List(ctx context.Context, productIDs []string, page Page) (ProductPage, error)
+	List(ctx context.Context, scope ProductListScope, page Page) (ProductPage, error)
 	Deactivate(ctx context.Context, tx pgx.Tx, productID string, deactivatedAt time.Time) (Product, error)
+}
+
+type ProductListScope struct {
+	AllProducts        bool
+	IncludedProductIDs []string
+	ExcludedProductIDs []string
 }
 
 type Transactor interface {

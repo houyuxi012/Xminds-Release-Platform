@@ -30,6 +30,11 @@ type ProductApplication interface {
 	Deactivate(ctx context.Context, principal identity.Principal, productID string, request RequestContext) (Product, error)
 }
 
+type productPageResponse struct {
+	Items      []Product `json:"items"`
+	NextCursor string    `json:"next_cursor,omitempty"`
+}
+
 func NewHTTPHandler(application ProductApplication) http.Handler {
 	if application == nil {
 		return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -111,7 +116,10 @@ func listProductsHandler(application ProductApplication) http.HandlerFunc {
 			writeProductApplicationError(writer, request, err)
 			return
 		}
-		writeJSON(writer, http.StatusOK, result)
+		writeJSON(writer, http.StatusOK, productPageResponse{
+			Items:      append([]Product{}, result.Items...),
+			NextCursor: result.NextCursor,
+		})
 	}
 }
 

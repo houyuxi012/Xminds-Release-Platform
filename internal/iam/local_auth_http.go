@@ -10,6 +10,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
+	"xminds-release-platform/internal/identity"
 	"xminds-release-platform/internal/platform/httpx"
 )
 
@@ -17,6 +18,14 @@ type LocalAuthApplication interface {
 	ActivateWithResult(ctx context.Context, command ActivateLocalAccountCommand, request RequestContext) (LocalActivationResult, error)
 	LoginLocal(ctx context.Context, command LocalLoginCommand, request RequestContext) (LoginResult, error)
 	LoginEmergency(ctx context.Context, command LocalLoginCommand, request RequestContext) (LoginResult, error)
+}
+
+type PublicLoginStateApplication interface {
+	GetPublicLoginState(ctx context.Context) (PublicLoginState, error)
+}
+
+type CurrentSessionLogoutApplication interface {
+	LogoutCurrentSession(ctx context.Context, principal identity.Principal, request RequestContext) error
 }
 
 type MFAActivationEnrollmentApplication interface {
@@ -30,6 +39,21 @@ func RegisterPublicAuthRoutes(router chi.Router, application LocalAuthApplicatio
 	router.Post("/api/v1/auth/local/activate", activateLocalAccountHandler(application))
 	router.Post("/api/v1/auth/local/login", localLoginHandler(application, false))
 	router.Post("/api/v1/auth/emergency/login", localLoginHandler(application, true))
+	if loginState, ok := application.(PublicLoginStateApplication); ok {
+		router.Get("/api/v1/auth/login-state", publicLoginStateHandler(loginState))
+	}
+}
+
+func publicLoginStateHandler(application PublicLoginStateApplication) http.HandlerFunc {
+	return func(writer http.ResponseWriter, request *http.Request) {
+		state, err := application.GetPublicLoginState(request.Context())
+		if err != nil {
+			writeIAMProblem(writer, request, http.StatusServiceUnavailable, "LOGIN_STATE_UNAVAILABLE", "Login state is unavailable", err)
+			return
+		}
+		writer.Header().Set("Cache-Control", "no-store")
+		writeIAMJSON(writer, http.StatusOK, state)
+	}
 }
 
 func RegisterPublicMFAEnrollmentRoutes(router chi.Router, application MFAActivationEnrollmentApplication) {
@@ -37,6 +61,28 @@ func RegisterPublicMFAEnrollmentRoutes(router chi.Router, application MFAActivat
 		return
 	}
 	router.Post("/api/v1/auth/local/mfa-enrollments", beginActivationMFAEnrollmentHandler(application))
+}
+
+func RegisterCurrentSessionLogoutRoute(router chi.Router, application CurrentSessionLogoutApplication) {
+	if application == nil {
+		return
+	}
+	router.Post("/api/v1/auth/logout", currentSessionLogoutHandler(application))
+}
+
+func currentSessionLogoutHandler(application CurrentSessionLogoutApplication) http.HandlerFunc {
+	return func(writer http.ResponseWriter, request *http.Request) {
+		principal, ok := requireIAMPrincipal(writer, request)
+		if !ok {
+			return
+		}
+		if err := application.LogoutCurrentSession(request.Context(), principal, iamRequestContext(request)); err != nil {
+			writeLocalAuthError(writer, request, err)
+			return
+		}
+		writer.Header().Set("Cache-Control", "no-store")
+		writer.WriteHeader(http.StatusNoContent)
+	}
 }
 
 func beginActivationMFAEnrollmentHandler(application MFAActivationEnrollmentApplication) http.HandlerFunc {

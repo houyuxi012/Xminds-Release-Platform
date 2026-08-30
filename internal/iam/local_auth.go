@@ -104,6 +104,14 @@ type LoginRepository interface {
 	SaveAuthenticationSuccess(ctx context.Context, tx pgx.Tx, userID uuid.UUID, mfaCounter int64, session Session) error
 }
 
+type LoginStateRepository interface {
+	GetLoginState(ctx context.Context, tx pgx.Tx) (LoginState, error)
+}
+
+type CurrentSessionRepository interface {
+	RevokeCurrentSession(ctx context.Context, tx pgx.Tx, sessionID uuid.UUID, revokedAt time.Time, reason string) error
+}
+
 type MFARecoveryRepository interface {
 	ConsumeMFARecoveryCode(ctx context.Context, tx pgx.Tx, userID uuid.UUID, digest string, usedAt time.Time) (bool, error)
 }
@@ -127,6 +135,8 @@ type LocalAuthConfig struct {
 type LocalAuthService struct {
 	repository       ActivationRepository
 	login            LoginRepository
+	loginState       LoginStateRepository
+	currentSession   CurrentSessionRepository
 	reauthentication LocalReauthenticationRepository
 	mfaActivation    MFAActivationRepository
 	mfaRecovery      MFARecoveryRepository
@@ -140,19 +150,62 @@ type LocalAuthService struct {
 
 func NewLocalAuthService(config LocalAuthConfig) (*LocalAuthService, error) {
 	login, ok := config.Repository.(LoginRepository)
+	loginState, loginStateOK := config.Repository.(LoginStateRepository)
+	currentSession, currentSessionOK := config.Repository.(CurrentSessionRepository)
 	reauthentication, reauthenticationOK := config.Repository.(LocalReauthenticationRepository)
 	mfaActivation, mfaActivationOK := config.Repository.(MFAActivationRepository)
 	mfaRecovery, mfaRecoveryOK := config.Repository.(MFARecoveryRepository)
-	if config.Repository == nil || !ok || !reauthenticationOK || !mfaActivationOK || !mfaRecoveryOK || config.Auditor == nil || config.Passwords == nil || config.MFA == nil || config.Clock == nil || !validLocalAuthPolicy(config.Policy) {
+	if config.Repository == nil || !ok || !loginStateOK || !currentSessionOK || !reauthenticationOK || !mfaActivationOK || !mfaRecoveryOK || config.Auditor == nil || config.Passwords == nil || config.MFA == nil || config.Clock == nil || !validLocalAuthPolicy(config.Policy) {
 		return nil, ErrIAMConfiguration
 	}
 	if _, _, _, _, err := parsePasswordDigest(config.DummyPassword); err != nil {
 		return nil, ErrIAMConfiguration
 	}
 	return &LocalAuthService{
-		repository: config.Repository, login: login, reauthentication: reauthentication, auditor: config.Auditor, passwords: config.Passwords,
+		repository: config.Repository, login: login, loginState: loginState, currentSession: currentSession, reauthentication: reauthentication, auditor: config.Auditor, passwords: config.Passwords,
 		dummyPassword: config.DummyPassword, mfa: config.MFA, mfaActivation: mfaActivation, mfaRecovery: mfaRecovery, policy: cloneLocalAuthPolicy(config.Policy), clock: config.Clock,
 	}, nil
+}
+
+func (service *LocalAuthService) LogoutCurrentSession(ctx context.Context, principal identity.Principal, request RequestContext) error {
+	if service == nil || service.repository == nil || service.currentSession == nil || service.auditor == nil || service.clock == nil || principal.Kind != identity.PrincipalKindLocal {
+		return ErrLocalAuthenticationFailed
+	}
+	sessionID, err := uuid.Parse(strings.TrimSpace(principal.TokenID))
+	if err != nil || sessionID == uuid.Nil {
+		return ErrLocalAuthenticationFailed
+	}
+	now := service.clock().UTC().Truncate(time.Microsecond)
+	return service.repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
+		if err := service.currentSession.RevokeCurrentSession(ctx, tx, sessionID, now, "user logout"); err != nil {
+			return err
+		}
+		_, err := service.auditor.Append(ctx, tx, audit.AppendCommand{
+			Actor: principal, Action: "identity.session.logout", ResourceType: "local_session", ResourceID: sessionID.String(),
+			Outcome: audit.OutcomeSuccess, RequestID: request.RequestID, SourceIP: request.SourceIP,
+		})
+		return err
+	})
+}
+
+type PublicLoginState struct {
+	Mode LoginMode `json:"mode"`
+}
+
+func (service *LocalAuthService) GetPublicLoginState(ctx context.Context) (PublicLoginState, error) {
+	if service == nil || service.loginState == nil {
+		return PublicLoginState{}, ErrIAMConfiguration
+	}
+	state, err := service.loginState.GetLoginState(ctx, nil)
+	if err != nil {
+		return PublicLoginState{}, err
+	}
+	switch state.Mode {
+	case LoginModeLocal, LoginModeConfiguring, LoginModeSSO, LoginModeFault:
+		return PublicLoginState{Mode: state.Mode}, nil
+	default:
+		return PublicLoginState{}, ErrIAMConfiguration
+	}
 }
 
 type localFactorResult struct {

@@ -383,6 +383,23 @@ WHERE id=$1 AND version=$4 AND revoked_at IS NULL`, sessionID, lastUsedAt.UTC(),
 	return nil
 }
 
+func (repository *PostgresRepository) RevokeCurrentSession(ctx context.Context, tx pgx.Tx, sessionID uuid.UUID, revokedAt time.Time, reason string) error {
+	reason = strings.TrimSpace(reason)
+	if repository == nil || repository.pool == nil || tx == nil || sessionID == uuid.Nil || reason == "" || len(reason) > 256 || revokedAt.IsZero() {
+		return ErrIAMConfiguration
+	}
+	result, err := tx.Exec(ctx, `
+UPDATE local_sessions SET revoked_at=$2, revocation_reason=$3, version=version+1
+WHERE id=$1 AND revoked_at IS NULL`, sessionID, revokedAt.UTC(), reason)
+	if err != nil {
+		return fmt.Errorf("revoke current local session: %w", err)
+	}
+	if result.RowsAffected() != 1 {
+		return ErrLocalAuthenticationFailed
+	}
+	return nil
+}
+
 func (repository *PostgresRepository) RevokeSubject(ctx context.Context, tx pgx.Tx, subjectID uuid.UUID, reason string) error {
 	reason = strings.TrimSpace(reason)
 	if repository == nil || repository.pool == nil || tx == nil || subjectID == uuid.Nil || reason == "" || len(reason) > 256 {

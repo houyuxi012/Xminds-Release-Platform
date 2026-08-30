@@ -1,7 +1,9 @@
 import { Skeleton } from 'antd';
 import { lazy, Suspense } from 'react';
 import { Navigate, Route, Routes } from 'react-router-dom';
+import { useAuth } from '../auth/AuthProvider';
 import { AppShell } from '../layout/AppShell';
+import { LoginPage } from '../pages/auth/LoginPage';
 
 const OverviewPage = lazy(() =>
   import('../pages/overview/OverviewPage').then((module) => ({ default: module.OverviewPage })),
@@ -36,6 +38,10 @@ const AuditPage = lazy(() =>
 );
 
 export function ConsoleRoutes() {
+  const { status } = useAuth();
+  if (status !== 'authenticated') {
+    return <LoginPage />;
+  }
   return (
     <AppShell>
       <Suspense fallback={<Skeleton active paragraph={{ rows: 8 }} style={{ padding: 24 }} />}>

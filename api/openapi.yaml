@@ -286,6 +286,52 @@ paths:
                 $ref: '#/components/schemas/ProblemDetails'
         '500':
           $ref: '#/components/responses/InternalError'
+  /api/v1/auth/login-state:
+    get:
+      operationId: getPublicLoginState
+      summary: 获取当前控制台登录模式
+      description: 仅返回控制台选择普通本地、企业 SSO 或独立应急入口所需的最小状态，不公开活动来源、故障详情或 Secret。
+      tags: [Local Authentication]
+      security: []
+      responses:
+        '200':
+          description: 当前登录模式
+          headers:
+            Cache-Control:
+              schema: {type: string, const: no-store}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PublicLoginState'}
+        '503': {$ref: '#/components/responses/Problem503'}
+  /api/v1/auth/session:
+    get:
+      operationId: getCurrentSession
+      summary: 获取当前认证主体及服务端授权范围
+      description: 返回认证中间件和治理解析器已经确认的主体、角色及范围；不返回访问令牌、Token ID 或任何凭据材料。
+      tags: [Local Authentication]
+      responses:
+        '200':
+          description: 当前会话
+          headers:
+            Cache-Control:
+              schema: {type: string, const: no-store}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CurrentSession'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+  /api/v1/auth/logout:
+    post:
+      operationId: logoutCurrentSession
+      summary: 撤销当前本地或应急会话
+      description: 使用认证上下文中的服务器端 Session ID 撤销当前会话；请求和响应均不传输 Token ID。
+      tags: [Local Authentication]
+      responses:
+        '204':
+          description: 当前会话已撤销
+          headers:
+            Cache-Control:
+              schema: {type: string, const: no-store}
+        '401': {$ref: '#/components/responses/Unauthorized'}
   /api/v1/auth/emergency/login:
     post:
       operationId: loginEmergencyAccount
@@ -4146,6 +4192,47 @@ components:
           const: Bearer
         expires_at: {type: string, format: date-time}
         subject: {$ref: '#/components/schemas/LocalAuthenticatedSubject'}
+    PublicLoginState:
+      type: object
+      additionalProperties: false
+      required: [mode]
+      properties:
+        mode:
+          type: string
+          enum: [local, configuring, sso, fault]
+    CurrentSessionRoleScope:
+      type: object
+      additionalProperties: false
+      required: [role, effect, scope_type]
+      properties:
+        role: {type: string, enum: [admin, publisher, approver, auditor, viewer]}
+        effect: {type: string, enum: [allow, deny]}
+        scope_type: {type: string, enum: [platform, product, product_channel]}
+        product_id: {type: string, maxLength: 256}
+        channel_name: {type: string, maxLength: 128}
+    CurrentSession:
+      type: object
+      additionalProperties: false
+      required: [subject, kind, roles, product_ids, role_scopes, authentication_assurance]
+      properties:
+        subject: {type: string, minLength: 1, maxLength: 512}
+        kind: {type: string, enum: [human, local, workload]}
+        governed_user_id: {type: string, format: uuid}
+        roles:
+          type: array
+          maxItems: 5
+          uniqueItems: true
+          items: {type: string, enum: [admin, publisher, approver, auditor, viewer]}
+        product_ids:
+          type: array
+          maxItems: 200
+          uniqueItems: true
+          items: {type: string, maxLength: 256}
+        role_scopes:
+          type: array
+          maxItems: 1000
+          items: {$ref: '#/components/schemas/CurrentSessionRoleScope'}
+        authentication_assurance: {type: integer, minimum: 0, maximum: 3}
     ProblemDetails:
       type: object
       additionalProperties: false

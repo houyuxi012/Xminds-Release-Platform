@@ -618,6 +618,38 @@ func TestOpenAPIDefinesPublicLocalAuthenticationWithoutSensitiveResponseFields(t
 	}
 }
 
+func TestOpenAPIDefinesLoginBootstrapAndCurrentSessionContracts(t *testing.T) {
+	t.Parallel()
+	loader := openapi3.NewLoader()
+	document, err := loader.LoadFromFile("openapi.yaml")
+	if err != nil {
+		t.Fatalf("load OpenAPI contract: %v", err)
+	}
+	loginState := document.Paths.Find("/api/v1/auth/login-state")
+	if loginState == nil || loginState.Get == nil || loginState.Get.Security == nil || len(*loginState.Get.Security) != 0 {
+		t.Fatal("GET /api/v1/auth/login-state must be public")
+	}
+	if response := loginState.Get.Responses.Value("200"); response == nil || response.Value.Content["application/json"].Schema.Ref != "#/components/schemas/PublicLoginState" {
+		t.Fatal("login state response must use PublicLoginState")
+	}
+	currentSession := document.Paths.Find("/api/v1/auth/session")
+	if currentSession == nil || currentSession.Get == nil || currentSession.Get.Security != nil {
+		t.Fatal("GET /api/v1/auth/session must inherit global Bearer security")
+	}
+	if response := currentSession.Get.Responses.Value("200"); response == nil || response.Value.Content["application/json"].Schema.Ref != "#/components/schemas/CurrentSession" {
+		t.Fatal("current session response must use CurrentSession")
+	}
+	for _, forbidden := range []string{"access_token", "token_id"} {
+		if _, found := document.Components.Schemas["CurrentSession"].Value.Properties[forbidden]; found {
+			t.Fatalf("CurrentSession exposes %s", forbidden)
+		}
+	}
+	logout := document.Paths.Find("/api/v1/auth/logout")
+	if logout == nil || logout.Post == nil || logout.Post.Security != nil || logout.Post.Responses.Value("204") == nil {
+		t.Fatal("POST /api/v1/auth/logout must inherit Bearer security and return 204")
+	}
+}
+
 func TestOpenAPIDefinesDurableDirectorySynchronizationWithoutWorkerState(t *testing.T) {
 	t.Parallel()
 	loader := openapi3.NewLoader()

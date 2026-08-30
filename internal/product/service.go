@@ -14,8 +14,9 @@ import (
 )
 
 const (
-	defaultPageLimit = 50
-	maximumPageLimit = 200
+	defaultPageLimit          = 50
+	maximumPageLimit          = 200
+	productAuthorizationProbe = "__authorization_scope_probe__"
 )
 
 var ErrPageInvalid = errors.New("product page is invalid")
@@ -58,9 +59,9 @@ func (service *Service) Register(ctx context.Context, principal identity.Princip
 		ID:                manifest.ProductID,
 		DisplayName:       manifest.DisplayName,
 		SchemaVersion:     manifest.SchemaVersion,
-		ArtifactTypes:     append([]string(nil), manifest.ArtifactTypes...),
+		ArtifactTypes:     append([]string{}, manifest.ArtifactTypes...),
 		VersionScheme:     manifest.VersionScheme,
-		CompatibilityKeys: append([]string(nil), manifest.CompatibilityKeys...),
+		CompatibilityKeys: append([]string{}, manifest.CompatibilityKeys...),
 		CatalogFormat:     manifest.CatalogFormat,
 		Manifest:          canonical,
 		ManifestDigest:    digest,
@@ -133,19 +134,47 @@ func (service *Service) List(ctx context.Context, principal identity.Principal, 
 	if page.Limit == 0 {
 		page.Limit = defaultPageLimit
 	}
-	productIDs := uniqueNonEmpty(principal.ProductIDs)
-	if len(productIDs) == 0 {
-		if err := service.authorizer.Require(principal, identity.ActionProductRead, "scope-check"); !errors.Is(err, identity.ErrProductScopeDenied) {
-			return ProductPage{}, err
-		}
-		return ProductPage{Items: []Product{}}, nil
+	scope, err := service.resolveProductListScope(principal)
+	if err != nil {
+		return ProductPage{}, err
 	}
-	for _, productID := range productIDs {
-		if err := service.authorizer.Require(principal, identity.ActionProductRead, productID); err != nil {
-			return ProductPage{}, err
+	return service.repository.List(ctx, scope, page)
+}
+
+func (service *Service) resolveProductListScope(principal identity.Principal) (ProductListScope, error) {
+	if !principal.Governed {
+		productIDs := uniqueNonEmpty(principal.ProductIDs)
+		for _, productID := range productIDs {
+			if err := service.authorizer.Require(principal, identity.ActionProductRead, productID); err != nil {
+				return ProductListScope{}, err
+			}
+		}
+		return ProductListScope{IncludedProductIDs: productIDs}, nil
+	}
+
+	allProducts := service.authorizer.Require(principal, identity.ActionProductRead, productAuthorizationProbe) == nil
+	candidates := make([]string, 0, len(principal.RoleScopes))
+	for _, roleScope := range principal.RoleScopes {
+		if roleScope.ProductID != "" {
+			candidates = append(candidates, roleScope.ProductID)
 		}
 	}
-	return service.repository.List(ctx, productIDs, page)
+	candidates = uniqueNonEmpty(candidates)
+	result := ProductListScope{AllProducts: allProducts}
+	for _, productID := range candidates {
+		err := service.authorizer.Require(principal, identity.ActionProductRead, productID)
+		switch {
+		case err == nil && !allProducts:
+			result.IncludedProductIDs = append(result.IncludedProductIDs, productID)
+		case errors.Is(err, identity.ErrActionDenied) && allProducts:
+			result.ExcludedProductIDs = append(result.ExcludedProductIDs, productID)
+		case err == nil || errors.Is(err, identity.ErrActionDenied):
+			continue
+		default:
+			return ProductListScope{}, err
+		}
+	}
+	return result, nil
 }
 
 func (service *Service) Deactivate(ctx context.Context, principal identity.Principal, productID string, request RequestContext) (Product, error) {

@@ -6,14 +6,14 @@ import {
   CodeOutlined,
   DatabaseOutlined,
   DeploymentUnitOutlined,
+  LogoutOutlined,
   QuestionCircleOutlined,
   RocketOutlined,
 } from '@ant-design/icons';
 import { ProLayout } from '@ant-design/pro-components';
-import { Badge, Select, Space, Tag, Typography } from 'antd';
+import { Badge, Button, Dropdown, Space, Tag, Typography } from 'antd';
 import type { ReactNode } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
-import type { PlatformRole } from '../api/types';
 import { platformRoleLabels, useAuth } from '../auth/AuthProvider';
 
 const menuRoutes = [
@@ -45,7 +45,12 @@ const menuRoutes = [
 export function AppShell({ children }: { children: ReactNode }) {
   const location = useLocation();
   const navigate = useNavigate();
-  const { activeRole, setActiveRole, principal } = useAuth();
+  const { logout, principal } = useAuth();
+  if (!principal) {
+    return null;
+  }
+  const roleLabel =
+    principal.roles.map((role) => platformRoleLabels[role]).join('、') || '无平台角色';
 
   return (
     <div data-testid="console-shell" data-navigation-surface="white">
@@ -92,19 +97,21 @@ export function AppShell({ children }: { children: ReactNode }) {
           <Space key="principal" size={8}>
             <div className="principal-copy">
               <Typography.Text strong>{principal.displayName}</Typography.Text>
-              <Typography.Text type="secondary">演示权限</Typography.Text>
+              <Typography.Text type="secondary">{roleLabel}</Typography.Text>
             </div>
-            <Select<PlatformRole>
-              aria-label="演示角色"
-              value={activeRole}
-              onChange={setActiveRole}
+            <Dropdown
               placement="bottomRight"
-              popupMatchSelectWidth={false}
-              options={(Object.keys(platformRoleLabels) as PlatformRole[]).map((role) => ({
-                value: role,
-                label: platformRoleLabels[role],
-              }))}
-            />
+              menu={{
+                items: [{ key: 'logout', label: '退出登录', icon: <LogoutOutlined /> }],
+                onClick: ({ key }) => {
+                  if (key === 'logout') void logout();
+                },
+              }}
+            >
+              <Button type="text" aria-label="账户菜单">
+                账户
+              </Button>
+            </Dropdown>
           </Space>,
         ]}
         token={{

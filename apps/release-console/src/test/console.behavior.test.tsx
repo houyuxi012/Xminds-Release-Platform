@@ -1,7 +1,10 @@
 import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { App } from '../app/App';
+import { apiProductFixture } from './apiFixtures';
+
+afterEach(() => vi.unstubAllGlobals());
 
 describe('控制台交互与可访问性', () => {
   it('使用白色导航语义并支持键盘进入主流程', async () => {
@@ -28,7 +31,8 @@ describe('控制台交互与可访问性', () => {
     expect(within(dialog).getAllByText('批准 Release 1.2.3').length).toBeGreaterThan(0);
     await userEvent.click(within(dialog).getByRole('button', { name: '确认批准' }));
 
-    expect(await screen.findByRole('button', { name: '开始发布' })).toBeVisible();
+    expect(screen.queryByRole('button', { name: '批准发布' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '开始发布' })).not.toBeInTheDocument();
   });
 
   it('分块上传中断后可继续，并显示服务端摘要校验结果', async () => {
@@ -47,6 +51,13 @@ describe('控制台交互与可访问性', () => {
   });
 
   it('产品详情使用白色抽屉语义，不依赖组件库内部类名', async () => {
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+      Response.json(
+        { items: [apiProductFixture] },
+        { headers: { 'content-type': 'application/json' } },
+      ),
+    );
+    vi.stubGlobal('fetch', fetchMock);
     render(<App initialEntries={['/products']} initialRoles={['admin']} />);
 
     const detailButtons = await screen.findAllByRole('button', { name: '查看详情' });
@@ -56,6 +67,36 @@ describe('控制台交互与可访问性', () => {
     expect(
       within(screen.getByTestId('white-detail-drawer')).getByText('Manifest 摘要'),
     ).toBeVisible();
+    expect(within(screen.getByTestId('white-detail-drawer')).getByText('macos-dmg')).toBeVisible();
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/v1/products?limit=50',
+      expect.objectContaining({ cache: 'no-store', credentials: 'same-origin' }),
+    );
+  });
+
+  it('产品列表在服务端失败时展示可追踪错误而不回退演示数据', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        Response.json(
+          {
+            type: 'https://xminds.example/problems/product-service-unavailable',
+            title: '产品服务不可用',
+            status: 503,
+            detail: '请稍后重试',
+            code: 'PRODUCT_SERVICE_UNAVAILABLE',
+            request_id: 'req_products_unavailable',
+          },
+          { status: 503, headers: { 'content-type': 'application/problem+json' } },
+        ),
+      ),
+    );
+
+    render(<App initialEntries={['/products']} initialRoles={['admin']} />);
+
+    expect(await screen.findByText('产品服务不可用（PRODUCT_SERVICE_UNAVAILABLE）')).toBeVisible();
+    expect(screen.getByText('请求 ID：req_products_unavailable')).toBeVisible();
+    expect(screen.queryByText('Next-Gen Enterprise Portal')).not.toBeInTheDocument();
   });
 
   it('证据导出仅对审计员显示', async () => {

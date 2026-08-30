@@ -33,6 +33,20 @@ func TestBoundaryCheckRejectsEscapingRelativeImports(t *testing.T) {
 	runScriptExpectFailure(t, "../../scripts/check-boundaries.sh", root)
 }
 
+func TestBoundaryCheckPrunesDependencyBuildAndCacheTrees(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	for _, path := range []string{
+		filepath.Join(root, "apps", "console", "node_modules", "dependency", "unsafe.ts"),
+		filepath.Join(root, "apps", "console", "dist", "unsafe.ts"),
+		filepath.Join(root, ".cache", "generated", "unsafe.ts"),
+	} {
+		writeFixture(t, path, "import config from '../../../../../../parent/config';\nvoid config;\n")
+	}
+	runScriptExpectSuccess(t, "../../scripts/check-boundaries.sh", root)
+}
+
 func writeFixture(t *testing.T, path string, content string) {
 	t.Helper()
 
