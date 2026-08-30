@@ -35,6 +35,111 @@ tags:
   - name: Public Distribution
     description: 无需登录的 TUF 元数据兼容下载与产品范围制品下载
 paths:
+  /api/v1/log-exports:
+    post:
+      operationId: createLogExport
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/LogExportRequest' } } }
+      responses:
+        '202': { description: 已创建, headers: { Cache-Control: { schema: { type: string, const: no-store } } }, content: { application/json: { schema: { $ref: '#/components/schemas/LogExport' } } } }
+        '400': { $ref: '#/components/responses/Problem400' }
+        '401': { $ref: '#/components/responses/Problem401' }
+        '403': { $ref: '#/components/responses/Problem403' }
+        '409': { $ref: '#/components/responses/Problem409' }
+        '503': { $ref: '#/components/responses/Problem503' }
+  /api/v1/log-exports/{export_id}:
+    get:
+      operationId: getLogExport
+      parameters: [{ in: path, name: export_id, required: true, schema: { type: string, format: uuid } }]
+      responses:
+        '200': { description: 导出状态, headers: { Cache-Control: { schema: { type: string, const: no-store } } }, content: { application/json: { schema: { $ref: '#/components/schemas/LogExport' } } } }
+        '404': { $ref: '#/components/responses/Problem404' }
+        '503': { $ref: '#/components/responses/Problem503' }
+  /api/v1/log-exports/{export_id}/download:
+    post:
+      operationId: grantLogExportDownload
+      parameters: [{ in: path, name: export_id, required: true, schema: { type: string, format: uuid } }]
+      responses:
+        '200': { description: 短时下载授权, headers: { Cache-Control: { schema: { type: string, const: no-store } } }, content: { application/json: { schema: { $ref: '#/components/schemas/LogExportDownload' } } } }
+        '404': { $ref: '#/components/responses/Problem404' }
+        '503': { $ref: '#/components/responses/Problem503' }
+  /api/v1/log-exports/{export_id}/content:
+    get:
+      operationId: streamLogExportContent
+      parameters: [{ in: path, name: export_id, required: true, schema: { type: string, format: uuid } }]
+      responses:
+        '200': { description: 归档 NDJSON, headers: { Content-Length: { schema: { type: integer, format: int64 } } }, content: { application/x-ndjson: { schema: { type: string, format: binary } } } }
+        '404': { $ref: '#/components/responses/Problem404' }
+        '503': { $ref: '#/components/responses/Problem503' }
+  /api/v1/logs/operations:
+    get:
+      operationId: listOperationLogs
+      parameters:
+        - { in: query, name: request_id, schema: { type: string, format: uuid } }
+        - { in: query, name: correlation_id, schema: { type: string, format: uuid } }
+        - { in: query, name: from, schema: { type: string, format: date-time } }
+        - { in: query, name: to, schema: { type: string, format: date-time } }
+        - { in: query, name: product_id, schema: { type: string, maxLength: 256 } }
+        - { in: query, name: result, schema: { type: string, enum: [success, denied, failed] } }
+        - { in: query, name: limit, schema: { type: integer, minimum: 1, maximum: 200, default: 50 } }
+        - { in: query, name: cursor, schema: { type: string, maxLength: 512 } }
+      responses:
+        '200':
+          description: 操作日志
+          headers: { Cache-Control: { schema: { type: string, const: no-store } } }
+          content: { application/json: { schema: { $ref: '#/components/schemas/LogPage' } } }
+        '400': {$ref: '#/components/responses/LogBadRequest'}
+        '404': {$ref: '#/components/responses/LogNotFound'}
+        '503': {$ref: '#/components/responses/LogUnavailable'}
+  /api/v1/logs/authentications:
+    get:
+      operationId: listAuthenticationLogs
+      parameters: [{$ref: '#/components/parameters/LogRequestID'}, {$ref: '#/components/parameters/LogCorrelationID'}, {$ref: '#/components/parameters/LogFrom'}, {$ref: '#/components/parameters/LogTo'}, {$ref: '#/components/parameters/LogProductID'}, {$ref: '#/components/parameters/LogResult'}, {$ref: '#/components/parameters/LogLimit'}, {$ref: '#/components/parameters/LogCursor'}]
+      responses:
+        '200':
+          description: 登录日志
+          headers: { Cache-Control: { schema: { type: string, const: no-store } } }
+          content: { application/json: { schema: { $ref: '#/components/schemas/LogPage' } } }
+        '400': {$ref: '#/components/responses/LogBadRequest'}
+        '404': {$ref: '#/components/responses/LogNotFound'}
+        '503': {$ref: '#/components/responses/LogUnavailable'}
+  /api/v1/logs/application-requests:
+    get:
+      operationId: listApplicationRequestLogs
+      parameters: [{$ref: '#/components/parameters/LogRequestID'}, {$ref: '#/components/parameters/LogCorrelationID'}, {$ref: '#/components/parameters/LogFrom'}, {$ref: '#/components/parameters/LogTo'}, {$ref: '#/components/parameters/LogProductID'}, {$ref: '#/components/parameters/LogCustomerID'}, {$ref: '#/components/parameters/LogAuthorizationName'}, {$ref: '#/components/parameters/LogClientAppID'}, {$ref: '#/components/parameters/LogClientAppVersion'}, {$ref: '#/components/parameters/LogLicenseID'}, {$ref: '#/components/parameters/LogLicenseStatus'}, {$ref: '#/components/parameters/LogDecision'}, {$ref: '#/components/parameters/LogResult'}, {$ref: '#/components/parameters/LogHTTPStatus'}, {$ref: '#/components/parameters/LogLimit'}, {$ref: '#/components/parameters/LogCursor'}]
+      responses:
+        '200':
+          description: 应用请求日志
+          headers: { Cache-Control: { schema: { type: string, const: no-store } } }
+          content: { application/json: { schema: { $ref: '#/components/schemas/LogPage' } } }
+        '400': {$ref: '#/components/responses/LogBadRequest'}
+        '404': {$ref: '#/components/responses/LogNotFound'}
+        '503': {$ref: '#/components/responses/LogUnavailable'}
+  /api/v1/logs/git-syncs:
+    get:
+      operationId: listGitSyncLogs
+      parameters: [{$ref: '#/components/parameters/LogRequestID'}, {$ref: '#/components/parameters/LogCorrelationID'}, {$ref: '#/components/parameters/LogFrom'}, {$ref: '#/components/parameters/LogTo'}, {$ref: '#/components/parameters/LogProductID'}, {$ref: '#/components/parameters/LogResult'}, {$ref: '#/components/parameters/LogLimit'}, {$ref: '#/components/parameters/LogCursor'}]
+      responses:
+        '200':
+          description: Git 同步日志
+          headers: { Cache-Control: { schema: { type: string, const: no-store } } }
+          content: { application/json: { schema: { $ref: '#/components/schemas/LogPage' } } }
+        '400': {$ref: '#/components/responses/LogBadRequest'}
+        '404': {$ref: '#/components/responses/LogNotFound'}
+        '503': {$ref: '#/components/responses/LogUnavailable'}
+  /api/v1/logs/related:
+    get:
+      operationId: listRelatedLogs
+      parameters: [{$ref: '#/components/parameters/LogRequestID'}, {$ref: '#/components/parameters/LogCorrelationID'}, {$ref: '#/components/parameters/LogFrom'}, {$ref: '#/components/parameters/LogTo'}, {$ref: '#/components/parameters/LogProductID'}, {$ref: '#/components/parameters/LogResult'}, {$ref: '#/components/parameters/LogLimit'}, {$ref: '#/components/parameters/LogCursor'}]
+      responses:
+        '200':
+          description: 关联日志
+          headers: { Cache-Control: { schema: { type: string, const: no-store } } }
+          content: { application/json: { schema: { $ref: '#/components/schemas/RelatedLogPage' } } }
+        '400': {$ref: '#/components/responses/LogBadRequest'}
+        '404': {$ref: '#/components/responses/LogNotFound'}
+        '503': {$ref: '#/components/responses/LogUnavailable'}
   /health/live:
     get:
       operationId: getLiveness
@@ -2119,6 +2224,70 @@ paths:
         '500': {$ref: '#/components/responses/InternalError'}
 components:
   parameters:
+    LogRequestID:
+      name: request_id
+      in: query
+      schema: {type: string, format: uuid}
+    LogCorrelationID:
+      name: correlation_id
+      in: query
+      schema: {type: string, format: uuid}
+    LogFrom:
+      name: from
+      in: query
+      schema: {type: string, format: date-time}
+    LogTo:
+      name: to
+      in: query
+      schema: {type: string, format: date-time}
+    LogProductID:
+      name: product_id
+      in: query
+      schema: {type: string, maxLength: 256}
+    LogCustomerID:
+      name: customer_id
+      in: query
+      schema: {type: string, maxLength: 256}
+    LogAuthorizationName:
+      name: authorization_name
+      in: query
+      schema: {type: string, maxLength: 256}
+    LogClientAppID:
+      name: client_app_id
+      in: query
+      schema: {type: string, maxLength: 256}
+    LogClientAppVersion:
+      name: client_app_version
+      in: query
+      schema: {type: string, maxLength: 256}
+    LogLicenseID:
+      name: license_id
+      in: query
+      schema: {type: string, maxLength: 256}
+    LogLicenseStatus:
+      name: license_status
+      in: query
+      schema: {type: string, enum: [valid, expiring, expired, revoked, unknown]}
+    LogDecision:
+      name: decision
+      in: query
+      schema: {type: string, enum: [allow, deny]}
+    LogResult:
+      name: result
+      in: query
+      schema: {type: string, enum: [success, denied, failed]}
+    LogHTTPStatus:
+      name: http_status
+      in: query
+      schema: {type: integer, minimum: 100, maximum: 599}
+    LogLimit:
+      name: limit
+      in: query
+      schema: {type: integer, minimum: 1, maximum: 200, default: 50}
+    LogCursor:
+      name: cursor
+      in: query
+      schema: {type: string, maxLength: 512}
     ProductIDPath:
       name: product_id
       in: path
@@ -2280,6 +2449,33 @@ components:
       bearerFormat: JWT
       description: 面向 CI/CD、客户端与同步执行器的短期工作负载令牌；使用独立静态受信发行者，token_use 必须精确为 workload，不与人员验签互相回退。
   responses:
+    Problem400: { description: 请求错误, headers: { Cache-Control: { schema: { type: string, const: no-store } } } }
+    Problem401: { description: 未认证, headers: { Cache-Control: { schema: { type: string, const: no-store } } } }
+    Problem403: { description: 无权限, headers: { Cache-Control: { schema: { type: string, const: no-store } } } }
+    Problem404: { description: 不存在, headers: { Cache-Control: { schema: { type: string, const: no-store } } } }
+    Problem409: { description: 冲突, headers: { Cache-Control: { schema: { type: string, const: no-store } } } }
+    Problem503: { description: 服务不可用, headers: { Cache-Control: { schema: { type: string, const: no-store } } } }
+    LogBadRequest:
+      description: 日志查询参数无效或重复
+      headers:
+        Cache-Control: {schema: {type: string, const: no-store}}
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/ProblemDetails'}
+    LogNotFound:
+      description: 日志资源不存在
+      headers:
+        Cache-Control: {schema: {type: string, const: no-store}}
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/ProblemDetails'}
+    LogUnavailable:
+      description: 日志中心暂不可用
+      headers:
+        Cache-Control: {schema: {type: string, const: no-store}}
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/ProblemDetails'}
     CatalogMetadata:
       description: 已签名的 TUF 元数据封装
       headers:
@@ -2350,6 +2546,95 @@ components:
           schema:
             $ref: '#/components/schemas/ProblemDetails'
   schemas:
+    LogExportRequest:
+      type: object
+      additionalProperties: false
+      required: [log_types, format, reauthentication]
+      properties: { log_types: { type: array, minItems: 1, uniqueItems: true, items: { type: string, enum: [operations, authentications, application_requests, git_syncs] } }, format: { type: string, const: ndjson }, filters: { $ref: '#/components/schemas/LogExportFilters' }, dedupe_key: { type: string, maxLength: 256, pattern: '^\\S(?:.*\\S)?$' }, reauthentication: { type: object, additionalProperties: false, required: [challenge_id, evidence, confirmed], properties: { challenge_id: { type: string, format: uuid }, evidence: { type: string, pattern: '^xmr_[A-Za-z0-9_-]{43}$' }, confirmed: { type: boolean, const: true } } } }
+    LogExportFilters:
+      type: object
+      additionalProperties: false
+      description: 导出过滤快照；不允许携带分页游标。
+      properties:
+        from: { type: string, format: date-time }
+        to: { type: string, format: date-time }
+        product_id: { type: string, maxLength: 256 }
+        customer_id: { type: string, maxLength: 256 }
+        authorization_name: { type: string, maxLength: 256 }
+        client_app_id: { type: string, maxLength: 256 }
+        client_app_version: { type: string, maxLength: 256 }
+        license_id: { type: string, maxLength: 256 }
+        license_status: { type: string, enum: [valid, expiring, expired, revoked, unknown] }
+        decision: { type: string, enum: [allow, deny] }
+        result: { type: string, enum: [success, denied, failed] }
+        request_id: { type: string, format: uuid }
+        correlation_id: { type: string, format: uuid }
+        http_status: { type: integer, minimum: 100, maximum: 599 }
+    LogExport:
+      type: object
+      additionalProperties: false
+      required: [id, status]
+      properties: { id: { type: string, format: uuid }, status: { type: string, enum: [queued, running, completed, failed, exhausted] } }
+    LogExportDownload:
+      type: object
+      additionalProperties: false
+      required: [url]
+      properties: { url: { type: string, format: uri-reference } }
+    LogPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            properties:
+              event_id: {type: string, format: uuid}
+              occurred_at: {type: string, format: date-time}
+              product_id: {type: [string, 'null']}
+              request_id: {type: string, format: uuid}
+              correlation_id: {type: [string, 'null'], format: uuid}
+              trace_id: {type: [string, 'null']}
+              result: {type: string, enum: [success, denied, failed]}
+              decision: {type: [string, 'null'], enum: [allow, deny, 'null']}
+              reason_code: {type: [string, 'null']}
+              http_status: {type: [integer, 'null']}
+              client_app_id: {type: [string, 'null']}
+              client_app_version: {type: [string, 'null']}
+              customer_id: {type: [string, 'null']}
+              customer_name: {type: [string, 'null']}
+              authorization_name: {type: [string, 'null']}
+              license_id: {type: [string, 'null']}
+              license_status: {type: [string, 'null'], enum: [valid, expiring, expired, revoked, unknown, 'null']}
+              provider: {type: [string, 'null']}
+              repository_id: {type: [string, 'null']}
+              repository_name: {type: [string, 'null']}
+              stage: {type: [string, 'null']}
+        next_cursor:
+          type: string
+          maxLength: 512
+    RelatedLogPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [log_type, event_id, occurred_at]
+            properties:
+              log_type: {type: string, enum: [operations, authentications, application_requests, git_syncs]}
+              event_id: {type: string, format: uuid}
+              occurred_at: {type: string, format: date-time}
+              product_id: {type: [string, 'null']}
+              request_id: {type: string, format: uuid}
+              correlation_id: {type: [string, 'null'], format: uuid}
+              result: {type: string, enum: [success, denied, failed]}
+        next_cursor: {type: string, maxLength: 512}
     DistributionEndpointRequest:
       type: object
       additionalProperties: false
@@ -3361,6 +3646,7 @@ components:
         - mfa.recovery_codes.regenerate
         - emergency.user.create
         - emergency.user.activation.reissue
+        - log.export.create
     HighRiskProof:
       type: object
       additionalProperties: false

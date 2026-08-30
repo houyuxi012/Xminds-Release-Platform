@@ -1,9 +1,9 @@
 import { DownloadOutlined, RightOutlined } from '@ant-design/icons';
 import { PageContainer, type ProColumns, ProTable } from '@ant-design/pro-components';
-import { Alert, App as AntApp, Button, Descriptions, Space, Typography } from 'antd';
+import { Alert, App as AntApp, Button, Descriptions, Space, Tabs, Typography } from 'antd';
 import { useState } from 'react';
-import { auditEvents } from '../../api/demoData';
-import type { AuditEvent } from '../../api/types';
+import { logCenterEvents } from '../../api/demoData';
+import type { LogCenterEvent, LogCenterKind } from '../../api/types';
 import { useAuth } from '../../auth/AuthProvider';
 import { StatusTag } from '../../components/StatusTag';
 import { WhiteDetailDrawer } from '../../components/WhiteDetailDrawer';
@@ -11,10 +11,12 @@ import { WhiteDetailDrawer } from '../../components/WhiteDetailDrawer';
 export function AuditPage() {
   const { message } = AntApp.useApp();
   const { hasAnyRole } = useAuth();
-  const [selected, setSelected] = useState<AuditEvent | null>(null);
+  const [selected, setSelected] = useState<LogCenterEvent | null>(null);
   const [cursorPage, setCursorPage] = useState(1);
+  const [logType, setLogType] = useState<LogCenterKind>('operation');
+  const logData = logCenterEvents.filter((event) => event.kind === logType);
 
-  const columns: ProColumns<AuditEvent>[] = [
+  const columns: ProColumns<LogCenterEvent>[] = [
     {
       title: '时间',
       dataIndex: 'time',
@@ -51,9 +53,20 @@ export function AuditPage() {
 
   return (
     <PageContainer
-      title="操作审计"
-      content="按产品范围查询不可变审计哈希链；P0 完整日志中心将在身份与日志 API 完成后接入。"
+      title="日志中心"
+      content="统一查询操作、登录、应用请求与 Git 同步日志；所有记录均按服务端 scope 与不可变证据策略返回。"
     >
+      <Tabs
+        activeKey={logType}
+        onChange={(key) => setLogType(key as LogCenterKind)}
+        items={[
+          { key: 'operation', label: '操作日志' },
+          { key: 'authentication', label: '登录日志' },
+          { key: 'application', label: '应用请求日志' },
+          { key: 'git', label: 'Git 同步日志' },
+        ]}
+        style={{ marginBottom: 16 }}
+      />
       <Alert
         type="info"
         showIcon
@@ -61,10 +74,26 @@ export function AuditPage() {
         description="导出任务异步生成，并记录导出主体、查询条件、摘要和到期时间。"
         style={{ marginBottom: 16 }}
       />
-      <ProTable<AuditEvent>
+      <ProTable<LogCenterEvent>
         rowKey="id"
-        columns={columns}
-        dataSource={auditEvents}
+        columns={columns.concat(
+          logType === 'application'
+            ? [
+                { title: '授权名称', dataIndex: 'authorizationName' },
+                { title: '客户端应用版本', dataIndex: 'clientAppVersion' },
+                { title: 'License ID', dataIndex: 'licenseId' },
+                { title: '到期时间', dataIndex: 'licenseExpiresAt' },
+              ]
+            : logType === 'authentication'
+              ? [{ title: '认证方式', dataIndex: 'action' }]
+              : logType === 'git'
+                ? [
+                    { title: 'Provider', dataIndex: 'provider' },
+                    { title: '同步阶段', dataIndex: 'syncStage' },
+                  ]
+                : [],
+        )}
+        dataSource={logData}
         search={{ labelWidth: 'auto', span: 6 }}
         options={{ density: true, setting: true, reload: true }}
         pagination={false}
@@ -118,6 +147,29 @@ export function AuditPage() {
                 <span className="mono">{selected.action}</span>
               </Descriptions.Item>
               <Descriptions.Item label="目标">{selected.target}</Descriptions.Item>
+              {selected.kind === 'application' ? (
+                <>
+                  <Descriptions.Item label="授权名称">
+                    {selected.authorizationName}
+                  </Descriptions.Item>
+                  <Descriptions.Item label="客户端应用版本">
+                    {selected.clientAppVersion}
+                  </Descriptions.Item>
+                  <Descriptions.Item label="License ID">
+                    <span className="mono">{selected.licenseId}</span>
+                  </Descriptions.Item>
+                  <Descriptions.Item label="到期时间">
+                    {selected.licenseExpiresAt}
+                  </Descriptions.Item>
+                </>
+              ) : null}
+              {selected.kind === 'git' ? (
+                <>
+                  <Descriptions.Item label="Provider">{selected.provider}</Descriptions.Item>
+                  <Descriptions.Item label="仓库">{selected.repository}</Descriptions.Item>
+                  <Descriptions.Item label="同步阶段">{selected.syncStage}</Descriptions.Item>
+                </>
+              ) : null}
               <Descriptions.Item label="请求 ID" span={2}>
                 <span className="mono">{selected.requestId}</span>
               </Descriptions.Item>

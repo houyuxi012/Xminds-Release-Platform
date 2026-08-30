@@ -51,3 +51,13 @@ func TestMinIOStoreDeleteRejectsVerifiedArtifactKey(t *testing.T) {
 		t.Fatalf("Delete(verified artifact) error = %v, want %v", err, ErrImmutableObject)
 	}
 }
+
+func TestMinIOStoreRequiresRetentionForObjectLocking(t *testing.T) {
+	store, err := NewMinIOStore(MinIOConfig{
+		EndpointURL: "https://minio.example.invalid", Bucket: "archive-test",
+		AccessKey: "access", SecretKey: "secret", ObjectLocking: true,
+	})
+	if !errors.Is(err, ErrObjectLockInvalid) || store != nil {
+		t.Fatalf("NewMinIOStore() store=%v err=%v, want object lock validation failure", store, err)
+	}
+}

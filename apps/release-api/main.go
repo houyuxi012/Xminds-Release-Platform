@@ -21,6 +21,7 @@ import (
 	"xminds-release-platform/internal/endpoint"
 	"xminds-release-platform/internal/iam"
 	"xminds-release-platform/internal/identity"
+	"xminds-release-platform/internal/logcenter"
 	"xminds-release-platform/internal/platform/buildinfo"
 	"xminds-release-platform/internal/platform/config"
 	"xminds-release-platform/internal/platform/database"
@@ -47,6 +48,14 @@ type apiRuntimeConfig struct {
 	DefaultChannel                 string
 	LocalAuth                      iam.LocalAuthRuntimeConfig
 	Directory                      iam.DirectoryRuntimeConfig
+	LogCursorKeyReference          string
+	LogCursorTTL                   time.Duration
+	LogArchiveObjectStoreURL       string
+	LogArchiveObjectBucket         string
+	LogArchiveAccessKey            string
+	LogArchiveSecretKey            string
+	LogArchiveRegion               string
+	LogArchiveSessionToken         string
 }
 
 func main() {
@@ -101,6 +110,20 @@ func run(ctx context.Context, arguments []string, environ map[string]string) err
 	})
 	if err != nil {
 		return fmt.Errorf("configure API object store: %w", err)
+	}
+	var logArchiveStore objectstore.Store
+	if runtimeConfig.LogArchiveObjectStoreURL != "" || runtimeConfig.LogArchiveObjectBucket != "" || runtimeConfig.LogArchiveAccessKey != "" || runtimeConfig.LogArchiveSecretKey != "" {
+		logArchiveStore, err = objectstore.NewMinIOStore(objectstore.MinIOConfig{
+			EndpointURL:  runtimeConfig.LogArchiveObjectStoreURL,
+			Bucket:       runtimeConfig.LogArchiveObjectBucket,
+			Region:       runtimeConfig.LogArchiveRegion,
+			AccessKey:    runtimeConfig.LogArchiveAccessKey,
+			SecretKey:    runtimeConfig.LogArchiveSecretKey,
+			SessionToken: runtimeConfig.LogArchiveSessionToken,
+		})
+		if err != nil {
+			return fmt.Errorf("configure log archive object store: %w", err)
+		}
 	}
 	publicHandler, err := catalog.NewPublicHTTPHandler(catalog.PublicHTTPConfig{
 		DefaultProductID: runtimeConfig.DefaultProductID,
@@ -197,6 +220,24 @@ func run(ctx context.Context, arguments []string, environ map[string]string) err
 	if err != nil {
 		return fmt.Errorf("configure IAM directory conflict cursor codec: %w", err)
 	}
+	logCursorKeySecret, err := secretResolver.Resolve(ctx, runtimeConfig.LogCursorKeyReference)
+	if err != nil {
+		return fmt.Errorf("configure log center cursor key: %w", err)
+	}
+	logCursorKey, err := logcenter.DecodeCursorKeySecret(logCursorKeySecret)
+	if err != nil {
+		return fmt.Errorf("configure log center cursor key: %w", err)
+	}
+	logCursorCodec, err := logcenter.NewCursorCodec(logCursorKey, runtimeConfig.LogCursorTTL)
+	if err != nil {
+		return fmt.Errorf("configure log center cursor codec: %w", err)
+	}
+	logCenterHandler := &logcenter.LogHTTPHandler{
+		Repo: logcenter.NewQueryRepository(pool, logCursorCodec),
+		ScopeResolver: func(request *http.Request) (logcenter.LogReadScope, bool) {
+			return resolveLogReadScope(request)
+		},
+	}
 	mfaSecretStore, err := iam.NewFileMFASecretStore(runtimeConfig.LocalAuth.MFAEnrollmentSecretDirectory)
 	if err != nil {
 		return fmt.Errorf("configure IAM MFA enrollment secret store: %w", err)
@@ -246,6 +287,23 @@ func run(ctx context.Context, arguments []string, environ map[string]string) err
 	})
 	if err != nil {
 		return fmt.Errorf("configure high-risk reauthentication service: %w", err)
+	}
+	logExportStore := logcenter.NewPostgresExportStore(pool)
+	logExportService := &logcenter.ExportService{Authorizer: logExportAuthorizer{service: reauthenticationService}, Store: logExportStore}
+	logExportHandler := &logcenter.ExportHTTPHandler{
+		Service: logExportService,
+		Archive: logArchiveStore,
+		ResolveContext: func(ctx context.Context) (string, logcenter.LogReadScope, error) {
+			principal, ok := identity.PrincipalFromContext(ctx)
+			if !ok || strings.TrimSpace(principal.Subject) == "" {
+				return "", logcenter.LogReadScope{}, logcenter.ErrExportForbidden
+			}
+			scope, ok := resolveLogReadScopeForPrincipal(principal)
+			if !ok {
+				return "", logcenter.LogReadScope{}, logcenter.ErrExportForbidden
+			}
+			return principal.Subject, scope, nil
+		},
 	}
 	mfaEnrollmentService, err := iam.NewMFAService(iam.MFAServiceConfig{
 		Repository: iamRepository, Auditor: auditor, Secrets: mfaSecretStore, Policy: runtimeConfig.LocalAuth.Policy,
@@ -318,6 +376,8 @@ func run(ctx context.Context, arguments []string, environ map[string]string) err
 				},
 				IAM:              iamService,
 				Reauthentication: reauthenticationService,
+				LogCenter:        logCenterHandler,
+				LogExports:       logExportHandler,
 			}),
 			func(router chi.Router) {
 				iam.RegisterPublicAuthRoutes(router, localAuthenticator)
@@ -340,6 +400,26 @@ func run(ctx context.Context, arguments []string, environ map[string]string) err
 		MaxHeaderBytes:    1 << 20,
 	}
 	return serveAPIServers(ctx, managementServer, publicServer)
+}
+
+func resolveLogReadScope(request *http.Request) (logcenter.LogReadScope, bool) {
+	if request == nil {
+		return logcenter.LogReadScope{}, false
+	}
+	principal, ok := identity.PrincipalFromContext(request.Context())
+	if !ok || strings.TrimSpace(principal.Subject) == "" {
+		return logcenter.LogReadScope{}, false
+	}
+	return resolveLogReadScopeForPrincipal(principal)
+}
+
+func resolveLogReadScopeForPrincipal(principal identity.Principal) (logcenter.LogReadScope, bool) {
+	resolved, err := identity.ResolveAuditReadScope(principal)
+	if err != nil {
+		return logcenter.LogReadScope{}, false
+	}
+	scope, err := logcenter.NewLogReadScope(resolved.AllowGlobal, resolved.AllProducts, resolved.IncludedProductIDs, resolved.ExcludedProductIDs)
+	return scope, err == nil
 }
 
 func runMFASecretGC(ctx context.Context, worker *iam.MFASecretGCWorker, interval time.Duration) {
@@ -375,6 +455,8 @@ type managementApplications struct {
 	Audits           auditManagementApplication
 	IAM              iam.IAMApplication
 	Reauthentication iam.ReauthenticationApplication
+	LogCenter        *logcenter.LogHTTPHandler
+	LogExports       *logcenter.ExportHTTPHandler
 }
 
 type auditManagementApplication struct {
@@ -405,18 +487,32 @@ func managementRoutes(applications managementApplications) httpserver.RouteRegis
 		if applications.Reauthentication != nil {
 			iam.RegisterReauthenticationRoutes(router, applications.Reauthentication)
 		}
+		if applications.LogCenter != nil {
+			router.Mount("/api/v1/logs", applications.LogCenter)
+		}
+		if applications.LogExports != nil {
+			router.Mount("/api/v1/log-exports", applications.LogExports)
+		}
 	}
 }
 
 func loadAPIRuntimeConfig(environ map[string]string, environment string) (apiRuntimeConfig, error) {
 	result := apiRuntimeConfig{
-		ObjectStoreAccessKey: strings.TrimSpace(environ["XMINDS_RELEASE_OBJECT_STORE_ACCESS_KEY"]),
-		ObjectStoreSecretKey: strings.TrimSpace(environ["XMINDS_RELEASE_OBJECT_STORE_SECRET_KEY"]),
-		Region:               strings.TrimSpace(environ["XMINDS_RELEASE_OBJECT_STORE_REGION"]),
-		SessionToken:         strings.TrimSpace(environ["XMINDS_RELEASE_OBJECT_STORE_SESSION_TOKEN"]),
-		EndpointCADirectory:  strings.TrimSpace(environ["XMINDS_RELEASE_ENDPOINT_CA_DIRECTORY"]),
-		DefaultProductID:     strings.TrimSpace(environ["XMINDS_RELEASE_DEFAULT_PRODUCT_ID"]),
-		DefaultChannel:       strings.TrimSpace(environ["XMINDS_RELEASE_DEFAULT_CHANNEL"]),
+		ObjectStoreAccessKey:     strings.TrimSpace(environ["XMINDS_RELEASE_OBJECT_STORE_ACCESS_KEY"]),
+		ObjectStoreSecretKey:     strings.TrimSpace(environ["XMINDS_RELEASE_OBJECT_STORE_SECRET_KEY"]),
+		Region:                   strings.TrimSpace(environ["XMINDS_RELEASE_OBJECT_STORE_REGION"]),
+		SessionToken:             strings.TrimSpace(environ["XMINDS_RELEASE_OBJECT_STORE_SESSION_TOKEN"]),
+		EndpointCADirectory:      strings.TrimSpace(environ["XMINDS_RELEASE_ENDPOINT_CA_DIRECTORY"]),
+		DefaultProductID:         strings.TrimSpace(environ["XMINDS_RELEASE_DEFAULT_PRODUCT_ID"]),
+		DefaultChannel:           strings.TrimSpace(environ["XMINDS_RELEASE_DEFAULT_CHANNEL"]),
+		LogCursorKeyReference:    "secret://iam/log-center-cursor-key",
+		LogCursorTTL:             15 * time.Minute,
+		LogArchiveObjectStoreURL: strings.TrimSpace(environ["XMINDS_RELEASE_LOG_ARCHIVE_OBJECT_STORE_URL"]),
+		LogArchiveObjectBucket:   strings.TrimSpace(environ["XMINDS_RELEASE_LOG_ARCHIVE_OBJECT_BUCKET"]),
+		LogArchiveAccessKey:      strings.TrimSpace(environ["XMINDS_RELEASE_LOG_ARCHIVE_OBJECT_STORE_ACCESS_KEY"]),
+		LogArchiveSecretKey:      strings.TrimSpace(environ["XMINDS_RELEASE_LOG_ARCHIVE_OBJECT_STORE_SECRET_KEY"]),
+		LogArchiveRegion:         strings.TrimSpace(environ["XMINDS_RELEASE_LOG_ARCHIVE_OBJECT_STORE_REGION"]),
+		LogArchiveSessionToken:   strings.TrimSpace(environ["XMINDS_RELEASE_LOG_ARCHIVE_OBJECT_STORE_SESSION_TOKEN"]),
 	}
 	if result.ObjectStoreAccessKey == "" || result.ObjectStoreSecretKey == "" || result.DefaultProductID == "" || result.DefaultChannel == "" {
 		return apiRuntimeConfig{}, errAPIRuntimeConfiguration
@@ -436,6 +532,22 @@ func loadAPIRuntimeConfig(environ map[string]string, environment string) (apiRun
 		return apiRuntimeConfig{}, fmt.Errorf("directory settings: %w", errAPIRuntimeConfiguration)
 	}
 	result.Directory = directory
+	if raw := strings.TrimSpace(environ["XMINDS_RELEASE_LOG_CURSOR_KEY_REFERENCE"]); raw != "" {
+		result.LogCursorKeyReference = raw
+	}
+	if !iam.ValidateSecretReference(result.LogCursorKeyReference) {
+		return apiRuntimeConfig{}, errAPIRuntimeConfiguration
+	}
+	if raw := strings.TrimSpace(environ["XMINDS_RELEASE_LOG_CURSOR_TTL"]); raw != "" {
+		var parseErr error
+		result.LogCursorTTL, parseErr = time.ParseDuration(raw)
+		if parseErr != nil {
+			return apiRuntimeConfig{}, errAPIRuntimeConfiguration
+		}
+	}
+	if result.LogCursorTTL < 5*time.Minute || result.LogCursorTTL > 24*time.Hour {
+		return apiRuntimeConfig{}, errAPIRuntimeConfiguration
+	}
 	return result, nil
 }
 

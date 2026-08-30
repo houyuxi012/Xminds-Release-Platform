@@ -43,6 +43,7 @@ const (
 	ReauthenticationOperationMFARecoveryCodesRegenerate   ReauthenticationOperation = "mfa.recovery_codes.regenerate"
 	ReauthenticationOperationEmergencyUserCreate          ReauthenticationOperation = "emergency.user.create"
 	ReauthenticationOperationEmergencyActivationReissue   ReauthenticationOperation = "emergency.user.activation.reissue"
+	ReauthenticationOperationLogExport                    ReauthenticationOperation = "log.export.create"
 )
 
 type ReauthenticationStatus string
@@ -272,28 +273,52 @@ func (service *ReauthenticationService) Authorize(ctx context.Context, actor ide
 	}
 	now := service.clock().UTC().Truncate(time.Microsecond)
 	err := service.repository.WithinTransaction(ctx, func(tx pgx.Tx) error {
-		if cleanupErr := service.repository.CleanupReauthenticationChallenges(ctx, tx, now, service.policy.TerminalRetention, service.policy.CleanupBatchSize); cleanupErr != nil {
-			return cleanupErr
-		}
-		challenge, getErr := service.repository.GetReauthenticationChallenge(ctx, tx, challengeID)
-		if getErr != nil || challenge.Status != ReauthenticationStatusVerified || challenge.Operation != parsedOperation ||
-			challenge.ActorSubject != strings.TrimSpace(actor.Subject) || challenge.ActorKind != actor.Kind ||
-			!challengeMatchesReauthenticationActor(challenge, bindingVersion, bindingDigest) ||
-			!challenge.EvidenceExpiresAt.After(now) || challenge.VerifiedTokenDigest != reauthenticationDigest(actor.TokenID) ||
-			subtle.ConstantTimeCompare([]byte(challenge.EvidenceDigest), []byte(reauthenticationDigest(proof.Evidence))) != 1 {
-			return ErrHighRiskConfirmationRequired
-		}
-		previousVersion := challenge.Version
-		challenge.Status, challenge.ConsumedAt, challenge.Version = ReauthenticationStatusConsumed, now, challenge.Version+1
-		if saveErr := service.repository.SaveReauthenticationChallenge(ctx, tx, challenge, previousVersion); saveErr != nil {
-			return saveErr
-		}
-		return service.appendAudit(ctx, tx, actor, "identity.reauthentication.challenge.consume", challenge, audit.OutcomeSuccess, request)
+		return service.authorizeInTransaction(ctx, tx, actor, parsedOperation, challengeID, proof, request, now, bindingVersion, bindingDigest)
 	})
 	if err != nil {
 		return ErrHighRiskConfirmationRequired
 	}
 	return nil
+}
+
+// AuthorizeInTransaction consumes a verified challenge on a caller-owned
+// transaction. It is used by high-risk operations that must commit their
+// authorization consumption and domain write atomically.
+func (service *ReauthenticationService) AuthorizeInTransaction(ctx context.Context, tx pgx.Tx, actor identity.Principal, operation string, proof HighRiskProof, request RequestContext) error {
+	if tx == nil {
+		return ErrHighRiskConfirmationRequired
+	}
+	parsedOperation := ReauthenticationOperation(strings.TrimSpace(operation))
+	challengeID, evidenceOK := parseReauthenticationProof(proof)
+	bindingVersion, bindingDigest, actorOK := service.actorBinding(actor)
+	if !proof.Confirmed || !actorOK || !validReauthenticationOperation(parsedOperation) || !evidenceOK {
+		return ErrHighRiskConfirmationRequired
+	}
+	now := service.clock().UTC().Truncate(time.Microsecond)
+	if err := service.authorizeInTransaction(ctx, tx, actor, parsedOperation, challengeID, proof, request, now, bindingVersion, bindingDigest); err != nil {
+		return ErrHighRiskConfirmationRequired
+	}
+	return nil
+}
+
+func (service *ReauthenticationService) authorizeInTransaction(ctx context.Context, tx pgx.Tx, actor identity.Principal, parsedOperation ReauthenticationOperation, challengeID uuid.UUID, proof HighRiskProof, request RequestContext, now time.Time, bindingVersion int16, bindingDigest string) error {
+	if cleanupErr := service.repository.CleanupReauthenticationChallenges(ctx, tx, now, service.policy.TerminalRetention, service.policy.CleanupBatchSize); cleanupErr != nil {
+		return cleanupErr
+	}
+	challenge, getErr := service.repository.GetReauthenticationChallenge(ctx, tx, challengeID)
+	if getErr != nil || challenge.Status != ReauthenticationStatusVerified || challenge.Operation != parsedOperation ||
+		challenge.ActorSubject != strings.TrimSpace(actor.Subject) || challenge.ActorKind != actor.Kind ||
+		!challengeMatchesReauthenticationActor(challenge, bindingVersion, bindingDigest) ||
+		!challenge.EvidenceExpiresAt.After(now) || challenge.VerifiedTokenDigest != reauthenticationDigest(actor.TokenID) ||
+		subtle.ConstantTimeCompare([]byte(challenge.EvidenceDigest), []byte(reauthenticationDigest(proof.Evidence))) != 1 {
+		return ErrHighRiskConfirmationRequired
+	}
+	previousVersion := challenge.Version
+	challenge.Status, challenge.ConsumedAt, challenge.Version = ReauthenticationStatusConsumed, now, challenge.Version+1
+	if saveErr := service.repository.SaveReauthenticationChallenge(ctx, tx, challenge, previousVersion); saveErr != nil {
+		return saveErr
+	}
+	return service.appendAudit(ctx, tx, actor, "identity.reauthentication.challenge.consume", challenge, audit.OutcomeSuccess, request)
 }
 
 func (service *ReauthenticationService) actorBinding(actor identity.Principal) (int16, string, bool) {
@@ -371,7 +396,8 @@ func validReauthenticationOperation(operation ReauthenticationOperation) bool {
 		ReauthenticationOperationSSOEnable, ReauthenticationOperationSSODisable, ReauthenticationOperationDirectoryConflictResolve,
 		ReauthenticationOperationOrganizationMembershipCreate, ReauthenticationOperationOrganizationMembershipDelete,
 		ReauthenticationOperationMFAEnrollmentBegin, ReauthenticationOperationMFARecoveryCodesRegenerate,
-		ReauthenticationOperationEmergencyUserCreate, ReauthenticationOperationEmergencyActivationReissue:
+		ReauthenticationOperationEmergencyUserCreate, ReauthenticationOperationEmergencyActivationReissue,
+		ReauthenticationOperationLogExport:
 		return true
 	default:
 		return false

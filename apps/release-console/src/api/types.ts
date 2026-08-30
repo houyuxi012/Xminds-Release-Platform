@@ -97,3 +97,19 @@ export interface AuditEvent {
   releaseId?: string;
   summary: string;
 }
+
+export type LogCenterKind = 'operation' | 'authentication' | 'application' | 'git';
+
+export interface LogCenterEvent extends AuditEvent {
+  kind: LogCenterKind;
+  decision?: 'allow' | 'deny';
+  reasonCode?: string;
+  clientAppId?: string;
+  clientAppVersion?: string;
+  authorizationName?: string;
+  licenseId?: string;
+  licenseExpiresAt?: string;
+  provider?: string;
+  repository?: string;
+  syncStage?: string;
+}

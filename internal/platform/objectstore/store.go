@@ -16,6 +16,7 @@ var (
 	ErrDigestMismatch       = errors.New("object digest does not match")
 	ErrRangeInvalid         = errors.New("object range is invalid")
 	ErrImmutableObject      = errors.New("verified object is immutable")
+	ErrObjectLockInvalid    = errors.New("object lock configuration is invalid")
 )
 
 type Part struct {

@@ -111,7 +111,7 @@ npx playwright install chromium
 npm run dev
 ```
 
-默认开发地址为 `http://127.0.0.1:4173`。开发环境提供确定性的演示数据用于交互验收；产品创建在生产构建中调用 `/api/v1/products`，后端仍是身份、授权、状态机和审计证据的唯一权威来源。当前 Console 交付 P0 核心可信发布管理流程；用户/组织后端已提供受控组织详情、子节点和成员关系接口，Console 展示与统一日志中心仍按后续实施任务接入，不在前端复制服务端安全策略。
+默认开发地址为 `http://127.0.0.1:4173`。开发环境提供确定性的演示数据用于交互验收；产品创建在生产构建中调用 `/api/v1/products`，后端仍是身份、授权、状态机和审计证据的唯一权威来源。当前 Console 交付 P0 核心可信发布管理流程，统一日志中心已接入管理 API 与 Console；用户/组织后端提供受控组织详情、子节点和成员关系接口，不在前端复制服务端安全策略。
 
 ## 本地启动
 
@@ -128,6 +128,8 @@ go run ./apps/release-worker
 - `GET /health/live`：进程存活检查；
 - `GET /health/ready`：PostgreSQL 就绪检查；
 - `GET /version`：构建版本信息；
+- `GET /api/v1/logs/operations`、`/authentications`、`/application-requests`、`/git-syncs`：按当前主体授权范围查询统一日志；
+- `GET /api/v1/logs/related`：按请求 ID 或关联 ID 查询跨类型日志；
 - `POST /api/v1/auth/local/activate`：一次性激活本地账户；
 - `POST /api/v1/auth/local/mfa-enrollments`：为待激活账户生成平台托管的 MFA seed 与 otpauth URI；
 - `POST /api/v1/auth/local/login`：本地账户登录；
@@ -140,6 +142,10 @@ MFA enrollment 根仅挂载给 API，由所有 API 副本以相同稳定 numeric
 ### 目录连接、活动 OIDC 与异步同步
 
 `XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY` 是 API 与 Worker 共享的受信任旧 IAM Secret 只读根（变量名为兼容已有部署保留）；不得向 API 或 Worker 授予该根写权限。目录必须是无符号链接的绝对路径，Secret 文件不得对 group/other 开放权限，单文件上限 4 KiB。数据库只保存 `secret://iam/<name>` 引用，不保存 Bearer、CA 或 Secret 内容。Secret 读取使用固定 4 个工作线程与 32 个等待槽位；调用方总超时可取消等待，即使底层 NFS/FUSE 打开操作卡住也不会按请求创建无界线程。关停时立即停止接单并以稳定错误释放队列请求，不等待无法取消的底层系统调用；受信任根目录描述符只会在固定工作线程真正退出后异步关闭。每次读取都从同一个已固定目录描述符打开、校验并完整读取单个文件快照；卡住的底层 I/O 最多占满固定工作线程，运维应同时监控上游文件系统健康。OIDC 来源 Secret 为严格 JSON：
+
+日志中心查询游标使用独立的 `XMINDS_RELEASE_LOG_CURSOR_KEY_REFERENCE` 与 `XMINDS_RELEASE_LOG_CURSOR_TTL`。该 Secret 仅用于日志查询游标，禁止复用目录冲突游标、Bearer、CA、MFA 或其他业务密钥；轮换后旧游标立即失效，客户端需从首页重新分页。日志查询 API 会从统一身份中间件取得当前主体，仅 `admin`/`auditor` 及其显式产品/平台授权可读，未授权主体不会得到静态或跨产品范围。
+
+日志导出执行由 `release-worker` 消费 `log.export.v1` Outbox 作业：请求、执行租约、重试和死信状态分别持久化在 `log_exports` 与 `log_export_jobs`，租约转换使用随机 token 做 CAS 围栏；归档对象按内容寻址键使用 PostgreSQL advisory lock 串行化，避免多 Worker 同时写入同一归档键。Worker 按导出时的范围与过滤快照分页读取四类日志，生成规范化 NDJSON；临时 staging 使用普通对象存储，最终内容写入独立归档对象存储（`XMINDS_RELEASE_LOG_ARCHIVE_OBJECT_STORE_*`），完成 Stat/Open readback 后再写入内容寻址对象，避免在 WORM bucket 删除 staging 版本。归档 bucket 启动时必须启用 MinIO Object Lock、COMPLIANCE 默认保留期（默认 365 天，可配置为更长），否则 Worker 拒绝启动。归档使用独立签名目录（`XMINDS_RELEASE_LOG_EXPORT_SIGNING_KEY_DIRECTORY`、`XMINDS_RELEASE_LOG_EXPORT_SIGNING_MASTER_KEY_PATH`）与 `XMINDS_RELEASE_LOG_EXPORT_SIGNING_KEY_REF` Ed25519 引用签署清单；死信通过同一 Outbox 结算事务将导出状态置为 `exhausted`。游标密钥、归档签名密钥和归档存储凭据必须分离，任一配置缺失或引用不合法时 Worker 拒绝启动。管理 API 的导出下载返回相对路径，并由已认证、已授权的管理会话从归档 bucket 流式读取，不向客户端暴露对象存储凭据。
 
 ```json
 {

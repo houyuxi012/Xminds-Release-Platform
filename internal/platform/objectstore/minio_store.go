@@ -22,19 +22,23 @@ var ErrRedirectRejected = errors.New("object store redirect was rejected")
 var bucketNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$`)
 
 type MinIOConfig struct {
-	EndpointURL  string
-	Bucket       string
-	Region       string
-	AccessKey    string
-	SecretKey    string
-	SessionToken string
-	TLSRootCAs   *x509.CertPool
+	EndpointURL          string
+	Bucket               string
+	Region               string
+	AccessKey            string
+	SecretKey            string
+	SessionToken         string
+	TLSRootCAs           *x509.CertPool
+	ObjectLocking        bool
+	DefaultRetentionDays uint
 }
 
 type MinIOStore struct {
-	core   *minio.Core
-	bucket string
-	region string
+	core                 *minio.Core
+	bucket               string
+	region               string
+	objectLocking        bool
+	defaultRetentionDays uint
 }
 
 func NewMinIOStore(configuration MinIOConfig) (*MinIOStore, error) {
@@ -71,7 +75,10 @@ func NewMinIOStore(configuration MinIOConfig) (*MinIOStore, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create MinIO client: %w", err)
 	}
-	return &MinIOStore{core: core, bucket: bucket, region: strings.TrimSpace(configuration.Region)}, nil
+	if configuration.ObjectLocking && (configuration.DefaultRetentionDays < 1 || configuration.DefaultRetentionDays > 3650) {
+		return nil, ErrObjectLockInvalid
+	}
+	return &MinIOStore{core: core, bucket: bucket, region: strings.TrimSpace(configuration.Region), objectLocking: configuration.ObjectLocking, defaultRetentionDays: configuration.DefaultRetentionDays}, nil
 }
 
 func (store *MinIOStore) EnsureBucket(ctx context.Context) error {
@@ -83,13 +90,46 @@ func (store *MinIOStore) EnsureBucket(ctx context.Context) error {
 		return fmt.Errorf("check object bucket: %w", mapMinIOError(err))
 	}
 	if exists {
+		if store.objectLocking {
+			return store.ensureObjectLock(ctx)
+		}
 		return nil
 	}
-	if err := store.core.MakeBucket(ctx, store.bucket, minio.MakeBucketOptions{Region: store.region}); err != nil {
+	if err := store.core.MakeBucket(ctx, store.bucket, minio.MakeBucketOptions{Region: store.region, ObjectLocking: store.objectLocking}); err != nil {
 		if existsAfterRace, existsErr := store.core.BucketExists(ctx, store.bucket); existsErr == nil && existsAfterRace {
+			if store.objectLocking {
+				return store.ensureObjectLock(ctx)
+			}
 			return nil
 		}
 		return fmt.Errorf("create object bucket: %w", mapMinIOError(err))
+	}
+	if store.objectLocking {
+		if err := store.ensureObjectLock(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (store *MinIOStore) ensureObjectLock(ctx context.Context) error {
+	if store == nil || store.core == nil || !store.objectLocking || store.defaultRetentionDays < 1 {
+		return ErrObjectLockInvalid
+	}
+	mode := minio.Compliance
+	days := store.defaultRetentionDays
+	unit := minio.Days
+	lockEnabled, currentMode, currentDays, currentUnit, err := store.core.Client.GetObjectLockConfig(ctx, store.bucket)
+	if err != nil {
+		return fmt.Errorf("read archive object lock configuration: %w", mapMinIOError(err))
+	}
+	if lockEnabled != "Enabled" {
+		return ErrObjectLockInvalid
+	}
+	if currentMode == nil || *currentMode != mode || currentUnit == nil || *currentUnit != unit || currentDays == nil || *currentDays < days {
+		if err := store.core.Client.SetObjectLockConfig(ctx, store.bucket, &mode, &days, &unit); err != nil {
+			return fmt.Errorf("set archive object lock configuration: %w", mapMinIOError(err))
+		}
 	}
 	return nil
 }

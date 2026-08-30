@@ -68,6 +68,21 @@ describe('控制台交互与可访问性', () => {
     expect(await screen.findByRole('button', { name: '导出审计证据' })).toBeVisible();
   });
 
+  it('日志中心可切换到应用请求并展示授权快照字段', async () => {
+    render(<App initialEntries={['/audit']} initialRoles={['auditor']} />);
+
+    await userEvent.click(await screen.findByRole('tab', { name: '应用请求日志' }));
+    expect(await screen.findByText('Next-Gen Enterprise Portal 商业授权')).toBeVisible();
+    expect(screen.getByText('2.4.0')).toBeVisible();
+    expect(screen.getByText('LIC-2026-000184')).toBeVisible();
+    expect(screen.getByText('2026-12-31 23:59:59')).toBeVisible();
+
+    await userEvent.click(screen.getByRole('button', { name: '查看证据' }));
+    const drawer = await screen.findByTestId('white-detail-drawer');
+    expect(within(drawer).getByText('授权名称')).toBeVisible();
+    expect(within(drawer).getByText('客户端应用版本')).toBeVisible();
+  });
+
   it('Release 向导不能跳过当前步骤必填校验', async () => {
     render(<App initialEntries={['/releases']} initialRoles={['publisher']} />);
 

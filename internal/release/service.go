@@ -241,7 +241,7 @@ func (service *Service) Revoke(ctx context.Context, principal identity.Principal
 		return OperationResult{}, ErrReleaseNotFound
 	}
 	if existing, findErr := service.repository.FindAttempt(ctx, nil, releaseID, AttemptKindRevoke, idempotencyKey); findErr == nil {
-		return OperationResult{Release: current, Attempt: existing}, nil
+		return service.loadOperationResult(ctx, productID, releaseID, existing)
 	} else if !errors.Is(findErr, ErrAttemptNotFound) {
 		return OperationResult{}, findErr
 	}
@@ -296,12 +296,17 @@ func (service *Service) Revoke(ctx context.Context, principal identity.Principal
 		return OperationResult{}, err
 	}
 	if replayed {
-		updated, err = service.repository.Get(ctx, productID, releaseID)
-		if err != nil {
-			return OperationResult{}, err
-		}
+		return service.loadOperationResult(ctx, productID, releaseID, attempt)
 	}
 	return OperationResult{Release: updated, Attempt: attempt}, nil
+}
+
+func (service *Service) loadOperationResult(ctx context.Context, productID string, releaseID uuid.UUID, attempt Attempt) (OperationResult, error) {
+	current, err := service.repository.Get(ctx, productID, releaseID)
+	if err != nil {
+		return OperationResult{}, err
+	}
+	return OperationResult{Release: current, Attempt: attempt}, nil
 }
 
 func (service *Service) startPublication(ctx context.Context, principal identity.Principal, action identity.Action, productID string, releaseID uuid.UUID, expectedLockVersion int64, kind AttemptKind, idempotencyKey string, request RequestContext) (OperationResult, error) {
@@ -332,7 +337,7 @@ func (service *Service) startPublication(ctx context.Context, principal identity
 		return OperationResult{}, ErrReleaseNotFound
 	}
 	if existing, findErr := service.repository.FindAttempt(ctx, nil, releaseID, kind, idempotencyKey); findErr == nil {
-		return OperationResult{Release: current, Attempt: existing}, nil
+		return service.loadOperationResult(ctx, productID, releaseID, existing)
 	} else if !errors.Is(findErr, ErrAttemptNotFound) {
 		return OperationResult{}, findErr
 	}
@@ -384,10 +389,7 @@ func (service *Service) startPublication(ctx context.Context, principal identity
 		return OperationResult{}, err
 	}
 	if replayed {
-		updated, err = service.repository.Get(ctx, productID, releaseID)
-		if err != nil {
-			return OperationResult{}, err
-		}
+		return service.loadOperationResult(ctx, productID, releaseID, attempt)
 	}
 	return OperationResult{Release: updated, Attempt: attempt}, nil
 }

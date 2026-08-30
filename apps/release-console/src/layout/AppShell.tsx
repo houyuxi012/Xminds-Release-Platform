@@ -38,7 +38,7 @@ const menuRoutes = [
   {
     path: '/governance',
     name: '可观测与治理',
-    routes: [{ path: '/audit', name: '操作审计', icon: <AuditOutlined /> }],
+    routes: [{ path: '/audit', name: '日志中心', icon: <AuditOutlined /> }],
   },
 ];
 

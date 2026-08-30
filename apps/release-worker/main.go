@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"xminds-release-platform/internal/audit"
 	"xminds-release-platform/internal/catalog"
 	"xminds-release-platform/internal/iam"
+	"xminds-release-platform/internal/logcenter"
 	"xminds-release-platform/internal/platform/buildinfo"
 	"xminds-release-platform/internal/platform/config"
 	"xminds-release-platform/internal/platform/database"
@@ -27,26 +29,39 @@ import (
 )
 
 const (
-	defaultWorkerPollInterval = time.Second
-	minimumWorkerPollInterval = 100 * time.Millisecond
-	maximumWorkerPollInterval = time.Minute
-	maximumCatalogRootBytes   = 4 * 1024 * 1024
+	defaultWorkerPollInterval      = time.Second
+	minimumWorkerPollInterval      = 100 * time.Millisecond
+	maximumWorkerPollInterval      = time.Minute
+	maximumCatalogRootBytes        = 4 * 1024 * 1024
+	defaultLogArchiveRetentionDays = 365
 )
 
 var errWorkerRuntimeConfiguration = errors.New("worker runtime configuration is invalid")
 
 type workerRuntimeConfig struct {
-	ObjectStoreAccessKey string
-	ObjectStoreSecretKey string
-	Region               string
-	SessionToken         string
-	SigningKeyDirectory  string
-	SigningMasterKeyPath string
-	CatalogRootPath      string
-	KeyRefs              catalog.RoleKeyRefs
-	AuditExportTempDir   string
-	PollInterval         time.Duration
-	Directory            iam.DirectoryRuntimeConfig
+	ObjectStoreAccessKey              string
+	ObjectStoreSecretKey              string
+	LogArchiveObjectStoreURL          string
+	LogArchiveObjectBucket            string
+	LogArchiveObjectStoreAccessKey    string
+	LogArchiveObjectStoreSecretKey    string
+	LogArchiveObjectStoreRegion       string
+	LogArchiveObjectStoreSessionToken string
+	LogArchiveRetentionDays           uint
+	Region                            string
+	SessionToken                      string
+	SigningKeyDirectory               string
+	SigningMasterKeyPath              string
+	LogExportSigningKeyDirectory      string
+	LogExportSigningMasterKeyPath     string
+	CatalogRootPath                   string
+	KeyRefs                           catalog.RoleKeyRefs
+	AuditExportTempDir                string
+	LogCursorKeyReference             string
+	LogCursorTTL                      time.Duration
+	LogExportSigningKeyRef            string
+	PollInterval                      time.Duration
+	Directory                         iam.DirectoryRuntimeConfig
 }
 
 func main() {
@@ -90,10 +105,26 @@ func run(ctx context.Context, environ map[string]string) error {
 	if err := store.EnsureBucket(ctx); err != nil {
 		return fmt.Errorf("prepare worker object bucket: %w", err)
 	}
+	archiveStore, err := objectstore.NewMinIOStore(objectstore.MinIOConfig{
+		EndpointURL: runtimeConfig.LogArchiveObjectStoreURL, Bucket: runtimeConfig.LogArchiveObjectBucket,
+		Region: runtimeConfig.LogArchiveObjectStoreRegion, AccessKey: runtimeConfig.LogArchiveObjectStoreAccessKey,
+		SecretKey: runtimeConfig.LogArchiveObjectStoreSecretKey, SessionToken: runtimeConfig.LogArchiveObjectStoreSessionToken,
+		ObjectLocking: true, DefaultRetentionDays: runtimeConfig.LogArchiveRetentionDays,
+	})
+	if err != nil {
+		return fmt.Errorf("configure log archive object store: %w", err)
+	}
+	if err := archiveStore.EnsureBucket(ctx); err != nil {
+		return fmt.Errorf("prepare log archive object bucket: %w", err)
+	}
 
 	provider, err := signing.NewLocalEncryptedProvider(runtimeConfig.SigningKeyDirectory, runtimeConfig.SigningMasterKeyPath)
 	if err != nil {
 		return fmt.Errorf("configure catalog signing provider: %w", err)
+	}
+	archiveSigner, err := signing.NewLocalEncryptedProvider(runtimeConfig.LogExportSigningKeyDirectory, runtimeConfig.LogExportSigningMasterKeyPath)
+	if err != nil {
+		return fmt.Errorf("configure log export signing provider: %w", err)
 	}
 	root, err := readCatalogRoot(runtimeConfig.CatalogRootPath)
 	if err != nil {
@@ -133,6 +164,29 @@ func run(ctx context.Context, environ map[string]string) error {
 		return fmt.Errorf("configure IAM directory secret resolver: %w", err)
 	}
 	defer directorySecrets.Close()
+	logCursorKeySecret, err := directorySecrets.Resolve(ctx, runtimeConfig.LogCursorKeyReference)
+	if err != nil {
+		return fmt.Errorf("configure log center cursor key: %w", err)
+	}
+	logCursorKey, err := logcenter.DecodeCursorKeySecret(logCursorKeySecret)
+	if err != nil {
+		return fmt.Errorf("configure log center cursor key: %w", err)
+	}
+	logCursorCodec, err := logcenter.NewCursorCodec(logCursorKey, runtimeConfig.LogCursorTTL)
+	if err != nil {
+		return fmt.Errorf("configure log center cursor codec: %w", err)
+	}
+	archivePort, err := logcenter.NewArchiveStoreWithPostgresLock(archiveStore, store, pool)
+	if err != nil {
+		return fmt.Errorf("configure log archive port: %w", err)
+	}
+	logExportWorker, err := logcenter.NewExportWorker(logcenter.ExportWorkerConfig{
+		Exports: logcenter.NewPostgresExportStore(pool), Queries: logcenter.NewQueryRepository(pool, logCursorCodec),
+		Objects: archivePort, Signer: archiveSigner, SigningKeyRef: runtimeConfig.LogExportSigningKeyRef, Clock: time.Now,
+	})
+	if err != nil {
+		return fmt.Errorf("configure log center export worker: %w", err)
+	}
 	directoryAdapter, err := iam.NewSecretBackedDirectoryAdapter(iam.SecretBackedDirectoryAdapterConfig{
 		Secrets: directorySecrets, RequestTimeout: runtimeConfig.Directory.RequestTimeout,
 		MaximumPages: runtimeConfig.Directory.MaximumPages, MaximumObjects: runtimeConfig.Directory.MaximumObjects,
@@ -159,12 +213,14 @@ func run(ctx context.Context, environ map[string]string) error {
 		catalog.JobKindCatalogPublish: publication,
 		catalog.JobKindCatalogRevoke:  publication,
 		audit.JobKindAuditExport:      exportHandler,
+		logcenter.JobKindExport:       logExportWorker,
 		iam.JobKindDirectorySync:      directoryHandler,
 	})
 	deadLetters := jobs.NewDeadLetterRegistry(map[string]jobs.DeadLetterHandler{
 		catalog.JobKindCatalogPublish: publication,
 		catalog.JobKindCatalogRevoke:  publication,
 		audit.JobKindAuditExport:      exportHandler,
+		logcenter.JobKindExport:       logExportWorker,
 		iam.JobKindDirectorySync:      directoryHandler,
 	})
 	renewInterval := configuration.JobLease / 3
@@ -173,7 +229,7 @@ func run(ctx context.Context, environ map[string]string) error {
 	}
 	worker, err := jobs.NewWorker(jobs.WorkerConfig{
 		Owner: configuration.WorkerID, Repository: jobs.NewPostgresRepository(pool), Handlers: handlers,
-		DeadLetters: deadLetters, RequiredTransactionalDeadLetterKinds: []string{iam.JobKindDirectorySync},
+		DeadLetters: deadLetters, RequiredTransactionalDeadLetterKinds: []string{iam.JobKindDirectorySync, logcenter.JobKindExport},
 		LeaseDuration: configuration.JobLease, RenewInterval: renewInterval,
 	})
 	if err != nil {
@@ -184,27 +240,71 @@ func run(ctx context.Context, environ map[string]string) error {
 
 func loadWorkerRuntimeConfig(environ map[string]string) (workerRuntimeConfig, error) {
 	result := workerRuntimeConfig{
-		ObjectStoreAccessKey: strings.TrimSpace(environ["XMINDS_RELEASE_OBJECT_STORE_ACCESS_KEY"]),
-		ObjectStoreSecretKey: strings.TrimSpace(environ["XMINDS_RELEASE_OBJECT_STORE_SECRET_KEY"]),
-		Region:               strings.TrimSpace(environ["XMINDS_RELEASE_OBJECT_STORE_REGION"]),
-		SessionToken:         strings.TrimSpace(environ["XMINDS_RELEASE_OBJECT_STORE_SESSION_TOKEN"]),
-		SigningKeyDirectory:  filepath.Clean(strings.TrimSpace(environ["XMINDS_RELEASE_SIGNING_KEY_DIRECTORY"])),
-		SigningMasterKeyPath: filepath.Clean(strings.TrimSpace(environ["XMINDS_RELEASE_SIGNING_MASTER_KEY_PATH"])),
-		CatalogRootPath:      filepath.Clean(strings.TrimSpace(environ["XMINDS_RELEASE_CATALOG_ROOT_PATH"])),
-		AuditExportTempDir:   strings.TrimSpace(environ["XMINDS_RELEASE_AUDIT_EXPORT_TEMP_DIR"]),
-		PollInterval:         defaultWorkerPollInterval,
+		ObjectStoreAccessKey:              strings.TrimSpace(environ["XMINDS_RELEASE_OBJECT_STORE_ACCESS_KEY"]),
+		ObjectStoreSecretKey:              strings.TrimSpace(environ["XMINDS_RELEASE_OBJECT_STORE_SECRET_KEY"]),
+		LogArchiveObjectStoreURL:          strings.TrimSpace(environ["XMINDS_RELEASE_LOG_ARCHIVE_OBJECT_STORE_URL"]),
+		LogArchiveObjectBucket:            strings.TrimSpace(environ["XMINDS_RELEASE_LOG_ARCHIVE_OBJECT_BUCKET"]),
+		LogArchiveObjectStoreAccessKey:    strings.TrimSpace(environ["XMINDS_RELEASE_LOG_ARCHIVE_OBJECT_STORE_ACCESS_KEY"]),
+		LogArchiveObjectStoreSecretKey:    strings.TrimSpace(environ["XMINDS_RELEASE_LOG_ARCHIVE_OBJECT_STORE_SECRET_KEY"]),
+		LogArchiveObjectStoreRegion:       strings.TrimSpace(environ["XMINDS_RELEASE_LOG_ARCHIVE_OBJECT_STORE_REGION"]),
+		LogArchiveObjectStoreSessionToken: strings.TrimSpace(environ["XMINDS_RELEASE_LOG_ARCHIVE_OBJECT_STORE_SESSION_TOKEN"]),
+		LogArchiveRetentionDays:           defaultLogArchiveRetentionDays,
+		Region:                            strings.TrimSpace(environ["XMINDS_RELEASE_OBJECT_STORE_REGION"]),
+		SessionToken:                      strings.TrimSpace(environ["XMINDS_RELEASE_OBJECT_STORE_SESSION_TOKEN"]),
+		SigningKeyDirectory:               filepath.Clean(strings.TrimSpace(environ["XMINDS_RELEASE_SIGNING_KEY_DIRECTORY"])),
+		SigningMasterKeyPath:              filepath.Clean(strings.TrimSpace(environ["XMINDS_RELEASE_SIGNING_MASTER_KEY_PATH"])),
+		LogExportSigningKeyDirectory:      filepath.Clean(strings.TrimSpace(environ["XMINDS_RELEASE_LOG_EXPORT_SIGNING_KEY_DIRECTORY"])),
+		LogExportSigningMasterKeyPath:     filepath.Clean(strings.TrimSpace(environ["XMINDS_RELEASE_LOG_EXPORT_SIGNING_MASTER_KEY_PATH"])),
+		CatalogRootPath:                   filepath.Clean(strings.TrimSpace(environ["XMINDS_RELEASE_CATALOG_ROOT_PATH"])),
+		AuditExportTempDir:                strings.TrimSpace(environ["XMINDS_RELEASE_AUDIT_EXPORT_TEMP_DIR"]),
+		LogCursorKeyReference:             "secret://iam/log-center-cursor-key",
+		LogCursorTTL:                      15 * time.Minute,
+		LogExportSigningKeyRef:            "log-export-archive",
+		PollInterval:                      defaultWorkerPollInterval,
 	}
-	if result.ObjectStoreAccessKey == "" || result.ObjectStoreSecretKey == "" ||
+	if result.ObjectStoreAccessKey == "" || result.ObjectStoreSecretKey == "" || result.LogArchiveObjectStoreURL == "" || result.LogArchiveObjectBucket == "" || result.LogArchiveObjectStoreAccessKey == "" || result.LogArchiveObjectStoreSecretKey == "" ||
 		!absoluteConfiguredPath(environ["XMINDS_RELEASE_SIGNING_KEY_DIRECTORY"]) ||
 		!absoluteConfiguredPath(environ["XMINDS_RELEASE_SIGNING_MASTER_KEY_PATH"]) ||
+		!absoluteConfiguredPath(environ["XMINDS_RELEASE_LOG_EXPORT_SIGNING_KEY_DIRECTORY"]) ||
+		!absoluteConfiguredPath(environ["XMINDS_RELEASE_LOG_EXPORT_SIGNING_MASTER_KEY_PATH"]) ||
 		!absoluteConfiguredPath(environ["XMINDS_RELEASE_CATALOG_ROOT_PATH"]) {
 		return workerRuntimeConfig{}, errWorkerRuntimeConfiguration
+	}
+	if raw := strings.TrimSpace(environ["XMINDS_RELEASE_LOG_ARCHIVE_RETENTION_DAYS"]); raw != "" {
+		parsedValue, parseErr := strconv.ParseUint(raw, 10, 32)
+		parsed := uint(parsedValue)
+		if parseErr != nil || parsed < defaultLogArchiveRetentionDays || parsed > 3650 {
+			return workerRuntimeConfig{}, errWorkerRuntimeConfiguration
+		}
+		result.LogArchiveRetentionDays = parsed
 	}
 	if result.AuditExportTempDir != "" {
 		if !filepath.IsAbs(result.AuditExportTempDir) {
 			return workerRuntimeConfig{}, errWorkerRuntimeConfiguration
 		}
 		result.AuditExportTempDir = filepath.Clean(result.AuditExportTempDir)
+	}
+	if raw := strings.TrimSpace(environ["XMINDS_RELEASE_LOG_CURSOR_KEY_REFERENCE"]); raw != "" {
+		result.LogCursorKeyReference = raw
+	}
+	if !iam.ValidateSecretReference(result.LogCursorKeyReference) {
+		return workerRuntimeConfig{}, errWorkerRuntimeConfiguration
+	}
+	if raw := strings.TrimSpace(environ["XMINDS_RELEASE_LOG_CURSOR_TTL"]); raw != "" {
+		parsed, parseErr := time.ParseDuration(raw)
+		if parseErr != nil {
+			return workerRuntimeConfig{}, errWorkerRuntimeConfiguration
+		}
+		result.LogCursorTTL = parsed
+	}
+	if result.LogCursorTTL < 5*time.Minute || result.LogCursorTTL > 24*time.Hour {
+		return workerRuntimeConfig{}, errWorkerRuntimeConfiguration
+	}
+	if raw := strings.TrimSpace(environ["XMINDS_RELEASE_LOG_EXPORT_SIGNING_KEY_REF"]); raw != "" {
+		result.LogExportSigningKeyRef = raw
+	}
+	if len(result.LogExportSigningKeyRef) > 256 || result.LogExportSigningKeyRef == "" {
+		return workerRuntimeConfig{}, errWorkerRuntimeConfiguration
 	}
 	var err error
 	result.KeyRefs.Targets, err = parseKeyRefs(environ["XMINDS_RELEASE_CATALOG_TARGETS_KEY_REFS"])

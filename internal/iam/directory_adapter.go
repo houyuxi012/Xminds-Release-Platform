@@ -583,6 +583,12 @@ func validSecretReference(reference string) bool {
 	return found && name != "" && len(reference) <= 256 && !strings.ContainsAny(name, `/\\`)
 }
 
+// ValidateSecretReference exposes the shared secret reference contract to
+// adjacent runtime components without duplicating namespace/path validation.
+func ValidateSecretReference(reference string) bool {
+	return validSecretReference(reference)
+}
+
 func validClaimName(claim string) bool {
 	claim = strings.TrimSpace(claim)
 	return claim != "" && len(claim) <= 128 && !strings.ContainsAny(claim, "\x00\r\n")

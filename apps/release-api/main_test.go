@@ -9,11 +9,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
 	"xminds-release-platform/internal/iam"
 	"xminds-release-platform/internal/identity"
+	"xminds-release-platform/internal/logcenter"
 	"xminds-release-platform/internal/platform/buildinfo"
 	"xminds-release-platform/internal/platform/config"
 	"xminds-release-platform/internal/platform/httpserver"
@@ -256,6 +258,97 @@ func TestManagementRoutesExposeProtectedReauthenticationAPI(t *testing.T) {
 
 	if response.Code != http.StatusCreated || application.operation != iam.ReauthenticationOperationUserDisable {
 		t.Fatalf("status = %d, operation = %q, body = %s", response.Code, application.operation, response.Body.String())
+	}
+}
+
+func TestManagementRoutesLogCenterResolvesAuditorScopePerRequest(t *testing.T) {
+	t.Parallel()
+	verifier := mainVerifierFunc(func(context.Context, string) (identity.Principal, error) {
+		return identity.Principal{
+			Subject:    "auditor",
+			Kind:       identity.PrincipalKindHuman,
+			Roles:      []identity.Role{identity.RoleAuditor},
+			ProductIDs: []string{"product-a"},
+		}, nil
+	})
+	logHandler := &logcenter.LogHTTPHandler{ScopeResolver: resolveLogReadScope}
+	handler := httpserver.NewManagementHandler(
+		nil,
+		buildinfo.Current(),
+		identity.AuthenticationMiddleware(verifier),
+		managementRoutes(managementApplications{LogCenter: logHandler}),
+	)
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/logs/operations?product_id=product-a", nil)
+	request.Header.Set("Authorization", "Bearer signed-token")
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("auditor status = %d, body = %s; expected resolver success followed by unavailable repository", response.Code, response.Body.String())
+	}
+}
+
+func TestManagementRoutesLogCenterRejectsViewerWithoutAuditScope(t *testing.T) {
+	t.Parallel()
+	verifier := mainVerifierFunc(func(context.Context, string) (identity.Principal, error) {
+		return identity.Principal{
+			Subject: "viewer",
+			Kind:    identity.PrincipalKindHuman,
+			Roles:   []identity.Role{identity.RoleViewer},
+		}, nil
+	})
+	logHandler := &logcenter.LogHTTPHandler{ScopeResolver: resolveLogReadScope}
+	handler := httpserver.NewManagementHandler(
+		nil,
+		buildinfo.Current(),
+		identity.AuthenticationMiddleware(verifier),
+		managementRoutes(managementApplications{LogCenter: logHandler}),
+	)
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/logs/operations", nil)
+	request.Header.Set("Authorization", "Bearer signed-token")
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("viewer status = %d, body = %s; want 403", response.Code, response.Body.String())
+	}
+}
+
+func TestManagementRoutesMountsLogExports(t *testing.T) {
+	router := chi.NewRouter()
+	managementRoutes(managementApplications{LogExports: &logcenter.ExportHTTPHandler{}})(router)
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/log-exports/018f835d-7e4b-7abc-9f42-67a2f5f48e13", nil)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestLoadAPIRuntimeConfigUsesIndependentLogCursorSettings(t *testing.T) {
+	t.Parallel()
+	environ := map[string]string{
+		"XMINDS_RELEASE_OBJECT_STORE_ACCESS_KEY":             "access-key",
+		"XMINDS_RELEASE_OBJECT_STORE_SECRET_KEY":             "secret-key",
+		"XMINDS_RELEASE_DEFAULT_PRODUCT_ID":                  "ngep",
+		"XMINDS_RELEASE_DEFAULT_CHANNEL":                     "stable",
+		"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY":            t.TempDir(),
+		"XMINDS_RELEASE_IAM_MFA_ENROLLMENT_SECRET_DIRECTORY": t.TempDir(),
+		"XMINDS_RELEASE_IAM_USE_DEVELOPMENT_BREACH_CORPUS":   "true",
+		"XMINDS_RELEASE_LOG_CURSOR_KEY_REFERENCE":            "secret://iam/custom-log-cursor-key",
+		"XMINDS_RELEASE_LOG_CURSOR_TTL":                      "20m",
+	}
+	configuration, err := loadAPIRuntimeConfig(environ, "development")
+	if err != nil {
+		t.Fatalf("loadAPIRuntimeConfig() error = %v", err)
+	}
+	if configuration.LogCursorKeyReference != "secret://iam/custom-log-cursor-key" || configuration.LogCursorTTL != 20*time.Minute {
+		t.Fatalf("log cursor configuration = %#v", configuration)
+	}
+	if configuration.LogCursorKeyReference == configuration.Directory.ConflictCursorKeyReference {
+		t.Fatal("log cursor key reference must be independent from directory cursor key reference")
 	}
 }
 

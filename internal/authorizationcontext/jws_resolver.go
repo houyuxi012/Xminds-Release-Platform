@@ -48,12 +48,14 @@ type signedClaims struct {
 	CustomerName      string        `json:"customer_name"`
 	TenantID          string        `json:"tenant_id"`
 	AuthorizationName string        `json:"authorization_name"`
+	ClientAppID       string        `json:"client_app_id"`
 	ClientAppVersion  string        `json:"client_app_version"`
 	LicenseID         string        `json:"license_id"`
 	LicenseExpiresAt  time.Time     `json:"license_expires_at"`
 	LicenseStatus     LicenseStatus `json:"license_status"`
 	Decision          Decision      `json:"decision"`
 	ReasonCode        string        `json:"reason_code"`
+	ValidatedAt       time.Time     `json:"validated_at"`
 }
 
 func NewJWSResolver(config JWSResolverConfig) (*JWSResolver, error) {
@@ -74,49 +76,74 @@ func NewJWSResolver(config JWSResolverConfig) (*JWSResolver, error) {
 	return &JWSResolver{config: config}, nil
 }
 
-func (resolver *JWSResolver) Resolve(_ context.Context, envelope SignedEnvelope, binding RequestBinding) (Snapshot, error) {
+func (resolver *JWSResolver) VerifyAndCanonicalize(_ context.Context, envelope SignedEnvelope, binding RequestBinding) (VerifiedContext, error) {
 	if resolver == nil || resolver.config.Clock == nil || resolver.config.ReplayStore == nil {
-		return Snapshot{}, ErrResolverConfiguration
+		return VerifiedContext{}, ErrResolverConfiguration
 	}
 	compact := strings.TrimSpace(envelope.Compact)
 	if compact == "" || len(compact) > maximumSignedContextBytes || strings.HasPrefix(compact, "{") {
-		return Snapshot{}, ErrUntrustedContext
+		return VerifiedContext{}, ErrUntrustedContext
 	}
 	object, err := jose.ParseSignedCompact(compact, resolver.config.Algorithms)
 	if err != nil || len(object.Signatures) != 1 {
-		return Snapshot{}, ErrUntrustedContext
+		return VerifiedContext{}, ErrUntrustedContext
 	}
 	payload, err := object.Verify(resolver.config.VerificationKey)
 	if err != nil {
-		return Snapshot{}, ErrUntrustedContext
+		return VerifiedContext{}, ErrUntrustedContext
 	}
 	var claims signedClaims
 	decoder := json.NewDecoder(bytes.NewReader(payload))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&claims); err != nil {
-		return Snapshot{}, ErrContextClaimsInvalid
+		return VerifiedContext{}, ErrContextClaimsInvalid
 	}
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return Snapshot{}, ErrContextClaimsInvalid
+		return VerifiedContext{}, ErrContextClaimsInvalid
 	}
 	now := resolver.config.Clock().UTC().Truncate(time.Microsecond)
 	if err := resolver.validateClaims(claims, binding, now); err != nil {
-		return Snapshot{}, err
+		return VerifiedContext{}, err
 	}
 	expiresAt := time.Unix(claims.ExpiresAt, 0).UTC()
-	if !resolver.config.ReplayStore.Claim(claims.ContextID, expiresAt.Add(resolver.config.ClockSkew), now) {
-		return Snapshot{}, ErrContextReplay
+	issuer, contextID, ok := canonicalReplayIdentity(claims.Issuer, claims.ContextID)
+	if !ok {
+		return VerifiedContext{}, ErrContextClaimsInvalid
 	}
 	snapshot := Snapshot{
 		CustomerID: strings.TrimSpace(claims.CustomerID), CustomerName: strings.TrimSpace(claims.CustomerName),
 		TenantID: strings.TrimSpace(claims.TenantID), AuthorizationName: strings.TrimSpace(claims.AuthorizationName),
+		ClientAppID:      strings.TrimSpace(claims.ClientAppID),
 		ClientAppVersion: strings.TrimSpace(claims.ClientAppVersion), LicenseID: strings.TrimSpace(claims.LicenseID),
 		LicenseExpiresAt: claims.LicenseExpiresAt.UTC(), LicenseStatus: claims.LicenseStatus,
-		Decision: claims.Decision, ReasonCode: claims.ReasonCode, ValidatedAt: now, ValidatorIssuer: resolver.config.Issuer,
+		Decision: claims.Decision, ReasonCode: claims.ReasonCode, ValidatedAt: claims.ValidatedAt.UTC(), ValidatorIssuer: resolver.config.Issuer,
 	}
 	applyLicenseDecision(&snapshot, now)
 	snapshot.ContextDigest = digestSnapshot(snapshot)
-	return snapshot, nil
+	return VerifiedContext{SnapshotCandidate: snapshot, ValidatorIssuer: issuer, ContextID: contextID, ExpiresAt: expiresAt.Add(resolver.config.ClockSkew)}, nil
+}
+
+func (resolver *JWSResolver) Claim(ctx context.Context, verified VerifiedContext) (Snapshot, error) {
+	if resolver == nil || resolver.config.ReplayStore == nil || resolver.config.Clock == nil {
+		return Snapshot{}, ErrResolverConfiguration
+	}
+	now := resolver.config.Clock().UTC().Truncate(time.Microsecond)
+	claimed, err := resolver.config.ReplayStore.Claim(ctx, verified.ValidatorIssuer, verified.ContextID, verified.ExpiresAt, now)
+	if err != nil {
+		return Snapshot{}, ErrReplayStoreUnavailable
+	}
+	if !claimed {
+		return Snapshot{}, ErrContextReplay
+	}
+	return verified.SnapshotCandidate, nil
+}
+
+func (resolver *JWSResolver) Resolve(ctx context.Context, envelope SignedEnvelope, binding RequestBinding) (Snapshot, error) {
+	verified, err := resolver.VerifyAndCanonicalize(ctx, envelope, binding)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	return resolver.Claim(ctx, verified)
 }
 
 func (resolver *JWSResolver) validateClaims(claims signedClaims, binding RequestBinding, now time.Time) error {
@@ -135,19 +162,19 @@ func (resolver *JWSResolver) validateClaims(claims signedClaims, binding Request
 		strings.TrimSpace(claims.Path) != strings.TrimSpace(binding.Path) {
 		return ErrRequestBindingInvalid
 	}
-	if !validBoundedClaims(claims) {
+	if !validBoundedClaims(claims, now, resolver.config.ClockSkew) {
 		return ErrContextClaimsInvalid
 	}
 	return nil
 }
 
-func validBoundedClaims(claims signedClaims) bool {
+func validBoundedClaims(claims signedClaims, now time.Time, skew time.Duration) bool {
 	values := []struct {
 		value string
 		max   int
 	}{
 		{claims.ContextID, 128}, {claims.RequestID, 128}, {claims.Method, 16}, {claims.Path, 2048},
-		{claims.CustomerID, 128}, {claims.CustomerName, 256}, {claims.TenantID, 128},
+		{claims.CustomerID, 128}, {claims.CustomerName, 256}, {claims.TenantID, 128}, {claims.ClientAppID, 128},
 		{claims.AuthorizationName, 256}, {claims.ClientAppVersion, 128}, {claims.LicenseID, 128},
 	}
 	for _, item := range values {
@@ -155,11 +182,11 @@ func validBoundedClaims(claims signedClaims) bool {
 			return false
 		}
 	}
-	if !strings.HasPrefix(strings.TrimSpace(claims.Path), "/") || strings.ContainsAny(claims.Path, "?#") || !reasonCodePattern.MatchString(claims.ReasonCode) || claims.LicenseExpiresAt.IsZero() {
+	if !strings.HasPrefix(strings.TrimSpace(claims.Path), "/") || strings.ContainsAny(claims.Path, "?#") || !reasonCodePattern.MatchString(claims.ReasonCode) || claims.LicenseExpiresAt.IsZero() || claims.ValidatedAt.IsZero() || claims.ValidatedAt.After(now.Add(skew)) || claims.ValidatedAt.Before(time.Unix(claims.IssuedAt, 0).UTC().Add(-skew)) {
 		return false
 	}
 	switch claims.LicenseStatus {
-	case LicenseStatusValid, LicenseStatusExpired, LicenseStatusRevoked, LicenseStatusSuspended:
+	case LicenseStatusValid, LicenseStatusExpiring, LicenseStatusExpired, LicenseStatusRevoked, LicenseStatusUnknown:
 	default:
 		return false
 	}
@@ -179,7 +206,7 @@ func applyLicenseDecision(snapshot *Snapshot, now time.Time) {
 	if snapshot.LicenseStatus == LicenseStatusValid && !snapshot.LicenseExpiresAt.After(now) {
 		snapshot.LicenseStatus = LicenseStatusExpired
 	}
-	if snapshot.LicenseStatus == LicenseStatusValid {
+	if snapshot.LicenseStatus == LicenseStatusValid || snapshot.LicenseStatus == LicenseStatusExpiring {
 		return
 	}
 	snapshot.Decision = DecisionDeny
@@ -188,20 +215,20 @@ func applyLicenseDecision(snapshot *Snapshot, now time.Time) {
 		snapshot.ReasonCode = "LICENSE_EXPIRED"
 	case LicenseStatusRevoked:
 		snapshot.ReasonCode = "LICENSE_REVOKED"
-	case LicenseStatusSuspended:
-		snapshot.ReasonCode = "LICENSE_SUSPENDED"
+	case LicenseStatusUnknown:
+		snapshot.ReasonCode = "LICENSE_UNKNOWN"
 	}
 }
 
 func digestSnapshot(snapshot Snapshot) [sha256.Size]byte {
 	canonical := struct {
-		CustomerID, CustomerName, TenantID, AuthorizationName, ClientAppVersion, LicenseID string
-		LicenseExpiresAt                                                                   string
-		LicenseStatus                                                                      LicenseStatus
-		Decision                                                                           Decision
-		ReasonCode, ValidatedAt, ValidatorIssuer                                           string
+		CustomerID, CustomerName, TenantID, AuthorizationName, ClientAppID, ClientAppVersion, LicenseID string
+		LicenseExpiresAt                                                                                string
+		LicenseStatus                                                                                   LicenseStatus
+		Decision                                                                                        Decision
+		ReasonCode, ValidatedAt, ValidatorIssuer                                                        string
 	}{
-		snapshot.CustomerID, snapshot.CustomerName, snapshot.TenantID, snapshot.AuthorizationName,
+		snapshot.CustomerID, snapshot.CustomerName, snapshot.TenantID, snapshot.AuthorizationName, snapshot.ClientAppID,
 		snapshot.ClientAppVersion, snapshot.LicenseID, snapshot.LicenseExpiresAt.UTC().Format(time.RFC3339Nano),
 		snapshot.LicenseStatus, snapshot.Decision, snapshot.ReasonCode,
 		snapshot.ValidatedAt.UTC().Format(time.RFC3339Nano), snapshot.ValidatorIssuer,
@@ -219,9 +246,10 @@ func NewMemoryReplayStore() *MemoryReplayStore {
 	return &MemoryReplayStore{entries: make(map[string]time.Time)}
 }
 
-func (store *MemoryReplayStore) Claim(contextID string, expiresAt, now time.Time) bool {
-	if store == nil || strings.TrimSpace(contextID) == "" || !expiresAt.After(now) {
-		return false
+func (store *MemoryReplayStore) Claim(_ context.Context, issuer, contextID string, expiresAt, now time.Time) (bool, error) {
+	issuer, contextID, ok := canonicalReplayIdentity(issuer, contextID)
+	if store == nil || !ok || !expiresAt.After(now) {
+		return false, nil
 	}
 	store.mutex.Lock()
 	defer store.mutex.Unlock()
@@ -230,9 +258,10 @@ func (store *MemoryReplayStore) Claim(contextID string, expiresAt, now time.Time
 			delete(store.entries, id)
 		}
 	}
-	if _, exists := store.entries[contextID]; exists {
-		return false
+	key := issuer + "\x00" + contextID
+	if _, exists := store.entries[key]; exists {
+		return false, nil
 	}
-	store.entries[contextID] = expiresAt
-	return true
+	store.entries[key] = expiresAt
+	return true, nil
 }

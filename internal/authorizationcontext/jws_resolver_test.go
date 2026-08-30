@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -67,6 +68,43 @@ func TestExpiredLicenseProducesImmutableDenySnapshot(t *testing.T) {
 	}
 }
 
+func TestExpiringLicenseRemainsAnAllowedSignedStatus(t *testing.T) {
+	t.Parallel()
+
+	resolver, privateKey, binding := newResolverHarness(t)
+	claims := validClaims(binding)
+	claims.LicenseStatus = LicenseStatusExpiring
+	snapshot, err := resolver.Resolve(context.Background(), signClaims(t, privateKey, claims), binding)
+	if err != nil {
+		t.Fatalf("Resolve() error = %v", err)
+	}
+	if snapshot.Decision != DecisionAllow || snapshot.LicenseStatus != LicenseStatusExpiring {
+		t.Fatalf("snapshot = %+v", snapshot)
+	}
+}
+
+func TestVerifyCanonicalizesReplayIdentity(t *testing.T) {
+	t.Parallel()
+
+	resolver, privateKey, binding := newResolverHarness(t)
+	claims := validClaims(binding)
+	claims.ContextID = "  " + claims.ContextID + "  "
+	verified, err := resolver.VerifyAndCanonicalize(context.Background(), signClaims(t, privateKey, claims), binding)
+	if err != nil {
+		t.Fatalf("VerifyAndCanonicalize() error = %v", err)
+	}
+	if verified.ContextID != strings.TrimSpace(claims.ContextID) {
+		t.Fatalf("ContextID = %q, want canonical %q", verified.ContextID, strings.TrimSpace(claims.ContextID))
+	}
+}
+
+func TestClaimRejectsMissingClockWithoutPanicking(t *testing.T) {
+	resolver := &JWSResolver{config: JWSResolverConfig{ReplayStore: NewMemoryReplayStore()}}
+	if _, err := resolver.Claim(context.Background(), VerifiedContext{ValidatorIssuer: "issuer", ContextID: "context"}); !errors.Is(err, ErrResolverConfiguration) {
+		t.Fatalf("Claim() error = %v, want ErrResolverConfiguration", err)
+	}
+}
+
 func newResolverHarness(t *testing.T) (*JWSResolver, ed25519.PrivateKey, RequestBinding) {
 	t.Helper()
 	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
@@ -92,9 +130,9 @@ func validClaims(binding RequestBinding) signedClaims {
 		ExpiresAt: now.Add(time.Minute).Unix(), NotBefore: now.Add(-time.Minute).Unix(), IssuedAt: now.Add(-time.Minute).Unix(),
 		ContextID: "ctx-018f835d-7e4b-7abc-9f42-67a2f5f48e72", RequestID: binding.RequestID, Method: binding.Method, Path: binding.Path,
 		CustomerID: "customer-184", CustomerName: "示例设计院", TenantID: "tenant-01",
-		AuthorizationName: "Xminds Enterprise", ClientAppVersion: "3.8.2", LicenseID: "LIC-2026-000184",
+		AuthorizationName: "Xminds Enterprise", ClientAppID: "xminds-client", ClientAppVersion: "3.8.2", LicenseID: "LIC-2026-000184",
 		LicenseExpiresAt: time.Date(2027, 8, 20, 0, 0, 0, 0, time.UTC), LicenseStatus: LicenseStatusValid,
-		Decision: DecisionAllow, ReasonCode: "LICENSE_VALID",
+		Decision: DecisionAllow, ReasonCode: "LICENSE_VALID", ValidatedAt: now.Add(-30 * time.Second),
 	}
 }
 
