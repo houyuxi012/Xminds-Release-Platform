@@ -1,0 +1,12 @@
+DROP TABLE IF EXISTS emergency_access_events;
+DROP TABLE IF EXISTS directory_sync_conflicts;
+DROP TABLE IF EXISTS directory_sync_jobs;
+DROP TABLE IF EXISTS role_bindings;
+DROP TABLE IF EXISTS organization_memberships;
+DROP TABLE IF EXISTS organization_units;
+DROP TABLE IF EXISTS local_password_history;
+DROP TABLE IF EXISTS local_credentials;
+DROP INDEX IF EXISTS user_principals_username_canonical_uidx;
+DROP TABLE IF EXISTS user_principals;
+DROP TABLE IF EXISTS iam_login_state;
+DROP TABLE IF EXISTS identity_sources;

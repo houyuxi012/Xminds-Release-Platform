@@ -1,0 +1,224 @@
+# Xminds Release Platform
+
+Xminds Release Platform 是面向企业软件交付场景的多产品可信发布平台。平台统一管理制品、Release、职责分离审批、TUF 风格可信目录、SCM 集成、分发端点、身份治理和审计证据。
+
+## 当前状态
+
+项目处于 P0 实施阶段，已交付第一批平台基础能力：
+
+- 严格的 `XMINDS_RELEASE_*` 配置边界和非开发环境必填校验；
+- 显式 `release-api migrate` 与 `release-api serve` 模式，服务启动不会隐式修改数据库；
+- PostgreSQL 内嵌迁移、advisory lock 串行化和已执行迁移 SHA-256 漂移防护；
+- 基于 UUIDv7、事务入队和 `FOR UPDATE SKIP LOCKED` 的可靠 Outbox；
+- RFC 9457 Problem Details、请求 ID、安全响应头和 OpenTelemetry HTTP 插桩；
+- OpenAPI 3.1 基础契约及机器校验测试。
+- OIDC Discovery/JWKS 验签、issuer/audience/时间声明校验和强制 token ID；
+- GitHub Actions、GitHub Enterprise Actions、GitLab CI 工作负载区分，以及仅保存 Argon2id 哈希的 API Token fallback；
+- 显式角色-动作矩阵、产品范围 RBAC、审计查询与导出的对象级授权；
+- 按产品分区的不可变审计哈希链、敏感字段递归脱敏，以及事务化审计导出 Outbox；
+- 版本化 `xminds-product-manifest/v1`、双产品无特例注册、默认通道和稳定 SHA-256 Manifest 摘要；
+- 产品、默认通道和审计证据的事务一致性，以及数据库层 Manifest 不可变保护；
+- 产品注册、范围内列表/详情和停用的 OpenAPI 3.1 与 RFC 9457 HTTP 适配器契约。
+- 24 小时可恢复分块上传、20 GiB/10000 分块硬限制、同分块安全重传和产品范围隔离；
+- MinIO/S3 兼容存储适配器、服务端独立 SHA-256 流式校验、内容寻址去重与最终对象不可删除；
+- 摘要不匹配隔离及事务化清理 Outbox，以及制品上传/完成的不可变审计证据；
+- 制品上传、分块、完成与元数据查询的 OpenAPI 3.1 和 RFC 9457 HTTP 适配器契约。
+- `DRAFT → SUBMITTED → APPROVED/REJECTED → PUBLISHING → PUBLISHED/FAILED` 精确 Release 状态机；
+- 显式审批者角色、提交者与审批者职责分离、数据库乐观锁及不可变 Release 内容；
+- 并发安全的发布幂等键、事务化 attempt/审计/Outbox，以及审批者授权重试和正交撤销证据；
+- Release 创建、提交、批准、拒绝、发布、重试、撤销和查询的 OpenAPI 3.1 与 RFC 9457 HTTP 契约。
+- 严格 Canonical JSON、Ed25519 五角色签名链、跨角色摘要/版本绑定和 NGEP 消费端黄金向量；
+- AES-256-GCM 本地加密 Signing Provider、在线 root 拒绝门禁、单调 Catalog 版本仓储和原子 current pointer；
+- 离线 root 密钥工具及双人控制的[密钥仪式规范](docs/security/key-ceremony.md)。
+- 可续租的持久化 Worker、分级退避重试、五次失败死信和领域状态终结；
+- 五角色目录的不可变对象发布、回读摘要校验、数据库原子 current 切换和崩溃后幂等恢复；
+- 发布后撤销目录、Release/attempt 完成与失败回写，以及 UTF-8 JSONL 审计导出的摘要和过期控制。
+- GitHub.com/GHES 与 GitLab Self-Managed 统一 Provider Port、显式 API Base URL 和标准化 Webhook 事件；
+- 固定 DNS 解析地址、系统根加版本化企业 CA、禁用重定向与环境代理的 SSRF/TLS 出站边界；
+- GitHub HMAC-SHA256、GitLab Standard Webhooks/旧版 Secret Token 验签、事件重放幂等和事务审计；
+- 提交查询、Check Run/Commit Status 能力回写、`scm.status.writeback.v1` 持久作业与本地私有 CA 契约测试；
+- AES-256-GCM Provider 凭据密文持久化、AAD 元数据绑定、主密钥 ID 轮换和旧凭据即时撤销。
+- origin、CDN 与私有分发端点的产品范围注册、HTTPS 摘要校验、优先级和连续失败健康状态；
+- `endpoint.sync.v1` 五角色目录与引用制品复制、目标端回读 SHA-256 校验和三次失败摘除；
+- 独立公网监听端口、默认产品兼容目录路径、产品/通道隔离目录路径和支持单段 Range 的内容寻址制品下载。
+- 基于受信任 Secret 根的 OIDC discovery/JWKS 与 SCIM 2.0 连接验证，并强制非对称签名算法、可用公钥材料、同源 JWKS、TLS 1.2+、禁用环境代理与重定向；
+- 身份源映射完整性仅由服务端 Verify 结果产生，并与独立 `configuration_version` 精确绑定；名称或 Secret 引用实际变化会推进配置代际并立即清除旧验证能力，客户端不能声明或恢复该状态；
+- 身份源详情和来源范围的同步作业历史提供稳定分页与 `identity.manage` 授权，响应不暴露 Secret 引用、上游游标、运行阶段或 worker 运行标记；
+- 基于当前 `iam_login_state.active_source_id` 的活动人员 OIDC 验签，来源切换、状态变更或 Secret/CA 原子轮换后立即失效旧信任；
+- SCIM Users/Groups 分页归一化、有界对象计数与持久化 preview/apply 作业，支持 Worker 崩溃后从服务端游标幂等恢复；
+- 目录来源字段所有权、本地角色/补充成员关系保留、full snapshot 终页停用及冲突对象最后安全状态保留。
+- 基于 React 19、Ant Design 6 与 Ant Design Pro Components 的发布管理控制台；
+- 白色管理台导航与详情抽屉、产品注册、断点续传、职责分离审批、SCM 能力探测、端点健康和审计证据主流程；
+- 真实 Chromium 组件测试与 Playwright 端到端主流程验收。
+
+当前管理 API 运行时已挂载产品、制品、Release、分发端点、审计查询/导出和 IAM 治理路由，包括组织详情、子节点和双权威成员关系治理。业务路由统一位于活动来源 OIDC 人员身份、静态受信工作负载 OIDC、Argon2id API Token 和本地持久会话的组合验证边界之后；未受信 JWT payload 中精确名称的 `token_use` 只用于选择唯一验签器，缺失、重复、大小写别名、未知值或任一验签失败都不会跨身份类型回退。角色变更、组织成员增删、用户启停/会话撤销和 SSO 切换还必须消费与 actor、operation 及完成 Bearer token ID 精确绑定的服务端一次性重认证 evidence；工作负载和 API Token 不具备 human reauthentication 能力。存活、就绪和版本端点保持匿名可用。分发端点激活使用 DNS 解析地址固定、禁用环境代理和重定向的 TLS 探测，私有 CA 仅能通过受控 Secret 目录中的单文件引用；私有端点网段必须通过 `XMINDS_RELEASE_ENDPOINT_ALLOWED_PRIVATE_CIDRS` 以最小 RFC1918/ULA CIDR 显式授权，未配置时只允许公开可路由地址。独立 Public API 只挂载公开目录和制品读取路由，不包含管理操作。Worker 已挂载目录发布、目录撤销、审计导出和版本化身份目录同步处理器；端点同步的具体目标写入适配器仍需在部署组合根注入。统一日志中心属于后续任务。所有签名材料、IAM Secret 与对象存储凭据必须在启动时显式注入，否则拒绝运行。
+
+## P0 能力范围
+
+- 多产品注册与产品级权限隔离；
+- 分块制品上传、SHA-256 校验和不可变对象存储；
+- Release 创建、提交、职责分离审批、发布和失败重试；
+- root、targets、snapshot、timestamp、revocation 五角色可信目录；
+- GitHub.com、GitHub Enterprise Server 和 GitLab Self-Managed 集成；
+- OIDC、目录同步、本地账户、应急账户和产品范围授权；
+- 操作、登录、应用请求和 Git 同步统一日志中心；
+- Docker Compose 在线/离线交付、监控、审计和恢复基线。
+
+P0 只保存可信上游产生的请求时授权快照，不负责 License 创建、签发、续期、计量和吊销。
+
+## 工程结构
+
+```text
+apps/       API、Worker 和 Console 入口
+api/        OpenAPI 3.1 接口契约与校验测试
+internal/   模块化单体领域与平台能力
+migrations/ 编译内嵌的 PostgreSQL 迁移
+scripts/    构建、边界和交付检查
+tests/      集成、契约、端到端和性能测试
+```
+
+## 开发环境
+
+- Go 1.26.5；
+- Node.js 24 LTS；
+- PostgreSQL 17.10；
+- Docker Compose；
+- golangci-lint v2（执行扩展静态检查时需要）。
+
+## 常用命令
+
+```bash
+make fmt
+make lint
+make test
+make test-integration
+make build
+make console-verify
+make console-e2e
+make verify
+```
+
+`make verify` 会执行格式、Go Vet、竞态测试、双二进制构建、仓库边界检查、macOS 元数据污染检查，以及 Console 的静态检查、类型检查、真实浏览器组件测试和生产构建。`make console-e2e` 单独执行产品创建、制品续传、职责分离发布、SCM、端点和审计证据主流程。
+
+## 管理控制台
+
+控制台位于 `apps/release-console`。首次启动先安装锁定依赖：
+
+```bash
+make console-install
+cd apps/release-console
+npx playwright install chromium
+npm run dev
+```
+
+默认开发地址为 `http://127.0.0.1:4173`。开发环境提供确定性的演示数据用于交互验收；产品创建在生产构建中调用 `/api/v1/products`，后端仍是身份、授权、状态机和审计证据的唯一权威来源。当前 Console 交付 P0 核心可信发布管理流程，统一日志中心已接入管理 API 与 Console；用户/组织后端提供受控组织详情、子节点和成员关系接口，不在前端复制服务端安全策略。
+
+## 本地启动
+
+复制 [`.env.example`](.env.example) 中的变量到本地环境，并确保 PostgreSQL 已创建对应数据库。迁移与服务启动必须分开执行：
+
+```bash
+go run ./apps/release-api migrate
+go run ./apps/release-api serve
+go run ./apps/release-worker
+```
+
+默认管理 API 监听 `127.0.0.1:8080`，可访问：
+
+- `GET /health/live`：进程存活检查；
+- `GET /health/ready`：PostgreSQL 就绪检查；
+- `GET /version`：构建版本信息；
+- `GET /api/v1/logs/operations`、`/authentications`、`/application-requests`、`/git-syncs`：按当前主体授权范围查询统一日志；
+- `GET /api/v1/logs/related`：按请求 ID 或关联 ID 查询跨类型日志；
+- `POST /api/v1/auth/local/activate`：一次性激活本地账户；
+- `POST /api/v1/auth/local/mfa-enrollments`：为待激活账户生成平台托管的 MFA seed 与 otpauth URI；
+- `POST /api/v1/auth/local/login`：本地账户登录；
+- `POST /api/v1/auth/emergency/login`：强制 MFA 的应急账户登录。
+
+上述 4 个认证入口不要求现有 Bearer，重认证挑战创建/完成和其他管理 API 仍在统一认证中间件之后。所有环境必须分别配置绝对路径 `XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY` 和 `XMINDS_RELEASE_IAM_MFA_ENROLLMENT_SECRET_DIRECTORY`，两者不得指向同一目录；生产、测试和预发环境还必须配置指向非可写 SHA-1/SHA-256 摘要文件的 `XMINDS_RELEASE_IAM_BREACH_CORPUS`，缺失时服务拒绝启动。仅显式 `development` 环境可通过 `XMINDS_RELEASE_IAM_USE_DEVELOPMENT_BREACH_CORPUS=true` 单独启用内置最小语料库；缺省环境、其他环境或与外部语料库同时配置时均拒绝启动。锁定阶段可通过 `XMINDS_RELEASE_IAM_LOCKOUT_STAGES=5:5m,8:30m,10:24h` 配置，次数和时长必须严格递增且满足运行时安全上下界。高风险挑战 TTL、evidence TTL、OIDC 新鲜度/时钟偏差、终态保留期和有界清理批次可通过 `.env.example` 中的 `XMINDS_RELEASE_IAM_REAUTH_*` 变量调整；越过安全边界的配置会导致服务拒绝启动。重认证 proof 绑定稳定的内部治理用户 ID；人员 proof 还精确绑定来源 ID，本地 proof 则使用独立的 local 绑定域，空来源从不作为通配。`000016` 会将无法可靠回填该绑定的既有活动 challenge 统一置为 `expired`。
+
+MFA enrollment 根仅挂载给 API，由所有 API 副本以相同稳定 numeric UID 通过受信 RWX 卷共享，目录 owner-only 可写，生成文件为 `0400`；Worker 不挂载该根。若基础设施不能提供共享根，必须经同一 `MFASecretStore` 边界改用外部 Secret Manager，禁止每个副本使用独立本地盘。API 启动执行不记录 seed 的 create→resolve→delete 真实探针，任一步失败即拒绝启动。轮换与过期 Secret 经 PostgreSQL 持久 GC 队列、reference 锁、存活性复查和 token-bound lease 清理。旧 `secret://iam/` TOTP 在首次轮换后保留，不进入新根 GC，由独立旧根退役流程处理。
+
+### 目录连接、活动 OIDC 与异步同步
+
+`XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY` 是 API 与 Worker 共享的受信任旧 IAM Secret 只读根（变量名为兼容已有部署保留）；不得向 API 或 Worker 授予该根写权限。目录必须是无符号链接的绝对路径，Secret 文件不得对 group/other 开放权限，单文件上限 4 KiB。数据库只保存 `secret://iam/<name>` 引用，不保存 Bearer、CA 或 Secret 内容。Secret 读取使用固定 4 个工作线程与 32 个等待槽位；调用方总超时可取消等待，即使底层 NFS/FUSE 打开操作卡住也不会按请求创建无界线程。关停时立即停止接单并以稳定错误释放队列请求，不等待无法取消的底层系统调用；受信任根目录描述符只会在固定工作线程真正退出后异步关闭。每次读取都从同一个已固定目录描述符打开、校验并完整读取单个文件快照；卡住的底层 I/O 最多占满固定工作线程，运维应同时监控上游文件系统健康。OIDC 来源 Secret 为严格 JSON：
+
+日志中心查询游标使用独立的 `XMINDS_RELEASE_LOG_CURSOR_KEY_REFERENCE` 与 `XMINDS_RELEASE_LOG_CURSOR_TTL`。该 Secret 仅用于日志查询游标，禁止复用目录冲突游标、Bearer、CA、MFA 或其他业务密钥；轮换后旧游标立即失效，客户端需从首页重新分页。日志查询 API 会从统一身份中间件取得当前主体，仅 `admin`/`auditor` 及其显式产品/平台授权可读，未授权主体不会得到静态或跨产品范围。
+
+日志导出执行由 `release-worker` 消费 `log.export.v1` Outbox 作业：请求、执行租约、重试和死信状态分别持久化在 `log_exports` 与 `log_export_jobs`，租约转换使用随机 token 做 CAS 围栏；归档对象按内容寻址键使用 PostgreSQL advisory lock 串行化，避免多 Worker 同时写入同一归档键。Worker 按导出时的范围与过滤快照分页读取四类日志，生成规范化 NDJSON；临时 staging 使用普通对象存储，最终内容写入独立归档对象存储（`XMINDS_RELEASE_LOG_ARCHIVE_OBJECT_STORE_*`），完成 Stat/Open readback 后再写入内容寻址对象，避免在 WORM bucket 删除 staging 版本。归档 bucket 启动时必须启用 MinIO Object Lock、COMPLIANCE 默认保留期（默认 365 天，可配置为更长），否则 Worker 拒绝启动。归档使用独立签名目录（`XMINDS_RELEASE_LOG_EXPORT_SIGNING_KEY_DIRECTORY`、`XMINDS_RELEASE_LOG_EXPORT_SIGNING_MASTER_KEY_PATH`）与 `XMINDS_RELEASE_LOG_EXPORT_SIGNING_KEY_REF` Ed25519 引用签署清单；死信通过同一 Outbox 结算事务将导出状态置为 `exhausted`。游标密钥、归档签名密钥和归档存储凭据必须分离，任一配置缺失或引用不合法时 Worker 拒绝启动。管理 API 的导出下载返回相对路径，并由已认证、已授权的管理会话从归档 bucket 流式读取，不向客户端暴露对象存储凭据。
+
+```json
+{
+  "issuer": "https://id.example.invalid",
+  "audience": "xminds-release-platform",
+  "roles_claim": "roles",
+  "product_ids_claim": "product_ids",
+  "token_use_claim": "token_use",
+  "signing_algorithms": ["RS256"],
+  "ca_reference": "secret://iam/corporate-ca"
+}
+```
+
+`token_use_claim` 必须精确为 `token_use`，以与管理令牌分派器的固定协议一致。当登录模式为 `sso` 时，API 每次人员认证都重读当前登录状态与活动来源；只有精确指向的 `enabled` OIDC 来源可继续。验签器缓存最多保留 16 个信任版本，键绑定来源 ID、数据库版本及 OIDC Secret 与 CA 内容摘要，并发首访仅构建一次。JWKS 首次预取会直接作为验签缓存，单次响应严格限制为 2 MiB、最多 128 个 key、单个 `kid` 最多 128 字节；合法轮换只触发一次共享刷新，未知 `kid` 使用最多 128 项短期负缓存及 KeySet 级全局刷新冷却，刷新失败按 1–30 秒上限指数退避并添加有界抖动，成功响应但未包含所需 `kid` 同样进入冷却；冷却到期后允许 unknown-`kid` 与 same-`kid` 公钥轮换进行同一受限刷新，已缓存且验签成功的 key 绝不触发出站。每个调用方只在自身总 deadline 内等待，取消某个 waiter 不会污染 issuer 失败退避；共享刷新由同一 `XMINDS_RELEASE_IAM_DIRECTORY_REQUEST_TIMEOUT` 配置的独立硬截止边界终止，即使所有 waiter 都已离开也不会无界运行。令牌完整验签后还会再次核对活动来源和 Secret 摘要，因此切换来源、进入 fault/local、停用来源或原子轮换 Secret/CA 不会继续接受旧信任。启动时若数据库已处于 SSO 而活动 Secret、CA、DNS/TLS 或 discovery 不可用，API 拒绝启动；`local|configuring|fault` 保持可启动以便运维恢复。
+
+`XMINDS_RELEASE_OIDC_ISSUER` 与 `XMINDS_RELEASE_OIDC_AUDIENCE` 仅配置独立的工作负载 OIDC 发行者，不用于人员认证。人员 OIDC 只来自上述 IAM 来源 Secret；两者不会在验签失败时互相回退。
+
+SCIM 来源 Secret 只引用另一个 Bearer 文件，禁止将 Token 直接写入来源 JSON：
+
+```json
+{
+  "base_url": "https://id.example.invalid/scim/v2",
+  "bearer_token_reference": "secret://iam/scim-bearer",
+  "ca_reference": "secret://iam/corporate-ca",
+  "page_size": 100
+}
+```
+
+`POST .../verify` 使用必填来源版本验证真实 OIDC discovery/JWKS 或 SCIM ServiceProviderConfig/ResourceTypes。SCIM 必须声明支持分页，ResourceTypes 会按严格 ListResponse 不变量有界收齐；Users/Groups 每个资源必须包含对应 core schema，后续页 `totalResults` 与首页不一致时立即 fail closed。`POST .../sync-preview` 和 `POST .../sync` 返回 `202 Accepted` 及作业 `Location`，作业通过现有 Outbox 由 `release-worker` 执行。只有 SCIM 来源支持 apply；OIDC 来源只支持连接验证和空快照预览。Worker 持久化每页游标，最终页才会在来源 ID 与本次 run marker 边界内停用缺失对象；缺失的目录成员边仅软移除 `source_owned=true` 代次，平台补充边保留，后续快照恢复时按版本重激活目录边。重复稳定标识、邮箱/规范用户名冲突、组织循环或缺失/冲突父组织会生成可分页查询的冲突记录，相关对象保留最后安全状态，不会自动猜测、覆盖本地字段或删除角色绑定。每个实际 apply batch 的业务变更、进度、会话撤销和无 PII/Secret 不可变审计在同一事务中提交；审计不可用时整批回滚并可恢复重试。冲突分页游标由独立 Secret-backed AES-256-GCM 密钥加密认证，并将路由、来源、schema 版本、filter 和页大小直接纳入 AEAD 附加认证数据，同时绑定有效期，禁止篡改或跨上下文重放。密钥 Secret 必须保存 32 字节随机值的无填充 base64url 文本（固定 43 字符），禁止保存随机原始字节；轮换时原子替换 Secret 并重启 API，旧游标立即 fail closed，客户端按默认 15 分钟短有效期契约从首页重新分页。
+
+目录请求总超时可在 1–30 秒范围内调整，该预算从操作入口开始，覆盖 Secret 读取、DNS、全部分页和 HTTP；单次拨号、TLS 与请求仍受更短上限约束。总页数上限为 10000，用户、组织、成员和层级关系总数上限为 100000。出站连接在解析后固定 IPv4/IPv6 地址并在拨号层校验目标 host，默认仅允许可公开路由地址，拒绝 loopback、link-local/metadata、CGNAT、文档/基准测试网段、unspecified、multicast 和其他特殊用途地址。拒绝表依据 IANA IPv4/IPv6 Special-Purpose Address Registry 的 2025-10-09 快照审核，并采用更保守的安全策略：`2001::/23` 整段均被拒绝，包括 IANA 标记为 globally reachable 的更具体例外，因此该策略不等同于 IANA `Globally Reachable` 属性。只有 `development`/`test` 可通过兼容变量 `XMINDS_RELEASE_IAM_DIRECTORY_ALLOW_LOOPBACK_HTTP=true` 显式允许 loopback HTTP/HTTPS；企业 RFC1918/ULA 私网必须经审核后通过 `XMINDS_RELEASE_IAM_DIRECTORY_ALLOWED_PRIVATE_CIDRS` 仅列出规范化、无主机位且确需访问的 CIDR，例如 `10.42.7.0/24,fd12:3456:789a::/48`。每个获准网段中的任一地址都可能接收目录 Bearer，因此必须遵循最小网段并纳入配置变更审计；即便配置私网 allowlist，仍强制 TLS 1.2+、正确 ServerName、DNS 固定与受控 CA，且不能放行 metadata、CGNAT、link-local 等特殊用途地址。具体变量与默认值见 [`.env.example`](.env.example)。
+
+迁移文件一经发布不得改写。`*.pre.sql` companion 仅用于让历史数据满足对应不可变迁移的前置条件：迁移框架在同一 PostgreSQL 事务中执行 companion 与目标 migration，并分别记录稳定名称和 SHA-256；目标失败时 companion 变更与两条记录全部回滚。已经记录目标 migration 的数据库不会补跑该 companion，后续修正必须使用新的顺序迁移。回滚目录同步迁移前必须停止 API/Worker 并由单一迁移领导者执行；`000015` down 会在同一事务中将仍含 v15 self-cycle staging 的非终态作业及其 active Outbox 收敛为带稳定回滚错误码的 `failed`/`dead_letter`，清理仅属 staging 的自循环关系后再恢复 v14 约束。原有 completed/dead-letter 终态与既有 failed 证据保持不变，迁移 ledger 与稳定错误码用于运维核查和重新发起同步。回滚 `000016` 同样必须先停止 API/Worker；down 会先将所有 v16 活动重认证 proof 原子置为 `expired`，再移除旧版运行时无法强制的内部用户/来源绑定列。
+
+默认 Public API 监听 `127.0.0.1:8081`，只提供：
+
+- `GET /metadata/{role}.json`：部署配置指定的默认产品与通道兼容路径；
+- `GET /v1/products/{product}/channels/{channel}/metadata/{role}.json`：产品范围可信目录；
+- `GET /v1/products/{product}/artifacts/{sha256}`：内容寻址制品下载与单段 Range 请求。
+
+Public API 仍需只读对象存储凭据，并要求显式配置 `XMINDS_RELEASE_DEFAULT_PRODUCT_ID` 与 `XMINDS_RELEASE_DEFAULT_CHANNEL`；缺少任一项时服务拒绝启动。
+
+Worker 依赖预先执行的数据库迁移、可用的 S3/MinIO 桶、经签名的 `root.json`、四类在线角色加密私钥和 32 字节主密钥文件。SCM Provider 凭据使用独立主密钥目录与当前 key ID，历史 key 仅用于轮换期解密，不能复用于目录签名。完整变量见 [`.env.example`](.env.example)，root 与在线密钥边界见[密钥仪式规范](docs/security/key-ceremony.md)。
+
+## PostgreSQL 集成测试
+
+集成测试只接受数据库名包含 `test` 的连接串，避免误清理非测试数据库：
+
+```bash
+export XMINDS_RELEASE_TEST_DATABASE_URL='postgres://xminds_release_test:xminds_release_test@127.0.0.1:55432/xminds_release_test?sslmode=disable'
+make test-integration
+```
+
+制品端到端集成测试还需要一个隔离的 MinIO 测试桶：
+
+```bash
+export XMINDS_RELEASE_TEST_MINIO_URL='http://127.0.0.1:59000'
+export XMINDS_RELEASE_TEST_MINIO_ACCESS_KEY='仅用于测试的访问密钥'
+export XMINDS_RELEASE_TEST_MINIO_SECRET_KEY='仅用于测试的秘密密钥'
+export XMINDS_RELEASE_TEST_MINIO_BUCKET='xminds-release-test'
+make test-integration
+```
+
+集成测试产生的已校验内容寻址对象保持不可变；测试应使用专用桶，并按环境生命周期整体回收测试桶。
+
+## 安全原则
+
+- 安全默认、最小权限和职责分离；
+- root 私钥不得进入在线服务、数据库、镜像或源码；
+- 禁止全局跳过 TLS 验证；
+- Token、Cookie、Authorization、License Key、密码和私钥不得进入普通日志；
+- 所有状态修改必须认证、授权并生成不可变审计证据。
+
+## 许可证
+
+本项目按照仓库中的 [LICENSE](LICENSE) 授权。

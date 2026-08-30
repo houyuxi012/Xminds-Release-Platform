@@ -1,0 +1,13 @@
+{
+  "schema_version": "xminds-product-manifest/v1",
+  "product_id": "ngep",
+  "display_name": "NGeP",
+  "artifact_types": ["container", "desktop"],
+  "version_scheme": "semver",
+  "compatibility_keys": ["os", "arch"],
+  "catalog_format": "xminds-tuf-v1",
+  "default_channels": [
+    {"name": "stable", "display_name": "Stable"},
+    {"name": "beta", "display_name": "Beta"}
+  ]
+}

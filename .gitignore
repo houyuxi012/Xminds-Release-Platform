@@ -1,0 +1,46 @@
+# Build output
+/bin/
+/dist/
+/artifacts/
+/coverage/
+*.cover
+*.out
+
+# Local caches and temporary files
+/.cache/
+/.tmp/
+/.worktrees/
+/docs/superpowers/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+/secrets/
+*.key
+*.pem
+*.p12
+
+# Go and frontend dependencies
+/vendor/
+node_modules/
+apps/release-console/dist/
+apps/release-console/playwright-report/
+apps/release-console/test-results/
+apps/release-console/.vitest-attachments/
+apps/release-console/*.tsbuildinfo
+apps/release-console/src/test/__screenshots__/
+
+# Editors
+.idea/
+.vscode/
+*.swp
+
+# macOS metadata pollution
+.DS_Store
+._*
+__MACOSX/
+.AppleDouble/
+AppleDouble/
+FinderInfo
+ResourceFork
