@@ -255,7 +255,7 @@ git commit -m "Add shared breach corpus parser"
 - Consumes: `BuildRequest`、`[]Input`、绝对输出根、`Generator` 和 UTC 时钟。
 - Produces: `Build(context.Context, BuildRequest, []Input, string, Generator, func() time.Time) (Result, error)`，发布目录内包含 `corpus.txt` 与 `manifest.json`。
 
-- [ ] **Step 1: 写稳定输出和跨输入去重失败测试**
+- [x] **Step 1: 写稳定输出和跨输入去重失败测试**
 
 ```go
 func TestBuildIsStableAcrossInputOrderAndDeduplicates(t *testing.T) {
@@ -269,7 +269,7 @@ func TestBuildIsStableAcrossInputOrderAndDeduplicates(t *testing.T) {
 
 另建独立测试验证输入摘要不一致、非普通文件、符号链接、总量超限、输出超限、目标已存在和失败后无正式发布目录。
 
-- [ ] **Step 2: 运行构建测试确认 RED**
+- [x] **Step 2: 运行构建测试确认 RED**
 
 Run:
 
@@ -279,7 +279,7 @@ go test ./internal/breachcorpus -run TestBuild -count=1
 
 Expected: FAIL，因为 `Build` 尚不存在。
 
-- [ ] **Step 3: 实现有界 run 与多路归并**
+- [x] **Step 3: 实现有界 run 与多路归并**
 
 固定接口：
 
@@ -310,7 +310,7 @@ func Build(
 
 实现要求：在输出根内创建 `0700` 隐藏临时目录；临时 run 文件为 `0600`；每个 run 在固定内存预算内排序去重；用 `container/heap` 执行稳定多路归并；写入时流式计算输出摘要和容量；正常失败清理临时目录。
 
-- [ ] **Step 4: 实现清单与原子目录发布**
+- [x] **Step 4: 实现清单与原子目录发布**
 
 清单使用无 map 的结构体并按来源 ID 排序：
 
@@ -328,7 +328,7 @@ type Manifest struct {
 
 同步两个文件和临时目录，设置只读权限，将临时目录重命名为 `breach-corpus-sha256-<digest>`，同步输出根并拒绝覆盖。
 
-- [ ] **Step 5: 运行构建测试确认 GREEN**
+- [x] **Step 5: 运行构建测试确认 GREEN**
 
 Run:
 
