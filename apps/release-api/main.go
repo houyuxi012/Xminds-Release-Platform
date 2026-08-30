@@ -375,6 +375,7 @@ func run(ctx context.Context, arguments []string, environ map[string]string) err
 					Transactor:  audit.PoolTransactor{Pool: pool},
 				},
 				IAM:              iamService,
+				LocalAuth:        localAuthenticator,
 				Reauthentication: reauthenticationService,
 				LogCenter:        logCenterHandler,
 				LogExports:       logExportHandler,
@@ -454,6 +455,7 @@ type managementApplications struct {
 	Endpoints        endpoint.EndpointApplication
 	Audits           auditManagementApplication
 	IAM              iam.IAMApplication
+	LocalAuth        iam.CurrentSessionLogoutApplication
 	Reauthentication iam.ReauthenticationApplication
 	LogCenter        *logcenter.LogHTTPHandler
 	LogExports       *logcenter.ExportHTTPHandler
@@ -483,6 +485,9 @@ func managementRoutes(applications managementApplications) httpserver.RouteRegis
 		}
 		if applications.IAM != nil {
 			iam.RegisterRoutes(router, applications.IAM)
+		}
+		if applications.LocalAuth != nil {
+			iam.RegisterCurrentSessionLogoutRoute(router, applications.LocalAuth)
 		}
 		if applications.Reauthentication != nil {
 			iam.RegisterReauthenticationRoutes(router, applications.Reauthentication)

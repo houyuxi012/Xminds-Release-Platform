@@ -17,10 +17,10 @@ export function ReleaseDetailPage() {
   const [status, setStatus] = useState<ReleaseStatus>(release.status);
   const canApprove =
     hasAnyRole('admin', 'approver') &&
-    principal.id !== release.submittedBy &&
+    principal?.id !== release.submittedBy &&
     status === 'submitted';
-  const canPublish = hasAnyRole('admin', 'approver') && status === 'approved';
-  const separationBlocked = principal.id === release.submittedBy && status === 'submitted';
+  const canPublish = hasAnyRole('admin', 'publisher') && status === 'approved';
+  const separationBlocked = principal?.id === release.submittedBy && status === 'submitted';
 
   const approve = () => {
     modal.confirm({

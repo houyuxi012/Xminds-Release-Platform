@@ -1,4 +1,4 @@
-export type PlatformRole = 'admin' | 'publisher' | 'approver' | 'auditor';
+export type PlatformRole = 'admin' | 'publisher' | 'approver' | 'auditor' | 'viewer';
 
 export interface Principal {
   id: string;
@@ -16,15 +16,97 @@ export interface ProblemDetails {
   request_id?: string;
 }
 
+export type LoginMode = 'local' | 'configuring' | 'sso' | 'fault';
+
+export interface PublicLoginState {
+  mode: LoginMode;
+}
+
+export interface LocalLoginInput {
+  username: string;
+  password: string;
+  mfaProof?: string;
+  recoveryCode?: string;
+}
+
+export interface LocalAuthenticatedSubject {
+  id: string;
+  username: string;
+  displayName: string;
+  kind: 'local' | 'emergency';
+}
+
+export interface LocalLoginResult {
+  accessToken: string;
+  tokenType: 'Bearer';
+  expiresAt: string;
+  subject: LocalAuthenticatedSubject;
+}
+
+export interface CurrentSessionRoleScope {
+  role: PlatformRole;
+  effect: 'allow' | 'deny';
+  scopeType: 'platform' | 'product' | 'product_channel';
+  productId?: string;
+  channelName?: string;
+}
+
+export interface CurrentSession {
+  subject: string;
+  kind: 'human' | 'local' | 'workload';
+  governedUserId?: string;
+  roles: PlatformRole[];
+  productIds: string[];
+  roleScopes: CurrentSessionRoleScope[];
+  authenticationAssurance: number;
+}
+
 export interface Product {
   id: string;
-  name: string;
-  description: string;
+  displayName: string;
+  schemaVersion: string;
+  artifactTypes: string[];
+  versionScheme: string;
+  compatibilityKeys: string[];
+  catalogFormat: string;
+  manifest: ProductManifestV1;
   defaultChannel: string;
-  channels: string[];
+  channels: ProductChannel[];
   status: 'active' | 'inactive';
   manifestDigest: string;
+  createdBy: string;
+  createdAt: string;
   updatedAt: string;
+  deactivatedAt?: string;
+}
+
+export interface ProductManifestV1 {
+  schema_version: 'xminds-product-manifest/v1';
+  product_id: string;
+  display_name: string;
+  artifact_types: string[];
+  version_scheme: 'semver';
+  compatibility_keys: string[];
+  catalog_format: 'xminds-tuf-v1';
+  default_channels: ProductChannelManifest[];
+}
+
+export interface ProductChannelManifest {
+  name: string;
+  display_name: string;
+}
+
+export interface ProductChannel {
+  productId: string;
+  name: string;
+  displayName: string;
+  position: number;
+  createdAt: string;
+}
+
+export interface ProductPage {
+  items: Product[];
+  nextCursor?: string;
 }
 
 export interface Artifact {

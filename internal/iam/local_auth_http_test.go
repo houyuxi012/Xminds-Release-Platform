@@ -44,6 +44,23 @@ func TestPublicLocalAuthenticationHTTPContractReturnsOnlyOpaqueSession(t *testin
 	}
 }
 
+func TestPublicLoginStateHTTPContractExposesOnlySafeMode(t *testing.T) {
+	t.Parallel()
+	harness := newActiveLocalAuthHarness(t, UserKindLocal, false, LoginModeLocal)
+	handler := localAuthManagementHandler(harness.service)
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/auth/login-state", nil)
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK || response.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("response = %d headers=%v body=%s", response.Code, response.Header(), response.Body)
+	}
+	if strings.TrimSpace(response.Body.String()) != `{"mode":"local"}` {
+		t.Fatalf("login state exposed an unstable or sensitive contract: %s", response.Body)
+	}
+}
+
 func TestPublicActivationHTTPContractConsumesTokenAndReturnsNoRecoveryCodesWithoutMFA(t *testing.T) {
 	t.Parallel()
 	harness := newLocalAuthHarness(t, UserKindLocal, false)

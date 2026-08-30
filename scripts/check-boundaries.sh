@@ -22,8 +22,13 @@ fi
 cd "$scan_root"
 
 find . \
-    -path './.git' -prune -o \
-    -path './node_modules' -prune -o \
+    -type d \( \
+        -name '.git' -o \
+        -name 'node_modules' -o \
+        -name 'dist' -o \
+        -name '.cache' -o \
+        -name 'coverage' \
+    \) -prune -o \
     -type f \( -name '*.go' -o -name '*.ts' -o -name '*.tsx' \) \
     -exec awk '
         function check_import_line(line) {

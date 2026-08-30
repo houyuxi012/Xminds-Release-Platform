@@ -79,6 +79,22 @@ func TestHTTPHandlerMapsProductErrorsToProblemDetails(t *testing.T) {
 	}
 }
 
+func TestHTTPHandlerSerializesEmptyProductPageItemsAsArray(t *testing.T) {
+	t.Parallel()
+
+	application := &stubProductApplication{listPage: ProductPage{}}
+	handler := authenticatedProductHandler(application, adminPrincipal("ngep"))
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/products", nil)
+	request.Header.Set("Authorization", "Bearer test-token")
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK || response.Body.String() != "{\"items\":[]}\n" {
+		t.Fatalf("response=%d body=%s", response.Code, response.Body)
+	}
+}
+
 func authenticatedProductHandler(application ProductApplication, principal identity.Principal) http.Handler {
 	verifier := staticProductVerifier{principal: principal}
 	return identity.AuthenticationMiddleware(verifier)(NewHTTPHandler(application))
@@ -96,6 +112,8 @@ type stubProductApplication struct {
 	registerProduct Product
 	registerError   error
 	registerRequest RequestContext
+	listPage        ProductPage
+	listError       error
 }
 
 func (application *stubProductApplication) Register(_ context.Context, _ identity.Principal, _ []byte, request RequestContext) (Product, error) {
@@ -107,8 +125,8 @@ func (*stubProductApplication) Get(context.Context, identity.Principal, string) 
 	return Product{}, errors.New("unexpected Get call")
 }
 
-func (*stubProductApplication) List(context.Context, identity.Principal, Page) (ProductPage, error) {
-	return ProductPage{}, errors.New("unexpected List call")
+func (application *stubProductApplication) List(context.Context, identity.Principal, Page) (ProductPage, error) {
+	return application.listPage, application.listError
 }
 
 func (*stubProductApplication) Deactivate(context.Context, identity.Principal, string, RequestContext) (Product, error) {

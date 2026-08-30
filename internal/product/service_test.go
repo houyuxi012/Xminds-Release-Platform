@@ -110,6 +110,36 @@ func TestListAndGetEnforceProductScope(t *testing.T) {
 	}
 }
 
+func TestGovernedPlatformAdministratorListsAllProductsExceptExplicitDenies(t *testing.T) {
+	t.Parallel()
+
+	repository := newMemoryRepository()
+	service := NewService(repository, passThroughTransactor{}, &recordingAuditAppender{})
+	registrar := adminPrincipal()
+	request := RequestContext{RequestID: "019c1547-e880-7831-949c-7302a34724c7"}
+	for _, fixture := range []string{"testdata/valid-ngep.json", "testdata/valid-second-product.json"} {
+		if _, err := service.Register(context.Background(), registrar, mustReadFixture(t, fixture), request); err != nil {
+			t.Fatalf("Register(%q) error = %v", fixture, err)
+		}
+	}
+
+	principal := identity.Principal{
+		Subject: "governed-admin", Kind: identity.PrincipalKindLocal, Governed: true,
+		AuthenticationAssurance: 1,
+		RoleScopes: []identity.RoleScope{
+			{Role: identity.RoleAdmin, Effect: "allow", ScopeType: "platform"},
+			{Role: identity.RoleViewer, Effect: "deny", ScopeType: "product", ProductID: "xminds-desktop"},
+		},
+	}
+	page, err := service.List(context.Background(), principal, Page{Limit: 20})
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(page.Items) != 1 || page.Items[0].ID != "ngep" {
+		t.Fatalf("governed products = %#v, want only ngep", page.Items)
+	}
+}
+
 func TestDeactivateWritesAuditAndPreservesProduct(t *testing.T) {
 	t.Parallel()
 
@@ -183,16 +213,24 @@ func (repository *memoryRepository) Get(_ context.Context, productID string) (Pr
 	return product, nil
 }
 
-func (repository *memoryRepository) List(_ context.Context, productIDs []string, page Page) (ProductPage, error) {
-	allowed := make(map[string]struct{}, len(productIDs))
-	for _, productID := range productIDs {
+func (repository *memoryRepository) List(_ context.Context, scope ProductListScope, page Page) (ProductPage, error) {
+	allowed := make(map[string]struct{}, len(scope.IncludedProductIDs))
+	for _, productID := range scope.IncludedProductIDs {
 		allowed[productID] = struct{}{}
+	}
+	excluded := make(map[string]struct{}, len(scope.ExcludedProductIDs))
+	for _, productID := range scope.ExcludedProductIDs {
+		excluded[productID] = struct{}{}
 	}
 	items := make([]Product, 0, len(repository.products))
 	for productID, product := range repository.products {
-		if _, ok := allowed[productID]; ok {
-			items = append(items, product)
+		if _, denied := excluded[productID]; denied {
+			continue
 		}
+		if _, ok := allowed[productID]; !scope.AllProducts && !ok {
+			continue
+		}
+		items = append(items, product)
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].ID < items[j].ID })
 	if page.Limit > 0 && len(items) > page.Limit {

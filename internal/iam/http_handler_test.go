@@ -758,6 +758,64 @@ func authenticatedIAMHandler(application IAMApplication) http.Handler {
 	return identity.AuthenticationMiddleware(verifier)(NewHTTPHandler(application))
 }
 
+func TestCurrentSessionHTTPReturnsGovernedAuthorizationWithoutTokenMaterial(t *testing.T) {
+	t.Parallel()
+	verifier := iamStaticVerifier{principal: identity.Principal{
+		Subject: "release.operator", Kind: identity.PrincipalKindLocal,
+		Governed: true, GovernedUserID: "018f835d-7e4b-7abc-9f42-67a2f5f48e13",
+		AuthenticationAssurance: 1, TokenID: "must-not-leak",
+		RoleScopes: []identity.RoleScope{
+			{Role: identity.RoleAdmin, Effect: "allow", ScopeType: "platform"},
+			{Role: identity.RolePublisher, Effect: "allow", ScopeType: "product", ProductID: "ngep"},
+			{Role: identity.RoleViewer, Effect: "allow", ScopeType: "channel", ProductID: "ngep", ChannelName: "stable"},
+		},
+	}}
+	handler := identity.AuthenticationMiddleware(verifier)(NewHTTPHandler(&stubIAMApplication{}))
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/auth/session", nil)
+	request.Header.Set("Authorization", "Bearer opaque-session")
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK || response.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("response=%d headers=%v body=%s", response.Code, response.Header(), response.Body)
+	}
+	body := response.Body.String()
+	for _, required := range []string{`"subject":"release.operator"`, `"kind":"local"`, `"roles":["admin","publisher","viewer"]`, `"product_id":"ngep"`, `"scope_type":"product_channel"`} {
+		if !strings.Contains(body, required) {
+			t.Fatalf("current session response is missing %s: %s", required, body)
+		}
+	}
+	for _, forbidden := range []string{"must-not-leak", "token_id", "access_token", `"scope_type":"channel"`} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("current session response exposed %q: %s", forbidden, body)
+		}
+	}
+}
+
+func TestCurrentSessionHTTPSerializesEmptyAuthorizationCollectionsAsArrays(t *testing.T) {
+	t.Parallel()
+	verifier := iamStaticVerifier{principal: identity.Principal{
+		Subject: "release.viewer", Kind: identity.PrincipalKindLocal,
+		Governed: true, GovernedUserID: "018f835d-7e4b-7abc-9f42-67a2f5f48e14",
+	}}
+	handler := identity.AuthenticationMiddleware(verifier)(NewHTTPHandler(&stubIAMApplication{}))
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/auth/session", nil)
+	request.Header.Set("Authorization", "Bearer opaque-session")
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("response=%d body=%s", response.Code, response.Body)
+	}
+	for _, required := range []string{`"roles":[]`, `"product_ids":[]`, `"role_scopes":[]`} {
+		if !strings.Contains(response.Body.String(), required) {
+			t.Fatalf("current session empty collection must be an array (%s): %s", required, response.Body)
+		}
+	}
+}
+
 type iamStaticVerifier struct{ principal identity.Principal }
 
 func (verifier iamStaticVerifier) Verify(context.Context, string) (identity.Principal, error) {

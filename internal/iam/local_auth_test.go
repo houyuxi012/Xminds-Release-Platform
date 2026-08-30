@@ -189,6 +189,32 @@ func TestLocalLoginModeMatrixAndEmergencyEntryIsolation(t *testing.T) {
 	}
 }
 
+func TestLogoutCurrentSessionRevokesOnlyAuthenticatedLocalSession(t *testing.T) {
+	t.Parallel()
+	harness := newActiveLocalAuthHarness(t, UserKindLocal, false, LoginModeLocal)
+	result, err := harness.service.LoginLocal(context.Background(), LocalLoginCommand{
+		Username: "release.operator", Password: "Current-Strong-Password!",
+	}, harness.request)
+	if err != nil {
+		t.Fatalf("LoginLocal() error = %v", err)
+	}
+	var sessionID uuid.UUID
+	for id := range harness.repository.sessions {
+		sessionID = id
+	}
+	principal := identity.Principal{
+		Subject: result.Subject.Username, Kind: identity.PrincipalKindLocal,
+		TokenID: sessionID.String(), GovernedUserID: result.Subject.ID.String(),
+	}
+
+	if err := harness.service.LogoutCurrentSession(context.Background(), principal, harness.request); err != nil {
+		t.Fatalf("LogoutCurrentSession() error = %v", err)
+	}
+	if harness.repository.sessions[sessionID].RevokedAt.IsZero() || harness.repository.sessions[sessionID].RevocationReason != "user logout" {
+		t.Fatalf("session was not revoked: %+v", harness.repository.sessions[sessionID])
+	}
+}
+
 func TestLocalLoginReturnsOpaquePersistedSessionWithBoundedLifetime(t *testing.T) {
 	t.Parallel()
 	harness := newActiveLocalAuthHarness(t, UserKindLocal, false, LoginModeLocal)
@@ -1076,6 +1102,20 @@ type memoryLocalAuthRepository struct {
 	failActivationAfterUserUpdate bool
 	findActivationError           error
 	findLoginError                error
+}
+
+func (repository *memoryLocalAuthRepository) GetLoginState(context.Context, pgx.Tx) (LoginState, error) {
+	return repository.login, repository.findLoginError
+}
+
+func (repository *memoryLocalAuthRepository) RevokeCurrentSession(_ context.Context, _ pgx.Tx, sessionID uuid.UUID, revokedAt time.Time, reason string) error {
+	session, found := repository.sessions[sessionID]
+	if !found || !session.RevokedAt.IsZero() {
+		return ErrLocalAuthenticationFailed
+	}
+	session.RevokedAt, session.RevocationReason, session.Version = revokedAt, reason, session.Version+1
+	repository.sessions[sessionID] = session
+	return nil
 }
 
 type memoryRateWindow struct {

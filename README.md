@@ -111,7 +111,29 @@ npx playwright install chromium
 npm run dev
 ```
 
-默认开发地址为 `http://127.0.0.1:4173`。开发环境提供确定性的演示数据用于交互验收；产品创建在生产构建中调用 `/api/v1/products`，后端仍是身份、授权、状态机和审计证据的唯一权威来源。当前 Console 交付 P0 核心可信发布管理流程，统一日志中心已接入管理 API 与 Console；用户/组织后端提供受控组织详情、子节点和成员关系接口，不在前端复制服务端安全策略。
+默认开发地址为 `http://127.0.0.1:4173`。登录状态、本地/应急登录、当前会话、退出以及产品列表、详情和创建始终调用真实管理 API；开发代理默认指向 `http://127.0.0.1:8080`，可通过 `XMINDS_RELEASE_CONSOLE_API_PROXY_TARGET` 显式覆盖。制品、Release、SCM、端点和部分日志页面仍使用确定性演示数据，仅用于后续真实 API 接入前的交互验收，不得作为生产后端验收证据。后端始终是身份、授权、状态机和审计证据的唯一权威来源。
+
+真实认证与产品 API 浏览器验收必须显式指定 loopback API origin 和仓库外 `0600` 凭据文件。凭据父目录必须仅当前用户可访问，文件必须为当前用户所有的普通非链接文件；配置缺失或不满足边界时测试会拒绝启动。生成 fixture 时也必须显式声明仓库根目录，以防凭据误入工作树：
+
+```bash
+mkdir -m 700 /absolute/private/runtime-e2e
+XMINDS_RELEASE_RUNTIME_FIXTURE_PASSWORD='<one-time-test-password>' \
+go run ./tests/support/runtime-admin-fixture \
+  --database-url 'postgres://.../xminds_release_runtime_test?sslmode=disable' \
+  --api-url 'http://127.0.0.1:18080' \
+  --repository-root "$PWD" \
+  --output '/absolute/private/runtime-e2e/runtime-credentials.json'
+```
+
+凭据生成后再执行：
+
+```bash
+XMINDS_RELEASE_CONSOLE_API_PROXY_TARGET='http://127.0.0.1:18080' \
+XMINDS_RELEASE_REAL_E2E_CREDENTIALS_FILE='/absolute/private/runtime-credentials.json' \
+npm run e2e:real
+```
+
+该流程会先检查目标 API readiness，再通过正式 MFA 登录创建并重新读取一个隔离测试产品，最后调用服务端退出；禁止在该测试中注册网络拦截。
 
 ## 本地启动
 

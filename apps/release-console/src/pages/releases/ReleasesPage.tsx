@@ -102,7 +102,7 @@ export function ReleasesPage() {
         version: values.version || '1.2.4',
         channel: values.channel || 'stable',
         status: 'submitted',
-        submittedBy: principal.id,
+        submittedBy: principal?.id ?? '',
         updatedAt: '刚刚',
         notes: values.notes || 'Release Notes 待补充',
         artifacts: [values.artifact || 'ngep-desktop-1.2.4-arm64.dmg'],

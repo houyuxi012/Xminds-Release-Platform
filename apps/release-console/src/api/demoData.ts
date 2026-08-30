@@ -3,33 +3,9 @@ import type {
   AuditEvent,
   DistributionEndpoint,
   LogCenterEvent,
-  Product,
   ReleaseRecord,
   ScmConnection,
 } from './types';
-
-export const products: Product[] = [
-  {
-    id: 'ngep',
-    name: 'Next-Gen Enterprise Portal',
-    description: '企业门户桌面端与服务端可信发布',
-    defaultChannel: 'stable',
-    channels: ['stable', 'preview'],
-    status: 'active',
-    manifestDigest: 'sha256:8b9c…7a12',
-    updatedAt: '2026-08-20 13:42',
-  },
-  {
-    id: 'xminds-agent',
-    name: 'Xminds Agent',
-    description: '终端更新代理与诊断工具',
-    defaultChannel: 'stable',
-    channels: ['stable', 'beta'],
-    status: 'active',
-    manifestDigest: 'sha256:2f19…c083',
-    updatedAt: '2026-08-20 11:18',
-  },
-];
 
 export const artifacts: Artifact[] = [
   {
