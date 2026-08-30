@@ -27,6 +27,28 @@ func TestVerifyReleaseAcceptsBuiltArtifactAndReturnsMembershipSet(t *testing.T) 
 	}
 }
 
+func TestVerifyReleaseAcceptsSourceWhoseFinalDigestHasNoNewline(t *testing.T) {
+	t.Parallel()
+
+	outputRoot := privateDirectory(t)
+	source := writeSource(t, "no-final-newline.txt", testSHA1Digest)
+	request := buildRequestForSources(t, sourceDefinition{id: "source-a", path: source, version: "2026-08", license: "LEGAL-1"})
+	result, err := Build(
+		context.Background(),
+		request,
+		[]Input{{SourceID: "source-a", Path: source}},
+		outputRoot,
+		Generator{Name: "xminds-breach-corpus", Version: "0.1.0-p0", Commit: "0123456789ab"},
+		func() time.Time { return fixedBuildTime },
+	)
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	if _, err := VerifyRelease(result.ReleaseDirectory, VerifyOptions{Mode: ArtifactMode}); err != nil {
+		t.Fatalf("VerifyRelease() error = %v", err)
+	}
+}
+
 func TestVerifyReleaseRejectsTamperedManifestCorpusAndDirectoryName(t *testing.T) {
 	t.Parallel()
 

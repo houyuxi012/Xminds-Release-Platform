@@ -236,7 +236,7 @@ func validManifest(manifest Manifest, expectedDigest string) bool {
 	if totalInputBytes <= 0 {
 		return false
 	}
-	maximumPossibleEntries := uint64(totalInputBytes / 41)
+	maximumPossibleEntries := uint64((totalInputBytes + 1) / 41)
 	return manifest.Corpus.UniqueEntries <= maximumPossibleEntries &&
 		manifest.Corpus.DuplicateEntries <= maximumPossibleEntries-manifest.Corpus.UniqueEntries
 }
