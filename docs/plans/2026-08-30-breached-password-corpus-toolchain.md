@@ -450,7 +450,7 @@ git commit -m "Verify breach corpus release boundaries"
 - Consumes: `build`、`verify` 子命令和 `internal/breachcorpus` 公共 API。
 - Produces: `run([]string, io.Writer, io.Writer, func() time.Time) int`、稳定退出码和 `bin/breach-corpus`。
 
-- [ ] **Step 1: 写参数、退出码和非敏感输出失败测试**
+- [x] **Step 1: 写参数、退出码和非敏感输出失败测试**
 
 ```go
 func TestRunRejectsPlaintextShapedInputAndDoesNotEchoContent(t *testing.T) {
@@ -467,7 +467,7 @@ func TestRunRejectsPlaintextShapedInputAndDoesNotEchoContent(t *testing.T) {
 
 分别测试：缺少子命令返回 `2`；格式/摘要/权限失败返回 `1`；成功只输出规范化 JSON 摘要；deployment 模式缺少 UID/GID 返回 `2`。
 
-- [ ] **Step 2: 运行 CLI 测试确认 RED**
+- [x] **Step 2: 运行 CLI 测试确认 RED**
 
 Run:
 
@@ -477,7 +477,7 @@ go test ./scripts/breach-corpus -count=1
 
 Expected: FAIL，因为 CLI 尚不存在。
 
-- [ ] **Step 3: 实现最小 CLI 适配**
+- [x] **Step 3: 实现最小 CLI 适配**
 
 ```go
 func main() {
@@ -489,7 +489,7 @@ func run(arguments []string, stdout, stderr io.Writer, clock func() time.Time) i
 
 `build` 使用可重复 `--input source-id=/absolute/path`；`verify` 支持 `--mode artifact|deployment`；标准输出编码 `Result`，标准错误只输出稳定中文错误类别。
 
-- [ ] **Step 4: 将工具纳入构建和格式检查**
+- [x] **Step 4: 将工具纳入构建和格式检查**
 
 修改：
 
@@ -503,7 +503,7 @@ GO_FILES := $(shell find apps internal scripts tests -type f -name '*.go' 2>/dev
 GOCACHE="$(GOCACHE)" $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o bin/breach-corpus ./scripts/breach-corpus
 ```
 
-- [ ] **Step 5: 运行 CLI 与构建验证确认 GREEN**
+- [x] **Step 5: 运行 CLI 与构建验证确认 GREEN**
 
 Run:
 

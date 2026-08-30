@@ -13,7 +13,7 @@ LDFLAGS := -s -w \
 	-X '$(BUILDINFO_PACKAGE).version=$(VERSION)' \
 	-X '$(BUILDINFO_PACKAGE).commit=$(COMMIT)' \
 	-X '$(BUILDINFO_PACKAGE).buildTime=$(BUILD_TIME)'
-GO_FILES := $(shell find apps internal tests -type f -name '*.go' 2>/dev/null)
+GO_FILES := $(shell find apps internal scripts tests -type f -name '*.go' 2>/dev/null)
 
 .PHONY: fmt fmt-check lint golangci test test-integration build boundary-check metadata-check console-install console-lint console-typecheck console-test console-build console-e2e console-verify verify clean
 
@@ -52,6 +52,7 @@ build:
 	mkdir -p bin
 	GOCACHE="$(GOCACHE)" $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o bin/release-api ./apps/release-api
 	GOCACHE="$(GOCACHE)" $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o bin/release-worker ./apps/release-worker
+	GOCACHE="$(GOCACHE)" $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o bin/breach-corpus ./scripts/breach-corpus
 
 boundary-check:
 	./scripts/check-boundaries.sh

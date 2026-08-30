@@ -99,7 +99,7 @@ make console-e2e
 make verify
 ```
 
-`make verify` 会执行格式、Go Vet、竞态测试、双二进制构建、仓库边界检查、macOS 元数据污染检查，以及 Console 的静态检查、类型检查、真实浏览器组件测试和生产构建。`make console-e2e` 单独执行产品创建、制品续传、职责分离发布、SCM、端点和审计证据主流程。
+`make verify` 会执行格式、Go Vet、竞态测试、三个 Go 二进制构建、仓库边界检查、macOS 元数据污染检查，以及 Console 的静态检查、类型检查、真实浏览器组件测试和生产构建。`make console-e2e` 单独执行产品创建、制品续传、职责分离发布、SCM、端点和审计证据主流程。
 
 泄露口令摘要语料工具完成后由 `make build` 一并生成 `bin/breach-corpus`。生产语料只从已审批的摘要制品离线构建：
 

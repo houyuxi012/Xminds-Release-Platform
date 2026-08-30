@@ -2,6 +2,8 @@ package breachcorpus
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -31,6 +33,38 @@ func TestReadBuildRequestAcceptsCompleteBoundedMetadata(t *testing.T) {
 		request.Sources[0].ExpectedSHA256 != "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" ||
 		request.Sources[0].LicenseReviewRef != "LEGAL-2026-001" {
 		t.Fatalf("source = %+v", request.Sources[0])
+	}
+}
+
+func TestReadBuildRequestFileAcceptsRegularFileAndRejectsRelativeOrLinkedPath(t *testing.T) {
+	t.Parallel()
+
+	const raw = `{
+		"schema_version": 1,
+		"corpus_version": "2026.08.30.1",
+		"sources": [{
+			"id": "source-a",
+			"version": "1",
+			"expected_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+			"license_review_ref": "LEGAL-1"
+		}]
+	}`
+	path := filepath.Join(t.TempDir(), "build-request.json")
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	request, err := ReadBuildRequestFile(path)
+	if err != nil || request.CorpusVersion != "2026.08.30.1" {
+		t.Fatalf("ReadBuildRequestFile(valid) = %+v, %v", request, err)
+	}
+	link := filepath.Join(t.TempDir(), "linked-request.json")
+	if err := os.Symlink(path, link); err != nil {
+		t.Fatal(err)
+	}
+	for name, invalid := range map[string]string{"relative": "build-request.json", "link": link} {
+		if _, err := ReadBuildRequestFile(invalid); !errors.Is(err, ErrInvalidRequest) {
+			t.Fatalf("ReadBuildRequestFile(%s) error = %v", name, err)
+		}
 	}
 }
 
