@@ -91,14 +91,12 @@ func (set *Set) ContainsPassword(password string) bool {
 	}
 	// These fast digests are standardized breach-corpus lookup keys, not stored
 	// credentials. Local credentials are independently salted and hashed with Argon2id.
-	// codeql[go/weak-sensitive-data-hashing]
-	sha1Digest := sha1.Sum([]byte(password))
+	sha1Digest := sha1.Sum([]byte(password)) // lgtm[go/weak-sensitive-data-hashing]
 	if _, found := set.sha1[strings.ToUpper(hex.EncodeToString(sha1Digest[:]))]; found {
 		return true
 	}
 	// SHA-256 is the alternate lookup-key format accepted by approved corpus sources.
-	// codeql[go/weak-sensitive-data-hashing]
-	sha256Digest := sha256.Sum256([]byte(password))
+	sha256Digest := sha256.Sum256([]byte(password)) // lgtm[go/weak-sensitive-data-hashing]
 	_, found := set.sha256[strings.ToUpper(hex.EncodeToString(sha256Digest[:]))]
 	return found
 }
