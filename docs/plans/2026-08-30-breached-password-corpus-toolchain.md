@@ -356,7 +356,7 @@ git commit -m "Build deterministic breach corpus releases"
 - Consumes: 绝对发布目录和 `VerifyOptions`。
 - Produces: `VerifyRelease(string, VerifyOptions) (*Release, error)`、`VerificationMode`、`OwnershipExpectation` 和稳定错误 `ErrInvalidRelease`。
 
-- [ ] **Step 1: 写篡改、权限和目录身份失败测试**
+- [x] **Step 1: 写篡改、权限和目录身份失败测试**
 
 ```go
 func TestVerifyReleaseRejectsTamperedManifestWritableFilesAndMismatchedDirectory(t *testing.T) {
@@ -380,7 +380,7 @@ func TestVerifyReleaseRejectsTamperedManifestWritableFilesAndMismatchedDirectory
 
 拆分测试覆盖：语料/清单符号链接、可写文件、父目录组/其他可写、目录摘要不一致、未知清单字段、错误计数、非规范化排序和部署 UID/GID 不一致。
 
-- [ ] **Step 2: 运行验证测试确认 RED**
+- [x] **Step 2: 运行验证测试确认 RED**
 
 Run:
 
@@ -390,7 +390,7 @@ go test ./internal/breachcorpus -run TestVerifyRelease -count=1
 
 Expected: FAIL，因为验证 API 尚不存在。
 
-- [ ] **Step 3: 实现安全打开和严格验证**
+- [x] **Step 3: 实现安全打开和严格验证**
 
 ```go
 type VerificationMode string
@@ -422,7 +422,7 @@ func VerifyRelease(releaseDirectory string, options VerifyOptions) (*Release, er
 
 `VerifyRelease` 对目录、`corpus.txt` 和 `manifest.json` 分别执行非跟随打开及身份复核；artifact 模式验证格式、摘要、计数、只读权限和不可写父目录；deployment 模式额外要求精确 UID/GID。运行时传入真实有效服务 UID，并拒绝服务 UID 拥有发布目录或文件。
 
-- [ ] **Step 4: 运行验证测试确认 GREEN**
+- [x] **Step 4: 运行验证测试确认 GREEN**
 
 Run:
 

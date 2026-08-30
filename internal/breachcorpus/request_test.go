@@ -39,6 +39,12 @@ func TestReadBuildRequestRejectsUnknownFieldsDuplicateSourcesAndTrailingJSON(t *
 
 	const validSHA256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 	tests := map[string]string{
+		"duplicate JSON member": `{
+			"schema_version": 1,
+			"schema_version": 1,
+			"corpus_version": "2026.08.30.1",
+			"sources": [{"id":"source-a","version":"1","expected_sha256":"` + validSHA256 + `","license_review_ref":"LEGAL-1"}]
+		}`,
 		"unknown field": `{
 			"schema_version": 1,
 			"corpus_version": "2026.08.30.1",

@@ -29,10 +29,14 @@ func Build(
 	generator Generator,
 	clock func() time.Time,
 ) (Result, error) {
-	if ctx == nil || clock == nil || ValidateInputs(request, inputs) != nil ||
-		!validGenerator(generator) || !validPrivateOutputRoot(outputRoot) {
+	if ctx == nil || clock == nil || ValidateInputs(request, inputs) != nil || !validGenerator(generator) {
 		return Result{}, ErrBuildFailed
 	}
+	canonicalOutputRoot, err := canonicalPrivateOutputRoot(outputRoot)
+	if err != nil {
+		return Result{}, ErrBuildFailed
+	}
+	outputRoot = canonicalOutputRoot
 	bindings := orderedBindings(request, inputs)
 	totalInputBytes, err := preflightInputBytes(bindings)
 	if err != nil {
@@ -266,12 +270,20 @@ func validGenerator(generator Generator) bool {
 		validBoundedText(generator.Commit, maximumVersionBytes)
 }
 
-func validPrivateOutputRoot(path string) bool {
+func canonicalPrivateOutputRoot(path string) (string, error) {
 	if path == "" || strings.TrimSpace(path) != path || !filepath.IsAbs(path) || filepath.Clean(path) != path {
-		return false
+		return "", ErrBuildFailed
 	}
-	info, err := os.Lstat(path)
-	return err == nil && info.IsDir() && info.Mode().Perm()&0o077 == 0
+	canonical, err := filepath.EvalSymlinks(path)
+	if err != nil || !filepath.IsAbs(canonical) {
+		return "", ErrBuildFailed
+	}
+	canonical = filepath.Clean(canonical)
+	info, err := os.Lstat(canonical)
+	if err != nil || !info.IsDir() || info.Mode().Perm()&0o077 != 0 {
+		return "", ErrBuildFailed
+	}
+	return canonical, nil
 }
 
 func writeSynchronizedFile(path string, contents []byte) error {

@@ -1,15 +1,15 @@
 package breachcorpus
 
 import (
-	"bytes"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"unicode"
+
+	"xminds-release-platform/internal/platform/strictjson"
 )
 
 const (
@@ -27,19 +27,8 @@ func ReadBuildRequest(reader io.Reader) (BuildRequest, error) {
 	if reader == nil {
 		return BuildRequest{}, ErrInvalidRequest
 	}
-	raw, err := io.ReadAll(io.LimitReader(reader, maximumBuildRequestBytes+1))
-	if err != nil || len(raw) == 0 || len(raw) > maximumBuildRequestBytes {
-		return BuildRequest{}, ErrInvalidRequest
-	}
-
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.DisallowUnknownFields()
 	var request BuildRequest
-	if err := decoder.Decode(&request); err != nil {
-		return BuildRequest{}, ErrInvalidRequest
-	}
-	var trailing any
-	if err := decoder.Decode(&trailing); err != io.EOF {
+	if err := strictjson.Decode(reader, maximumBuildRequestBytes, &request); err != nil {
 		return BuildRequest{}, ErrInvalidRequest
 	}
 	if err := validateBuildRequest(request); err != nil {

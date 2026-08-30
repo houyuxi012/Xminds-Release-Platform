@@ -17,6 +17,7 @@ const (
 var (
 	ErrBuildFailed    = errors.New("breach corpus build failed")
 	ErrInvalidCorpus  = errors.New("breach corpus is invalid")
+	ErrInvalidRelease = errors.New("breach corpus release is invalid")
 	ErrInvalidRequest = errors.New("breach corpus build request is invalid")
 )
 
@@ -94,4 +95,29 @@ type Result struct {
 	ManifestSHA256   string `json:"manifest_sha256"`
 	Counts           Counts `json:"counts"`
 	CorpusBytes      int64  `json:"corpus_bytes"`
+}
+
+type VerificationMode string
+
+const (
+	ArtifactMode   VerificationMode = "artifact"
+	DeploymentMode VerificationMode = "deployment"
+	RuntimeMode    VerificationMode = "runtime"
+)
+
+type OwnershipExpectation struct {
+	OwnerUID uint32
+	GroupGID uint32
+}
+
+type VerifyOptions struct {
+	Mode                VerificationMode
+	ExpectedOwnership   *OwnershipExpectation
+	EffectiveServiceUID *uint32
+}
+
+type Release struct {
+	Manifest Manifest
+	Set      *Set
+	Result   Result
 }
