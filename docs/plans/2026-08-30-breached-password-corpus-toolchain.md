@@ -170,7 +170,7 @@ git commit -m "Define breach corpus build contracts"
 - Consumes: `io.Reader` 摘要流。
 - Produces: `Parse(io.Reader) (*Set, Counts, error)`、`NormalizeLine(string) (string, Algorithm, bool, error)`、`Set.ContainsPassword(string) bool` 和 `ErrInvalidCorpus`。
 
-- [ ] **Step 1: 写格式、边界和口令命中失败测试**
+- [x] **Step 1: 写格式、边界和口令命中失败测试**
 
 ```go
 func TestParseNormalizesSupportedDigestsAndMatchesPasswords(t *testing.T) {
@@ -187,7 +187,7 @@ func TestParseNormalizesSupportedDigestsAndMatchesPasswords(t *testing.T) {
 
 另建独立测试分别拒绝空语料、非十六进制、错误长度和超过 4096 字节的行。
 
-- [ ] **Step 2: 运行解析测试确认 RED**
+- [x] **Step 2: 运行解析测试确认 RED**
 
 Run:
 
@@ -197,7 +197,7 @@ go test ./internal/breachcorpus -run 'TestParse|TestNormalizeLine' -count=1
 
 Expected: FAIL，因为解析 API 尚不存在。
 
-- [ ] **Step 3: 实现最小解析器**
+- [x] **Step 3: 实现最小解析器**
 
 ```go
 type Algorithm string
@@ -227,7 +227,7 @@ func (set *Set) ContainsPassword(password string) bool
 
 `Parse` 使用 4096 字节扫描上限，空行和注释忽略，其他行必须完整解码为 20 或 32 字节。
 
-- [ ] **Step 4: 运行解析测试确认 GREEN**
+- [x] **Step 4: 运行解析测试确认 GREEN**
 
 Run:
 
