@@ -2,12 +2,9 @@ package iam
 
 import (
 	"context"
-	"crypto/sha1"
-	"encoding/hex"
 	"errors"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -15,30 +12,52 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func TestFileBreachCheckerRejectsDigestMatchesAndMalformedCorpus(t *testing.T) {
+func TestFileBreachCheckerMatchesSupportedDigestCorpusFormats(t *testing.T) {
 	t.Parallel()
 
-	directory := t.TempDir()
-	password := "Known-Breached-Password!"
-	digest := sha1.Sum([]byte(password))
-	corpus := filepath.Join(directory, "breached.txt")
-	if err := os.WriteFile(corpus, []byte(strings.ToUpper(hex.EncodeToString(digest[:]))+"\n"), 0o400); err != nil {
-		t.Fatal(err)
+	const (
+		sha1Password   = "Known-SHA1-Breached-Password!"
+		sha1Digest     = "844eba1a7a7bebadaad266bf2db5b9429d441818"
+		sha256Password = "Known-SHA256-Breached-Password!"
+		sha256Digest   = "6CE0335CCB0E6AD50693A435D4BF0659DB2D69D53D84631661774AC86E8F5722"
+	)
+	tests := []struct {
+		name     string
+		corpus   string
+		breached []string
+	}{
+		{name: "SHA-1", corpus: sha1Digest, breached: []string{sha1Password}},
+		{name: "SHA-256", corpus: sha256Digest, breached: []string{sha256Password}},
+		{name: "mixed", corpus: "# supported digest formats\n" + sha1Digest + "\n" + sha256Digest, breached: []string{sha1Password, sha256Password}},
 	}
-	checker, err := NewFileBreachChecker(corpus)
-	if err != nil {
-		t.Fatalf("NewFileBreachChecker() error = %v", err)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			corpus := filepath.Join(t.TempDir(), "breached.txt")
+			if err := os.WriteFile(corpus, []byte(test.corpus+"\n"), 0o400); err != nil {
+				t.Fatal(err)
+			}
+			checker, err := NewFileBreachChecker(corpus)
+			if err != nil {
+				t.Fatalf("NewFileBreachChecker() error = %v", err)
+			}
+			for _, password := range test.breached {
+				breached, checkErr := checker.IsBreached(context.Background(), password)
+				if checkErr != nil || !breached {
+					t.Fatalf("IsBreached(%q) = %v, %v", password, breached, checkErr)
+				}
+			}
+			breached, err := checker.IsBreached(context.Background(), "A-Different-Safe-Password!")
+			if err != nil || breached {
+				t.Fatalf("IsBreached(safe) = %v, %v", breached, err)
+			}
+		})
 	}
-	breached, err := checker.IsBreached(context.Background(), password)
-	if err != nil || !breached {
-		t.Fatalf("IsBreached() = %v, %v", breached, err)
-	}
-	breached, err = checker.IsBreached(context.Background(), "A-Different-Safe-Password!")
-	if err != nil || breached {
-		t.Fatalf("IsBreached(safe) = %v, %v", breached, err)
-	}
+}
 
-	malformed := filepath.Join(directory, "malformed.txt")
+func TestFileBreachCheckerRejectsMalformedCorpus(t *testing.T) {
+	t.Parallel()
+	malformed := filepath.Join(t.TempDir(), "malformed.txt")
 	if err := os.WriteFile(malformed, []byte("not-a-password-digest\n"), 0o400); err != nil {
 		t.Fatal(err)
 	}
