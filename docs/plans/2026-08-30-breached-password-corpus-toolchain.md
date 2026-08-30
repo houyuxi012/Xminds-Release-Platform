@@ -78,7 +78,7 @@ Expected: 本任务只出现 `docs/security`、`docs/deployment`、`docs/plans`�
 - Consumes: `io.Reader` 形式的严格 JSON 构建请求。
 - Produces: `ReadBuildRequest(io.Reader) (BuildRequest, error)`、`ValidateInputs(BuildRequest, []Input) error`、`BuildRequest`、`SourceRequest`、`Input`、`Generator`、`Manifest`、`Result` 和稳定错误 `ErrInvalidRequest`。
 
-- [ ] **Step 1: 写严格请求解码失败测试**
+- [x] **Step 1: 写严格请求解码失败测试**
 
 ```go
 func TestReadBuildRequestRejectsUnknownFieldsDuplicateSourcesAndTrailingJSON(t *testing.T) {
@@ -95,7 +95,7 @@ func TestReadBuildRequestRejectsUnknownFieldsDuplicateSourcesAndTrailingJSON(t *
 }
 ```
 
-- [ ] **Step 2: 运行测试确认 RED**
+- [x] **Step 2: 运行测试确认 RED**
 
 Run:
 
@@ -105,7 +105,7 @@ go test ./internal/breachcorpus -run TestReadBuildRequestRejects -count=1
 
 Expected: FAIL，因为 `ReadBuildRequest` 和领域类型尚不存在。
 
-- [ ] **Step 3: 实现最小严格请求模型**
+- [x] **Step 3: 实现最小严格请求模型**
 
 类型签名固定为：
 
@@ -143,7 +143,7 @@ func ValidateInputs(request BuildRequest, inputs []Input) error
 
 解码器使用 `DisallowUnknownFields`，并在首个对象后要求 EOF；所有标识、版本、许可证引用和摘要采用有界格式验证。
 
-- [ ] **Step 4: 运行请求测试确认 GREEN**
+- [x] **Step 4: 运行请求测试确认 GREEN**
 
 Run:
 
