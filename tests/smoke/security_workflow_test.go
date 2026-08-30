@@ -34,8 +34,18 @@ type securityJob struct {
 }
 
 type workflowStrategy struct {
-	FailFast bool                `yaml:"fail-fast"`
-	Matrix   map[string][]string `yaml:"matrix"`
+	FailFast bool           `yaml:"fail-fast"`
+	Matrix   workflowMatrix `yaml:"matrix"`
+}
+
+type workflowMatrix struct {
+	Language []string              `yaml:"language"`
+	Include  []workflowMatrixEntry `yaml:"include"`
+}
+
+type workflowMatrixEntry struct {
+	Language  string `yaml:"language"`
+	BuildMode string `yaml:"build-mode"`
 }
 
 type securityStep struct {
@@ -71,9 +81,15 @@ func TestCodeQLWorkflowEnforcesStaticAnalysisGate(t *testing.T) {
 	if job.RunsOn != "ubuntu-24.04" || job.TimeoutMinutes != 30 {
 		t.Fatalf("CodeQL execution boundary = %s/%d minutes", job.RunsOn, job.TimeoutMinutes)
 	}
-	wantLanguages := []string{"go", "javascript-typescript"}
-	if got := job.Strategy.Matrix["language"]; !reflect.DeepEqual(got, wantLanguages) {
-		t.Fatalf("CodeQL languages = %v, want %v", got, wantLanguages)
+	wantMatrix := []workflowMatrixEntry{
+		{Language: "go", BuildMode: "autobuild"},
+		{Language: "javascript-typescript", BuildMode: "none"},
+	}
+	if got := job.Strategy.Matrix.Include; !reflect.DeepEqual(got, wantMatrix) {
+		t.Fatalf("CodeQL language/build matrix = %v, want %v", got, wantMatrix)
+	}
+	if len(job.Strategy.Matrix.Language) != 0 {
+		t.Fatalf("CodeQL matrix must define build mode per language, got shared language list %v", job.Strategy.Matrix.Language)
 	}
 	if job.Strategy.FailFast {
 		t.Fatal("CodeQL matrix must preserve findings from both languages when one job fails")
@@ -87,8 +103,8 @@ func TestCodeQLWorkflowEnforcesStaticAnalysisGate(t *testing.T) {
 	if got := fmt.Sprint(init.With["languages"]); got != "${{ matrix.language }}" {
 		t.Fatalf("CodeQL init languages = %q", got)
 	}
-	if got := fmt.Sprint(init.With["build-mode"]); got != "none" {
-		t.Fatalf("CodeQL build mode = %q, want none", got)
+	if got := fmt.Sprint(init.With["build-mode"]); got != "${{ matrix.build-mode }}" {
+		t.Fatalf("CodeQL build mode = %q, want matrix-specific mode", got)
 	}
 	if got := fmt.Sprint(init.With["queries"]); got != "security-extended" {
 		t.Fatalf("CodeQL query suite = %q, want security-extended", got)
