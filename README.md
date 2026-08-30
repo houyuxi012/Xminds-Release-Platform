@@ -100,6 +100,16 @@ make verify
 
 `make verify` 会执行格式、Go Vet、竞态测试、双二进制构建、仓库边界检查、macOS 元数据污染检查，以及 Console 的静态检查、类型检查、真实浏览器组件测试和生产构建。`make console-e2e` 单独执行产品创建、制品续传、职责分离发布、SCM、端点和审计证据主流程。
 
+## 持续集成
+
+GitHub Actions 在 Pull Request 和 `main` 分支推送时执行三个独立门禁：
+
+- `Quality`：安装锁定的 Console 依赖后执行 `make verify`；
+- `Integration`：通过 `compose.integration.yaml` 启动 PostgreSQL 18 和 MinIO，执行 `make test-integration`，最后无条件回收容器与测试卷；
+- `Console E2E`：安装 Chromium 运行时后执行 `make console-e2e`。
+
+Go 版本由 `go.mod` 的 `toolchain` 声明统一管理，Node.js 版本由根目录 `.node-version` 统一管理。工作流程仅具有仓库内容读权限，所有 GitHub Action 都固定到完整提交 SHA，不使用 Pull Request Secret。Dependabot 每周检查 GitHub Action 更新并创建独立 Pull Request，不自动合并。
+
 ## 管理控制台
 
 控制台位于 `apps/release-console`。首次启动先安装锁定依赖：
