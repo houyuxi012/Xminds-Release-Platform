@@ -153,7 +153,7 @@ go test ./internal/breachcorpus -run 'TestReadBuildRequest|TestValidateInputs' -
 
 Expected: PASS。
 
-- [ ] **Step 5: 提交领域契约**
+- [x] **Step 5: 提交领域契约**
 
 ```bash
 git add internal/breachcorpus/types.go internal/breachcorpus/request.go internal/breachcorpus/request_test.go
@@ -237,7 +237,7 @@ go test ./internal/breachcorpus -run 'TestParse|TestNormalizeLine' -count=1
 
 Expected: PASS。
 
-- [ ] **Step 5: 提交解析器**
+- [x] **Step 5: 提交解析器**
 
 ```bash
 git add internal/breachcorpus/parser.go internal/breachcorpus/parser_test.go
@@ -338,7 +338,7 @@ go test ./internal/breachcorpus -run TestBuild -race -count=1
 
 Expected: PASS，且测试临时目录中不存在未清理的正式半成品。
 
-- [ ] **Step 6: 提交构建器**
+- [x] **Step 6: 提交构建器**
 
 ```bash
 git add internal/breachcorpus/builder.go internal/breachcorpus/merge.go internal/breachcorpus/builder_test.go
@@ -408,7 +408,7 @@ type OwnershipExpectation struct {
 type VerifyOptions struct {
     Mode                VerificationMode
     ExpectedOwnership   *OwnershipExpectation
-    EffectiveServiceUID uint32
+    EffectiveServiceUID *uint32
 }
 
 type Release struct {
@@ -432,7 +432,7 @@ go test ./internal/breachcorpus -run TestVerifyRelease -race -count=1
 
 Expected: PASS。
 
-- [ ] **Step 5: 提交验证器**
+- [x] **Step 5: 提交验证器**
 
 ```bash
 git add internal/breachcorpus/verifier.go internal/breachcorpus/verifier_unix.go internal/breachcorpus/verifier_test.go
@@ -515,7 +515,7 @@ make build
 
 Expected: PASS，并生成 `bin/breach-corpus`。
 
-- [ ] **Step 6: 提交 CLI**
+- [x] **Step 6: 提交 CLI**
 
 ```bash
 git add scripts/breach-corpus Makefile
@@ -536,7 +536,7 @@ git commit -m "Add breach corpus governance CLI"
 - Consumes: `breachcorpus.VerifyRelease` 和环境变量 `XMINDS_RELEASE_IAM_BREACH_CORPUS_RELEASE_DIR`。
 - Produces: `NewReleaseBreachChecker(string) (*FileBreachChecker, error)` 和 `LocalAuthRuntimeConfig.BreachCorpusReleaseDirectory`。
 
-- [ ] **Step 1: 写配置收敛失败测试**
+- [x] **Step 1: 写配置收敛失败测试**
 
 ```go
 func TestLoadLocalAuthRuntimeConfigRequiresReleaseDirectoryAndRejectsLegacyCorpusPath(t *testing.T) {
@@ -550,11 +550,11 @@ func TestLoadLocalAuthRuntimeConfigRequiresReleaseDirectoryAndRejectsLegacyCorpu
 
 再测试绝对内容寻址发布目录成功、development 内置语料与发布目录不能同时配置、非 development 不能启用内置语料。
 
-- [ ] **Step 2: 写运行时清单失败测试**
+- [x] **Step 2: 写运行时清单失败测试**
 
 测试 `NewReleaseBreachChecker` 对有效发布目录命中 SHA-1/SHA-256，并拒绝清单缺失、清单篡改、服务 UID 拥有产物及可写父目录。
 
-- [ ] **Step 3: 运行 IAM 测试确认 RED**
+- [x] **Step 3: 运行 IAM 测试确认 RED**
 
 Run:
 
@@ -564,11 +564,11 @@ go test ./internal/iam ./apps/release-api -run 'Breach|Corpus|LocalAuthRuntimeCo
 
 Expected: FAIL，因为新配置字段和发布目录构造器尚不存在。
 
-- [ ] **Step 4: 重构 IAM 适配器**
+- [x] **Step 4: 重构 IAM 适配器**
 
 `FileBreachChecker` 仅保存 `*breachcorpus.Set`；`NewReleaseBreachChecker` 调用共享验证器并传入真实 `os.Geteuid()`。删除 IAM 内重复的解析、文件限制和摘要编码逻辑；`NewDevelopmentBreachChecker` 使用共享 `Parse` 读取嵌入语料。
 
-- [ ] **Step 5: 收敛运行配置和应用启动**
+- [x] **Step 5: 收敛运行配置和应用启动**
 
 将配置字段固定为：
 
@@ -581,7 +581,7 @@ type LocalAuthRuntimeConfig struct {
 
 生产路径只读取 `XMINDS_RELEASE_IAM_BREACH_CORPUS_RELEASE_DIR`，显式拒绝旧变量非空；`apps/release-api/main.go` 调用 `iam.NewReleaseBreachChecker`。
 
-- [ ] **Step 6: 运行 IAM 测试确认 GREEN**
+- [x] **Step 6: 运行 IAM 测试确认 GREEN**
 
 Run:
 

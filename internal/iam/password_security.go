@@ -1,7 +1,6 @@
 package iam
 
 import (
-	"bufio"
 	"context"
 	"crypto/hmac"
 	"crypto/sha1"
@@ -9,7 +8,6 @@ import (
 	"embed"
 	"encoding/base32"
 	"encoding/binary"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"hash"
@@ -22,9 +20,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+	"xminds-release-platform/internal/breachcorpus"
 )
-
-const maximumBreachCorpusBytes = 128 << 20
 
 //go:embed breach_corpus_development.txt
 var developmentBreachCorpus embed.FS
@@ -37,31 +34,22 @@ var (
 )
 
 type FileBreachChecker struct {
-	sha1Digests   map[string]struct{}
-	sha256Digests map[string]struct{}
+	set *breachcorpus.Set
 }
 
-func NewFileBreachChecker(path string) (*FileBreachChecker, error) {
-	path = strings.TrimSpace(path)
-	if path == "" {
+func NewReleaseBreachChecker(releaseDirectory string) (*FileBreachChecker, error) {
+	return newReleaseBreachChecker(releaseDirectory, uint32(os.Geteuid()))
+}
+
+func newReleaseBreachChecker(releaseDirectory string, effectiveServiceUID uint32) (*FileBreachChecker, error) {
+	release, err := breachcorpus.VerifyRelease(releaseDirectory, breachcorpus.VerifyOptions{
+		Mode:                breachcorpus.RuntimeMode,
+		EffectiveServiceUID: &effectiveServiceUID,
+	})
+	if err != nil || release == nil || release.Set == nil {
 		return nil, ErrBreachCorpusInvalid
 	}
-	info, err := os.Lstat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o222 != 0 || info.Size() <= 0 || info.Size() > maximumBreachCorpusBytes {
-		return nil, ErrBreachCorpusInvalid
-	}
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("open breached-password corpus: %w", err)
-	}
-	defer file.Close()
-	openedInfo, err := file.Stat()
-	if err != nil || !os.SameFile(info, openedInfo) {
-		return nil, ErrBreachCorpusInvalid
-	}
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 4096), 4096)
-	return parseBreachCorpus(scanner)
+	return &FileBreachChecker{set: release.Set}, nil
 }
 
 func NewDevelopmentBreachChecker() (*FileBreachChecker, error) {
@@ -70,48 +58,18 @@ func NewDevelopmentBreachChecker() (*FileBreachChecker, error) {
 		return nil, ErrBreachCorpusInvalid
 	}
 	defer file.Close()
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 4096), 4096)
-	return parseBreachCorpus(scanner)
-}
-
-func parseBreachCorpus(scanner *bufio.Scanner) (*FileBreachChecker, error) {
-	checker := &FileBreachChecker{sha1Digests: make(map[string]struct{}), sha256Digests: make(map[string]struct{})}
-	for scanner.Scan() {
-		line := strings.ToUpper(strings.TrimSpace(scanner.Text()))
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		decoded, decodeErr := hex.DecodeString(line)
-		if decodeErr != nil {
-			return nil, ErrBreachCorpusInvalid
-		}
-		switch len(decoded) {
-		case sha1.Size:
-			checker.sha1Digests[line] = struct{}{}
-		case sha256.Size:
-			checker.sha256Digests[line] = struct{}{}
-		default:
-			return nil, ErrBreachCorpusInvalid
-		}
-	}
-	if err := scanner.Err(); err != nil || len(checker.sha1Digests)+len(checker.sha256Digests) == 0 {
+	set, _, err := breachcorpus.Parse(file)
+	if err != nil {
 		return nil, ErrBreachCorpusInvalid
 	}
-	return checker, nil
+	return &FileBreachChecker{set: set}, nil
 }
 
 func (checker *FileBreachChecker) IsBreached(_ context.Context, password string) (bool, error) {
-	if checker == nil || len(checker.sha1Digests)+len(checker.sha256Digests) == 0 {
+	if checker == nil || checker.set == nil {
 		return false, ErrBreachCorpusInvalid
 	}
-	sha1Digest := sha1.Sum([]byte(password))
-	if _, found := checker.sha1Digests[strings.ToUpper(hex.EncodeToString(sha1Digest[:]))]; found {
-		return true, nil
-	}
-	sha256Digest := sha256.Sum256([]byte(password))
-	_, found := checker.sha256Digests[strings.ToUpper(hex.EncodeToString(sha256Digest[:]))]
-	return found, nil
+	return checker.set.ContainsPassword(password), nil
 }
 
 type SecretResolver interface {

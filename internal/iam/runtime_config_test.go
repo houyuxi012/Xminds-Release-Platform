@@ -114,7 +114,7 @@ func TestLoadLocalAuthRuntimeConfigRequiresExplicitDevelopmentCorpusOptIn(t *tes
 			"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY":            secretDirectory,
 			"XMINDS_RELEASE_IAM_MFA_ENROLLMENT_SECRET_DIRECTORY": enrollmentDirectory,
 			"XMINDS_RELEASE_IAM_USE_DEVELOPMENT_BREACH_CORPUS":   "true",
-			"XMINDS_RELEASE_IAM_BREACH_CORPUS":                   filepath.Join(t.TempDir(), "breaches.txt"),
+			"XMINDS_RELEASE_IAM_BREACH_CORPUS_RELEASE_DIR":       filepath.Join(t.TempDir(), "breach-corpus-sha256-"+strings.Repeat("0", 64)),
 		}, "development"},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -136,10 +136,45 @@ func TestLoadLocalAuthRuntimeConfigRequiresExplicitDevelopmentCorpusOptIn(t *tes
 	}
 }
 
+func TestLoadLocalAuthRuntimeConfigRequiresReleaseDirectoryAndRejectsLegacyCorpusPath(t *testing.T) {
+	t.Parallel()
+	releaseDirectory := filepath.Join(t.TempDir(), "breach-corpus-sha256-"+strings.Repeat("0", 64))
+	base := map[string]string{
+		"XMINDS_RELEASE_IAM_BREACH_CORPUS_RELEASE_DIR":       releaseDirectory,
+		"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY":            t.TempDir(),
+		"XMINDS_RELEASE_IAM_MFA_ENROLLMENT_SECRET_DIRECTORY": t.TempDir(),
+	}
+	configuration, err := LoadLocalAuthRuntimeConfig(base, "production")
+	if err != nil {
+		t.Fatalf("LoadLocalAuthRuntimeConfig() error = %v", err)
+	}
+	if configuration.BreachCorpusReleaseDirectory != filepath.Clean(releaseDirectory) {
+		t.Fatalf("release directory = %q", configuration.BreachCorpusReleaseDirectory)
+	}
+	for name, legacy := range map[string]string{
+		"legacy only":         filepath.Join(t.TempDir(), "breaches.txt"),
+		"legacy with release": filepath.Join(t.TempDir(), "breaches.txt"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			environ := make(map[string]string, len(base)+1)
+			for key, value := range base {
+				environ[key] = value
+			}
+			environ["XMINDS_RELEASE_IAM_BREACH_CORPUS"] = legacy
+			if name == "legacy only" {
+				delete(environ, "XMINDS_RELEASE_IAM_BREACH_CORPUS_RELEASE_DIR")
+			}
+			if _, err := LoadLocalAuthRuntimeConfig(environ, "production"); !errors.Is(err, ErrLocalAuthRuntimeConfiguration) {
+				t.Fatalf("legacy configuration error = %v", err)
+			}
+		})
+	}
+}
+
 func TestLoadLocalAuthRuntimeConfigRejectsUnsafePolicyOverrides(t *testing.T) {
 	t.Parallel()
 	base := map[string]string{
-		"XMINDS_RELEASE_IAM_BREACH_CORPUS":                   filepath.Join(t.TempDir(), "breaches.txt"),
+		"XMINDS_RELEASE_IAM_BREACH_CORPUS_RELEASE_DIR":       filepath.Join(t.TempDir(), "breach-corpus-sha256-"+strings.Repeat("0", 64)),
 		"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY":            t.TempDir(),
 		"XMINDS_RELEASE_IAM_MFA_ENROLLMENT_SECRET_DIRECTORY": t.TempDir(),
 	}
@@ -180,7 +215,7 @@ func TestLoadLocalAuthRuntimeConfigRejectsUnsafePolicyOverrides(t *testing.T) {
 func TestLoadLocalAuthRuntimeConfigParsesBoundedPolicy(t *testing.T) {
 	t.Parallel()
 	configuration, err := LoadLocalAuthRuntimeConfig(map[string]string{
-		"XMINDS_RELEASE_IAM_BREACH_CORPUS":                   filepath.Join(t.TempDir(), "breaches.txt"),
+		"XMINDS_RELEASE_IAM_BREACH_CORPUS_RELEASE_DIR":       filepath.Join(t.TempDir(), "breach-corpus-sha256-"+strings.Repeat("0", 64)),
 		"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY":            t.TempDir(),
 		"XMINDS_RELEASE_IAM_MFA_ENROLLMENT_SECRET_DIRECTORY": t.TempDir(),
 		"XMINDS_RELEASE_IAM_ACCOUNT_LIMIT":                   "20",
@@ -204,7 +239,7 @@ func TestLoadLocalAuthRuntimeConfigRequiresIndependentBoundedEnrollmentSecretRoo
 	legacyRoot := t.TempDir()
 	enrollmentRoot := t.TempDir()
 	base := map[string]string{
-		"XMINDS_RELEASE_IAM_BREACH_CORPUS":                   filepath.Join(t.TempDir(), "breaches.txt"),
+		"XMINDS_RELEASE_IAM_BREACH_CORPUS_RELEASE_DIR":       filepath.Join(t.TempDir(), "breach-corpus-sha256-"+strings.Repeat("0", 64)),
 		"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY":            legacyRoot,
 		"XMINDS_RELEASE_IAM_MFA_ENROLLMENT_SECRET_DIRECTORY": enrollmentRoot,
 	}
@@ -242,7 +277,7 @@ func TestLoadLocalAuthRuntimeConfigRequiresIndependentBoundedEnrollmentSecretRoo
 func TestLoadLocalAuthRuntimeConfigParsesBoundedReauthenticationPolicy(t *testing.T) {
 	t.Parallel()
 	configuration, err := LoadLocalAuthRuntimeConfig(map[string]string{
-		"XMINDS_RELEASE_IAM_BREACH_CORPUS":                   filepath.Join(t.TempDir(), "breaches.txt"),
+		"XMINDS_RELEASE_IAM_BREACH_CORPUS_RELEASE_DIR":       filepath.Join(t.TempDir(), "breach-corpus-sha256-"+strings.Repeat("0", 64)),
 		"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY":            t.TempDir(),
 		"XMINDS_RELEASE_IAM_MFA_ENROLLMENT_SECRET_DIRECTORY": t.TempDir(),
 		"XMINDS_RELEASE_IAM_REAUTH_CHALLENGE_TTL":            "6m",
@@ -267,7 +302,7 @@ func TestLoadLocalAuthRuntimeConfigParsesBoundedReauthenticationPolicy(t *testin
 func TestLoadLocalAuthRuntimeConfigRejectsUnsafeReauthenticationPolicy(t *testing.T) {
 	t.Parallel()
 	base := map[string]string{
-		"XMINDS_RELEASE_IAM_BREACH_CORPUS":                   filepath.Join(t.TempDir(), "breaches.txt"),
+		"XMINDS_RELEASE_IAM_BREACH_CORPUS_RELEASE_DIR":       filepath.Join(t.TempDir(), "breach-corpus-sha256-"+strings.Repeat("0", 64)),
 		"XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY":            t.TempDir(),
 		"XMINDS_RELEASE_IAM_MFA_ENROLLMENT_SECRET_DIRECTORY": t.TempDir(),
 	}

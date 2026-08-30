@@ -190,7 +190,7 @@ func run(ctx context.Context, arguments []string, environ map[string]string) err
 	if runtimeConfig.LocalAuth.UseDevelopmentBreachCorpus {
 		breachChecker, err = iam.NewDevelopmentBreachChecker()
 	} else {
-		breachChecker, err = iam.NewFileBreachChecker(runtimeConfig.LocalAuth.BreachCorpusPath)
+		breachChecker, err = iam.NewReleaseBreachChecker(runtimeConfig.LocalAuth.BreachCorpusReleaseDirectory)
 	}
 	if err != nil {
 		return fmt.Errorf("configure breached-password corpus: %w", err)
