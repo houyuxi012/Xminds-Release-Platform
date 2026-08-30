@@ -241,3 +241,21 @@ func integrationDatabaseURL(t *testing.T) string {
 	}
 	return rawURL
 }
+
+const requiredPostgreSQLMajorVersion = 18
+
+type postgresVersionQuerier interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+func requirePostgreSQLMajorVersion(t *testing.T, ctx context.Context, querier postgresVersionQuerier) {
+	t.Helper()
+
+	var majorVersion int
+	if err := querier.QueryRow(ctx, `SELECT current_setting('server_version_num')::integer / 10000`).Scan(&majorVersion); err != nil {
+		t.Fatalf("query PostgreSQL server major version: %v", err)
+	}
+	if majorVersion != requiredPostgreSQLMajorVersion {
+		t.Fatalf("PostgreSQL major version=%d, require %d", majorVersion, requiredPostgreSQLMajorVersion)
+	}
+}

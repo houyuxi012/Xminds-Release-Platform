@@ -169,10 +169,7 @@ func TestDirectoryConflictResolutionPostgresConcurrencyAndAuditRollback(t *testi
 		t.Fatal(err)
 	}
 	now := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Microsecond)
-	var serverVersion string
-	if err := pool.QueryRow(ctx, `SHOW server_version`).Scan(&serverVersion); err != nil || !strings.HasPrefix(serverVersion, "17.10") {
-		t.Fatalf("PostgreSQL server_version=%q error=%v, require 17.10", serverVersion, err)
-	}
+	requirePostgreSQLMajorVersion(t, ctx, pool)
 	repository := iam.NewPostgresRepository(pool)
 	auditor := audit.NewService(audit.NewPostgresRepository(pool))
 	reauthentication, err := iam.NewReauthenticationService(iam.ReauthenticationConfig{

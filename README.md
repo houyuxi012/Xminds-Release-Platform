@@ -81,7 +81,7 @@ tests/      集成、契约、端到端和性能测试
 
 - Go 1.26.5；
 - Node.js 24 LTS；
-- PostgreSQL 17.10；
+- PostgreSQL 18（开发与集成测试镜像统一使用 `postgres:18-alpine`）；
 - Docker Compose；
 - golangci-lint v2（执行扩展静态检查时需要）。
 
@@ -195,19 +195,16 @@ Worker 依赖预先执行的数据库迁移、可用的 S3/MinIO 桶、经签名
 集成测试只接受数据库名包含 `test` 的连接串，避免误清理非测试数据库：
 
 ```bash
+docker compose -f compose.integration.yaml up -d --wait postgres minio
 export XMINDS_RELEASE_TEST_DATABASE_URL='postgres://xminds_release_test:xminds_release_test@127.0.0.1:55432/xminds_release_test?sslmode=disable'
-make test-integration
-```
-
-制品端到端集成测试还需要一个隔离的 MinIO 测试桶：
-
-```bash
 export XMINDS_RELEASE_TEST_MINIO_URL='http://127.0.0.1:59000'
-export XMINDS_RELEASE_TEST_MINIO_ACCESS_KEY='仅用于测试的访问密钥'
-export XMINDS_RELEASE_TEST_MINIO_SECRET_KEY='仅用于测试的秘密密钥'
+export XMINDS_RELEASE_TEST_MINIO_ACCESS_KEY='xminds_release_test'
+export XMINDS_RELEASE_TEST_MINIO_SECRET_KEY='xminds_release_test_secret'
 export XMINDS_RELEASE_TEST_MINIO_BUCKET='xminds-release-test'
 make test-integration
 ```
+
+`compose.integration.yaml` 将 PostgreSQL 18 与 MinIO 数据挂载到各自的专用测试卷；上述凭据只用于本机集成测试，测试卷禁止承载生产或历史项目数据。
 
 集成测试产生的已校验内容寻址对象保持不可变；测试应使用专用桶，并按环境生命周期整体回收测试桶。
 

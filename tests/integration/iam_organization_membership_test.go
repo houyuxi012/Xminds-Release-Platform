@@ -133,10 +133,7 @@ func TestOrganizationMembershipMigrationV17UpgradeRollbackAndReapply(t *testing.
 	if err := database.ApplyMigrations(ctx, pool, migrations.FS); err != nil {
 		t.Fatalf("reapply v18: %v", err)
 	}
-	var serverVersion string
-	if err := pool.QueryRow(ctx, `SHOW server_version`).Scan(&serverVersion); err != nil || !strings.HasPrefix(serverVersion, "17.10") {
-		t.Fatalf("PostgreSQL server_version=%q error=%v, require 17.10", serverVersion, err)
-	}
+	requirePostgreSQLMajorVersion(t, ctx, pool)
 }
 
 // Mutation caught: ordering a dual-owned edge only by (created_at,user_id)

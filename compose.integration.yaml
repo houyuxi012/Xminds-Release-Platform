@@ -1,0 +1,43 @@
+name: xminds-release-integration
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    container_name: xminds-release-postgres-test
+    environment:
+      POSTGRES_DB: xminds_release_test
+      POSTGRES_USER: xminds_release_test
+      POSTGRES_PASSWORD: xminds_release_test
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - postgres-test-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U xminds_release_test -d xminds_release_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: "no"
+
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    container_name: xminds-release-minio-test
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: xminds_release_test
+      MINIO_ROOT_PASSWORD: xminds_release_test_secret
+    ports:
+      - "127.0.0.1:59000:9000"
+      - "127.0.0.1:59001:9001"
+    volumes:
+      - minio-test-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: "no"
+
+volumes:
+  postgres-test-data:
+  minio-test-data:
