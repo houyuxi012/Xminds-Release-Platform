@@ -30,6 +30,7 @@ Xminds Release Platform 是面向企业软件交付场景的多产品可信发�
 - 严格 Canonical JSON、Ed25519 五角色签名链、跨角色摘要/版本绑定和 NGEP 消费端黄金向量；
 - AES-256-GCM 本地加密 Signing Provider、在线 root 拒绝门禁、单调 Catalog 版本仓储和原子 current pointer；
 - 离线 root 密钥工具及双人控制的[密钥仪式规范](docs/security/key-ceremony.md)。
+- 只处理已审批 SHA-1/SHA-256 摘要的离线语料构建与验证设计，以及内容寻址、清单绑定和失败关闭的[治理规范](docs/security/breached-password-corpus-governance.md)；
 - 可续租的持久化 Worker、分级退避重试、五次失败死信和领域状态终结；
 - 五角色目录的不可变对象发布、回读摘要校验、数据库原子 current 切换和崩溃后幂等恢复；
 - 发布后撤销目录、Release/attempt 完成与失败回写，以及 UTF-8 JSONL 审计导出的摘要和过期控制。
@@ -98,7 +99,21 @@ make console-e2e
 make verify
 ```
 
-`make verify` 会执行格式、Go Vet、竞态测试、双二进制构建、仓库边界检查、macOS 元数据污染检查，以及 Console 的静态检查、类型检查、真实浏览器组件测试和生产构建。`make console-e2e` 单独执行产品创建、制品续传、职责分离发布、SCM、端点和审计证据主流程。
+`make verify` 会执行格式、Go Vet、竞态测试、三个 Go 二进制构建、仓库边界检查、macOS 元数据污染检查，以及 Console 的静态检查、类型检查、真实浏览器组件测试和生产构建。`make console-e2e` 单独执行产品创建、制品续传、职责分离发布、SCM、端点和审计证据主流程。
+
+泄露口令摘要语料工具由 `make build` 一并生成为 `bin/breach-corpus`。生产语料只从已审批的摘要制品离线构建：
+
+```bash
+bin/breach-corpus build \
+  --request /secure/build-request.json \
+  --input source-id=/secure/input/source.txt \
+  --output-root /secure/output
+
+bin/breach-corpus verify \
+  --release-dir /secure/output/breach-corpus-sha256-<digest>
+```
+
+CLI 永不接收明文口令。命令、清单和原子发布契约见[工具链设计](docs/security/breached-password-corpus-toolchain-design.md)，生产账户、权限、灰度和回滚步骤见[部署实施文档](docs/deployment/breached-password-corpus-deployment.md)。
 
 ## 持续集成
 
@@ -172,7 +187,7 @@ go run ./apps/release-worker
 - `POST /api/v1/auth/local/login`：本地账户登录；
 - `POST /api/v1/auth/emergency/login`：强制 MFA 的应急账户登录。
 
-上述 4 个认证入口不要求现有 Bearer，重认证挑战创建/完成和其他管理 API 仍在统一认证中间件之后。所有环境必须分别配置绝对路径 `XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY` 和 `XMINDS_RELEASE_IAM_MFA_ENROLLMENT_SECRET_DIRECTORY`，两者不得指向同一目录；生产、测试和预发环境还必须配置指向非可写 SHA-1/SHA-256 摘要文件的 `XMINDS_RELEASE_IAM_BREACH_CORPUS`，缺失时服务拒绝启动。语料的引入、验证、发布、轮换、回滚和审计必须遵循[生产泄露口令摘要语料治理规范](docs/security/breached-password-corpus-governance.md)。仅显式 `development` 环境可通过 `XMINDS_RELEASE_IAM_USE_DEVELOPMENT_BREACH_CORPUS=true` 单独启用内置最小语料库；缺省环境、其他环境或与外部语料库同时配置时均拒绝启动。锁定阶段可通过 `XMINDS_RELEASE_IAM_LOCKOUT_STAGES=5:5m,8:30m,10:24h` 配置，次数和时长必须严格递增且满足运行时安全上下界。高风险挑战 TTL、evidence TTL、OIDC 新鲜度/时钟偏差、终态保留期和有界清理批次可通过 `.env.example` 中的 `XMINDS_RELEASE_IAM_REAUTH_*` 变量调整；越过安全边界的配置会导致服务拒绝启动。重认证 proof 绑定稳定的内部治理用户 ID；人员 proof 还精确绑定来源 ID，本地 proof 则使用独立的 local 绑定域，空来源从不作为通配。`000016` 会将无法可靠回填该绑定的既有活动 challenge 统一置为 `expired`。
+上述 4 个认证入口不要求现有 Bearer，重认证挑战创建/完成和其他管理 API 仍在统一认证中间件之后。所有环境必须分别配置绝对路径 `XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY` 和 `XMINDS_RELEASE_IAM_MFA_ENROLLMENT_SECRET_DIRECTORY`，两者不得指向同一目录；生产、测试和预发环境还必须配置 `XMINDS_RELEASE_IAM_BREACH_CORPUS_RELEASE_DIR`，指向同时包含只读 `corpus.txt` 与 `manifest.json` 的内容寻址发布目录，缺失、可写、摘要不一致或清单异常时服务拒绝启动。旧单文件变量 `XMINDS_RELEASE_IAM_BREACH_CORPUS` 不再是有效生产配置。语料的引入、验证、发布、轮换、回滚和审计必须遵循[生产泄露口令摘要语料治理规范](docs/security/breached-password-corpus-governance.md)及[部署实施文档](docs/deployment/breached-password-corpus-deployment.md)。仅显式 `development` 环境可通过 `XMINDS_RELEASE_IAM_USE_DEVELOPMENT_BREACH_CORPUS=true` 单独启用内置最小语料库；缺省环境、其他环境或与外部语料库同时配置时均拒绝启动。锁定阶段可通过 `XMINDS_RELEASE_IAM_LOCKOUT_STAGES=5:5m,8:30m,10:24h` 配置，次数和时长必须严格递增且满足运行时安全上下界。高风险挑战 TTL、evidence TTL、OIDC 新鲜度/时钟偏差、终态保留期和有界清理批次可通过 `.env.example` 中的 `XMINDS_RELEASE_IAM_REAUTH_*` 变量调整；越过安全边界的配置会导致服务拒绝启动。重认证 proof 绑定稳定的内部治理用户 ID；人员 proof 还精确绑定来源 ID，本地 proof 则使用独立的 local 绑定域，空来源从不作为通配。`000016` 会将无法可靠回填该绑定的既有活动 challenge 统一置为 `expired`。
 
 MFA enrollment 根仅挂载给 API，由所有 API 副本以相同稳定 numeric UID 通过受信 RWX 卷共享，目录 owner-only 可写，生成文件为 `0400`；Worker 不挂载该根。若基础设施不能提供共享根，必须经同一 `MFASecretStore` 边界改用外部 Secret Manager，禁止每个副本使用独立本地盘。API 启动执行不记录 seed 的 create→resolve→delete 真实探针，任一步失败即拒绝启动。轮换与过期 Secret 经 PostgreSQL 持久 GC 队列、reference 锁、存活性复查和 token-bound lease 清理。旧 `secret://iam/` TOTP 在首次轮换后保留，不进入新根 GC，由独立旧根退役流程处理。
 

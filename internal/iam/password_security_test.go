@@ -2,6 +2,8 @@ package iam
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"os"
 	"path/filepath"
@@ -10,82 +12,98 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+	"xminds-release-platform/internal/breachcorpus"
 )
 
-func TestFileBreachCheckerMatchesSupportedDigestCorpusFormats(t *testing.T) {
+func TestReleaseBreachCheckerLoadsVerifiedManifestAndRejectsServiceOwnedRelease(t *testing.T) {
 	t.Parallel()
 
 	const (
 		sha1Password   = "Known-SHA1-Breached-Password!"
-		sha1Digest     = "844eba1a7a7bebadaad266bf2db5b9429d441818"
+		sha1Digest     = "844EBA1A7A7BEBADAAD266BF2DB5B9429D441818"
 		sha256Password = "Known-SHA256-Breached-Password!"
 		sha256Digest   = "6CE0335CCB0E6AD50693A435D4BF0659DB2D69D53D84631661774AC86E8F5722"
 	)
-	tests := []struct {
-		name     string
-		corpus   string
-		breached []string
-	}{
-		{name: "SHA-1", corpus: sha1Digest, breached: []string{sha1Password}},
-		{name: "SHA-256", corpus: sha256Digest, breached: []string{sha256Password}},
-		{name: "mixed", corpus: "# supported digest formats\n" + sha1Digest + "\n" + sha256Digest, breached: []string{sha1Password, sha256Password}},
+	releaseDirectory := buildIAMCorpusRelease(t, sha1Digest+"\n"+sha256Digest+"\n")
+	serviceUID := uint32(os.Geteuid() + 1)
+	if serviceUID == 0 {
+		serviceUID = 1
 	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
-			corpus := filepath.Join(t.TempDir(), "breached.txt")
-			if err := os.WriteFile(corpus, []byte(test.corpus+"\n"), 0o400); err != nil {
-				t.Fatal(err)
-			}
-			checker, err := NewFileBreachChecker(corpus)
-			if err != nil {
-				t.Fatalf("NewFileBreachChecker() error = %v", err)
-			}
-			for _, password := range test.breached {
-				breached, checkErr := checker.IsBreached(context.Background(), password)
-				if checkErr != nil || !breached {
-					t.Fatalf("IsBreached(%q) = %v, %v", password, breached, checkErr)
-				}
-			}
-			breached, err := checker.IsBreached(context.Background(), "A-Different-Safe-Password!")
-			if err != nil || breached {
-				t.Fatalf("IsBreached(safe) = %v, %v", breached, err)
-			}
-		})
+	checker, err := newReleaseBreachChecker(releaseDirectory, serviceUID)
+	if err != nil {
+		t.Fatalf("newReleaseBreachChecker() error = %v", err)
+	}
+	for _, password := range []string{sha1Password, sha256Password} {
+		breached, checkErr := checker.IsBreached(context.Background(), password)
+		if checkErr != nil || !breached {
+			t.Fatalf("IsBreached(%q) = %v, %v", password, breached, checkErr)
+		}
+	}
+	breached, err := checker.IsBreached(context.Background(), "A-Different-Safe-Password!")
+	if err != nil || breached {
+		t.Fatalf("IsBreached(safe) = %v, %v", breached, err)
+	}
+	if _, err := NewReleaseBreachChecker(releaseDirectory); !errors.Is(err, ErrBreachCorpusInvalid) {
+		t.Fatalf("NewReleaseBreachChecker(service-owned release) error = %v", err)
 	}
 }
 
-func TestFileBreachCheckerRejectsMalformedCorpus(t *testing.T) {
+func TestReleaseBreachCheckerRejectsTamperedManifest(t *testing.T) {
 	t.Parallel()
-	malformed := filepath.Join(t.TempDir(), "malformed.txt")
-	if err := os.WriteFile(malformed, []byte("not-a-password-digest\n"), 0o400); err != nil {
+	releaseDirectory := buildIAMCorpusRelease(t, "844EBA1A7A7BEBADAAD266BF2DB5B9429D441818\n")
+	manifestPath := filepath.Join(releaseDirectory, breachcorpus.ManifestFileName)
+	if err := os.Chmod(releaseDirectory, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := NewFileBreachChecker(malformed); !errors.Is(err, ErrBreachCorpusInvalid) {
-		t.Fatalf("NewFileBreachChecker(malformed) error = %v", err)
+	if err := os.Chmod(manifestPath, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifestPath, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(manifestPath, 0o400); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(releaseDirectory, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	serviceUID := uint32(os.Geteuid() + 1)
+	if serviceUID == 0 {
+		serviceUID = 1
+	}
+	if _, err := newReleaseBreachChecker(releaseDirectory, serviceUID); !errors.Is(err, ErrBreachCorpusInvalid) {
+		t.Fatalf("newReleaseBreachChecker(tampered manifest) error = %v", err)
 	}
 }
 
-func TestFileBreachCheckerRejectsWritableOrLinkedCorpus(t *testing.T) {
-	t.Parallel()
-	directory := t.TempDir()
-	path := filepath.Join(directory, "breached.txt")
-	if err := os.WriteFile(path, []byte("5BAA61E4C9B93F3F0682250B6CF8331B7EE68FD8\n"), 0o600); err != nil {
+func buildIAMCorpusRelease(t *testing.T, corpus string) string {
+	t.Helper()
+	outputRoot := t.TempDir()
+	if err := os.Chmod(outputRoot, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := NewFileBreachChecker(path); !errors.Is(err, ErrBreachCorpusInvalid) {
-		t.Fatalf("NewFileBreachChecker(writable) error = %v", err)
-	}
-	if err := os.Chmod(path, 0o400); err != nil {
+	sourcePath := filepath.Join(t.TempDir(), "approved-source.txt")
+	if err := os.WriteFile(sourcePath, []byte(corpus), 0o400); err != nil {
 		t.Fatal(err)
 	}
-	link := filepath.Join(directory, "linked.txt")
-	if err := os.Symlink(path, link); err != nil {
-		t.Fatal(err)
+	sourceDigest := sha256.Sum256([]byte(corpus))
+	result, err := breachcorpus.Build(context.Background(), breachcorpus.BuildRequest{
+		SchemaVersion: breachcorpus.ManifestSchemaVersion,
+		CorpusVersion: "2026.08.30.1",
+		Sources: []breachcorpus.SourceRequest{{
+			ID: "approved-source", Version: "2026-08", ExpectedSHA256: hex.EncodeToString(sourceDigest[:]), LicenseReviewRef: "LEGAL-2026-001",
+		}},
+	}, []breachcorpus.Input{{SourceID: "approved-source", Path: sourcePath}}, outputRoot,
+		breachcorpus.Generator{Name: "xminds-breach-corpus", Version: "test", Commit: "0123456789ab"}, time.Now)
+	if err != nil {
+		t.Fatalf("build IAM breach corpus release: %v", err)
 	}
-	if _, err := NewFileBreachChecker(link); !errors.Is(err, ErrBreachCorpusInvalid) {
-		t.Fatalf("NewFileBreachChecker(symlink) error = %v", err)
-	}
+	t.Cleanup(func() {
+		_ = os.Chmod(result.ReleaseDirectory, 0o700)
+		_ = os.Chmod(filepath.Join(result.ReleaseDirectory, breachcorpus.ManifestFileName), 0o600)
+		_ = os.Chmod(filepath.Join(result.ReleaseDirectory, breachcorpus.CorpusFileName), 0o600)
+	})
+	return result.ReleaseDirectory
 }
 
 func TestDevelopmentBreachCheckerRejectsEmbeddedCommonPassword(t *testing.T) {

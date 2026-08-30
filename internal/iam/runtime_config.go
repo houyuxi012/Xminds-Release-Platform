@@ -28,7 +28,7 @@ type DirectoryRuntimeConfig struct {
 }
 
 type LocalAuthRuntimeConfig struct {
-	BreachCorpusPath             string
+	BreachCorpusReleaseDirectory string
 	UseDevelopmentBreachCorpus   bool
 	MFASecretDirectory           string
 	MFAEnrollmentSecretDirectory string
@@ -107,7 +107,7 @@ func LoadDirectoryRuntimeConfig(environ map[string]string, environment string) (
 
 func LoadLocalAuthRuntimeConfig(environ map[string]string, environment string) (LocalAuthRuntimeConfig, error) {
 	configuration := LocalAuthRuntimeConfig{
-		BreachCorpusPath:             strings.TrimSpace(environ["XMINDS_RELEASE_IAM_BREACH_CORPUS"]),
+		BreachCorpusReleaseDirectory: strings.TrimSpace(environ["XMINDS_RELEASE_IAM_BREACH_CORPUS_RELEASE_DIR"]),
 		MFASecretDirectory:           strings.TrimSpace(environ["XMINDS_RELEASE_IAM_MFA_SECRET_DIRECTORY"]),
 		MFAEnrollmentSecretDirectory: strings.TrimSpace(environ["XMINDS_RELEASE_IAM_MFA_ENROLLMENT_SECRET_DIRECTORY"]),
 		MFAEnrollmentTTL:             10 * time.Minute,
@@ -120,21 +120,24 @@ func LoadLocalAuthRuntimeConfig(environ map[string]string, environment string) (
 		Reauthentication: DefaultReauthenticationPolicy(),
 	}
 	environment = strings.ToLower(strings.TrimSpace(environment))
+	if strings.TrimSpace(environ["XMINDS_RELEASE_IAM_BREACH_CORPUS"]) != "" {
+		return LocalAuthRuntimeConfig{}, ErrLocalAuthRuntimeConfiguration
+	}
 	developmentCorpus := strings.ToLower(strings.TrimSpace(environ["XMINDS_RELEASE_IAM_USE_DEVELOPMENT_BREACH_CORPUS"]))
 	if developmentCorpus != "" && developmentCorpus != "true" && developmentCorpus != "false" {
 		return LocalAuthRuntimeConfig{}, ErrLocalAuthRuntimeConfiguration
 	}
-	if configuration.BreachCorpusPath == "" {
+	if configuration.BreachCorpusReleaseDirectory == "" {
 		if environment != "development" || developmentCorpus != "true" {
 			return LocalAuthRuntimeConfig{}, ErrLocalAuthRuntimeConfiguration
 		}
 		configuration.UseDevelopmentBreachCorpus = true
 	} else if developmentCorpus == "true" {
 		return LocalAuthRuntimeConfig{}, ErrLocalAuthRuntimeConfiguration
-	} else if !filepath.IsAbs(configuration.BreachCorpusPath) {
+	} else if !filepath.IsAbs(configuration.BreachCorpusReleaseDirectory) {
 		return LocalAuthRuntimeConfig{}, ErrLocalAuthRuntimeConfiguration
 	} else {
-		configuration.BreachCorpusPath = filepath.Clean(configuration.BreachCorpusPath)
+		configuration.BreachCorpusReleaseDirectory = filepath.Clean(configuration.BreachCorpusReleaseDirectory)
 	}
 	if configuration.MFASecretDirectory == "" || !filepath.IsAbs(configuration.MFASecretDirectory) ||
 		configuration.MFAEnrollmentSecretDirectory == "" || !filepath.IsAbs(configuration.MFAEnrollmentSecretDirectory) {
