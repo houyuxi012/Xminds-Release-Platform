@@ -1,0 +1,108 @@
+name: Continuous Integration
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  quality:
+    name: Quality
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: apps/release-console/package-lock.json
+
+      - name: Install console dependencies
+        run: make console-install
+
+      - name: Run repository verification
+        run: make verify
+
+  integration:
+    name: Integration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      XMINDS_RELEASE_TEST_DATABASE_URL: postgres://xminds_release_test:xminds_release_test@127.0.0.1:55432/xminds_release_test?sslmode=disable
+      XMINDS_RELEASE_TEST_MINIO_URL: http://127.0.0.1:59000
+      XMINDS_RELEASE_TEST_MINIO_ACCESS_KEY: xminds_release_test
+      XMINDS_RELEASE_TEST_MINIO_SECRET_KEY: xminds_release_test_secret
+      XMINDS_RELEASE_TEST_MINIO_BUCKET: xminds-release-test
+    steps:
+      - name: Check out repository
+        id: checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Start PostgreSQL and MinIO
+        run: docker compose -f compose.integration.yaml up -d --wait postgres minio
+
+      - name: Run integration tests
+        run: make test-integration
+
+      - name: Stop integration services
+        if: ${{ always() && steps.checkout.outcome == 'success' }}
+        run: docker compose -f compose.integration.yaml down -v --remove-orphans
+
+  console-e2e:
+    name: Console E2E
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: apps/release-console/package-lock.json
+
+      - name: Install console dependencies
+        run: make console-install
+
+      - name: Install Chromium runtime
+        working-directory: apps/release-console
+        run: ./node_modules/.bin/playwright install --with-deps chromium
+
+      - name: Run console end-to-end tests
+        run: make console-e2e
