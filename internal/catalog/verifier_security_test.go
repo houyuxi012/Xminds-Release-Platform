@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -104,6 +105,14 @@ func TestCatalogPrimitiveValidatorsFailClosedOnUnsupportedValues(t *testing.T) {
 	}
 	if _, err := positiveInt(json.Number("0")); err == nil {
 		t.Fatal("zero threshold was accepted")
+	}
+	maximumInt := int(^uint(0) >> 1)
+	converted, err := positiveInt(json.Number(strconv.FormatUint(uint64(maximumInt), 10)))
+	if err != nil || converted != maximumInt {
+		t.Fatalf("maximum int threshold = %d, %v", converted, err)
+	}
+	if _, err := positiveInt(json.Number(strconv.FormatUint(uint64(maximumInt)+1, 10))); !errors.Is(err, ErrRootInvalid) {
+		t.Fatalf("threshold exceeding maximum int error = %v", err)
 	}
 	if _, err := positiveInt(json.Number("18446744073709551615")); err == nil {
 		t.Fatal("threshold exceeding int was accepted")
