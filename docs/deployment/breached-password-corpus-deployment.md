@@ -176,12 +176,14 @@ services:
     volumes:
       - type: bind
         source: /opt/xminds/breach-corpora/breach-corpus-sha256-<digest>
-        target: /run/xminds/breach-corpus
+        target: /run/xminds/breach-corpora/breach-corpus-sha256-<digest>
         read_only: true
     environment:
-      XMINDS_RELEASE_IAM_BREACH_CORPUS_RELEASE_DIR: /run/xminds/breach-corpus
+      XMINDS_RELEASE_IAM_BREACH_CORPUS_RELEASE_DIR: /run/xminds/breach-corpora/breach-corpus-sha256-<digest>
       XMINDS_RELEASE_IAM_USE_DEVELOPMENT_BREACH_CORPUS: "false"
 ```
+
+容器内目标路径也必须保留内容寻址目录名；若挂载为 `/run/xminds/breach-corpus` 等可变名称，运行时会因目录名无法绑定语料 SHA-256 而拒绝启动。
 
 ## 11. 灰度与滚动发布
 

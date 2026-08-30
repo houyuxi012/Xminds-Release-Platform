@@ -591,7 +591,7 @@ go test ./internal/iam ./apps/release-api -race -count=1
 
 Expected: PASS。
 
-- [ ] **Step 7: 提交运行时集成**
+- [x] **Step 7: 提交运行时集成**
 
 ```bash
 git add internal/iam/password_security.go internal/iam/password_security_test.go internal/iam/runtime_config.go internal/iam/runtime_config_test.go apps/release-api/main.go apps/release-api/main_test.go
@@ -612,7 +612,7 @@ git commit -m "Require verified breach corpus releases"
 - Consumes: 最终 CLI、运行时配置、测试命令和真实验证结果。
 - Produces: 与实现一致的客户可交付文档和明确未完成的生产环境门禁。
 
-- [ ] **Step 1: 更新所有用户可见文档**
+- [x] **Step 1: 更新所有用户可见文档**
 
 README 给出：
 
@@ -624,7 +624,7 @@ bin/breach-corpus verify --release-dir /absolute/output/breach-corpus-sha256-<di
 
 `.env.example` 只保留 `XMINDS_RELEASE_IAM_BREACH_CORPUS_RELEASE_DIR`。
 
-- [ ] **Step 2: 执行聚焦测试**
+- [x] **Step 2: 执行聚焦测试**
 
 Run:
 
@@ -634,7 +634,7 @@ go test ./internal/breachcorpus ./internal/iam ./scripts/breach-corpus ./apps/re
 
 Expected: PASS。
 
-- [ ] **Step 3: 执行仓库完整验证**
+- [x] **Step 3: 执行仓库完整验证**
 
 Run:
 
@@ -644,17 +644,17 @@ make verify
 
 Expected: Go 格式、vet、竞态测试、二进制构建、边界、macOS 元数据、Console lint/typecheck/test/build 全部通过。
 
-- [ ] **Step 4: 检查敏感内容和计划占位符**
+- [x] **Step 4: 检查敏感内容和计划占位符**
 
 Run:
 
 ```bash
-rg -n 'plaintext_password|Secret123!|BEGIN (RSA|OPENSSH|PRIVATE) KEY|TODO|TBD' internal/breachcorpus scripts/breach-corpus docs/security docs/deployment docs/plans README.md .env.example
+rg -n 'plaintext_password|Secret123!|BEGIN (RSA|OPENSSH|PRIVATE) KEY|[T]ODO|[T]BD' internal/breachcorpus scripts/breach-corpus docs/security docs/deployment docs/plans README.md .env.example
 ```
 
 Expected: 不存在凭据、私钥、永久待办或未完成占位符；测试中的固定非生产字符串如被命中，必须确认不会进入运行时输出。
 
-- [ ] **Step 5: 检查最终差异和用户排除目录**
+- [x] **Step 5: 检查最终差异和用户排除目录**
 
 Run:
 
@@ -667,7 +667,7 @@ git diff -- docs/superpowers
 
 Expected: `git diff --check` 无输出，`docs/superpowers` 无变更，差异仅包含本工具链范围。
 
-- [ ] **Step 6: 记录真实环境验收边界**
+- [x] **Step 6: 记录真实环境验收边界**
 
 本地测试通过后仍将以下项目保留为生产部署门禁，不宣称已经完成：
 
@@ -677,7 +677,15 @@ Expected: `git diff --check` 无输出，`docs/superpowers` 无变更，差异�
 - 多副本版本和 SHA-256 一致性；
 - 回滚演练及审计系统证据。
 
-- [ ] **Step 7: 提交文档和最终验证记录**
+2026-08-30 本地实施验证记录：
+
+- `go test ./internal/breachcorpus ./internal/iam ./scripts/breach-corpus ./apps/release-api -race -count=1` 通过；
+- `make verify` 通过，覆盖 Go 格式、`vet`、全仓竞态测试、三个二进制构建、边界与 macOS 元数据检查，以及 Console lint、类型检查、29 个组件测试和生产构建；
+- 敏感内容扫描未发现凭据或私钥；`Secret123!` 仅是 CLI 非回显回归测试的固定非生产输入；
+- `docs/superpowers` 无差异，本工具链未将输入、语料或构建产物纳入 Git；
+- 上述 Linux 所有权、容器挂载、灰度、多副本一致性、回滚及审计证据仍是生产环境待执行门禁。
+
+- [x] **Step 7: 提交文档和最终验证记录**
 
 ```bash
 git add README.md .env.example docs/security docs/deployment docs/plans/2026-08-30-breached-password-corpus-toolchain.md
