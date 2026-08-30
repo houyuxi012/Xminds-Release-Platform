@@ -72,6 +72,12 @@ func TestCIWorkflowPreservesRequiredQualityGates(t *testing.T) {
 			t.Errorf("CI action must be approved and pinned to a full commit SHA: %s", match[1])
 		}
 	}
+	if installs := strings.Count(
+		workflow,
+		"./node_modules/.bin/playwright install --with-deps chromium",
+	); installs != 2 {
+		t.Errorf("Quality and Console E2E jobs must each install Chromium, got %d install steps", installs)
+	}
 
 	composeContent, err := os.ReadFile(filepath.Join("..", "..", "compose.integration.yaml"))
 	if err != nil {
